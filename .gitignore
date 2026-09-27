@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.npm-cache/
+.bruin/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.node-gyp/
+.electron-cache/
+.cache/
+.electron-builder-cache/
+.desktop-audit.json
+.desktop-runtime/
+desktop/build/
+desktop/release*/

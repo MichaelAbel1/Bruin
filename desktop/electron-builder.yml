@@ -1,0 +1,25 @@
+appId: com.bruin.agent
+productName: Bruin
+directories:
+  output: desktop/release-current
+files:
+  - desktop/main.cjs
+  - desktop/preload.cjs
+  - desktop/build/renderer/**/*
+  - package.json
+extraResources:
+  - from: .desktop-runtime
+    to: runtime
+npmRebuild: false
+asar: true
+mac:
+  icon: desktop/assets/icon.png
+  target:
+    - dmg
+    - zip
+win:
+  target:
+    - nsis
+linux:
+  target:
+    - AppImage

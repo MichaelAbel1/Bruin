@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.desktop-runtime/
+.npm-cache/
+.electron-cache/
+.node-gyp/
+desktop/build/
+desktop/release*/
+desktop/assets/icon.svg
+desktop/assets/icon.png
+package-lock.json

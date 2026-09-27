@@ -1,0 +1,52 @@
+{
+  "name": "bruin-agent",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "main": "desktop/main.cjs",
+  "bin": {
+    "bruin": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "desktop:check": "tsc --noEmit -p desktop/tsconfig.json",
+    "desktop:build": "npm run build && node desktop/scripts/generate-icon.cjs && vite build --config desktop/vite.config.ts",
+    "desktop:dev": "npm run build && node desktop/scripts/dev.cjs",
+    "desktop:pack": "npm run desktop:build && node desktop/scripts/stage-runtime.cjs && electron-builder --config desktop/electron-builder.yml --dir",
+    "desktop:dist": "npm run desktop:build && node desktop/scripts/stage-runtime.cjs && electron-builder --config desktop/electron-builder.yml"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/google": "^3.0.0",
+    "@ai-sdk/openai": "^3.0.0",
+    "@ai-sdk/openai-compatible": "^2.0.0",
+    "ai": "^6.0.0",
+    "better-sqlite3": "^12.0.0",
+    "lucide-react": "^1.48.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "electron": "^41.10.7",
+    "electron-builder": "^26.15.3",
+    "prettier": "3.9.9",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^8.3.1"
+  }
+}
