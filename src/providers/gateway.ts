@@ -145,6 +145,11 @@ export const toolSchemas = {
     description: 'Save a persistent memory page for this workspace. Requires user approval.',
     inputSchema: z.object({ key: z.string(), content: z.string() }),
   },
+  remember_preference: {
+    description:
+      'Remember a lasting user preference only when explicitly stated in the latest user message. Pass the exact words, not an inference.',
+    inputSchema: z.object({ content: z.string().min(1).max(1000) }),
+  },
 };
 export function resolveApiKey(profile: ModelProfile): string | undefined {
   const keyName =
@@ -233,11 +238,35 @@ export class AiSdkGateway implements ModelGateway {
       maxRetries: 2,
     });
     let text = '';
+    let hidden = false;
+    let pending = '';
+    const visibleText = (delta: string): string => {
+      let visible = '';
+      for (const char of delta) {
+        if (!pending && char !== '<') {
+          if (!hidden) visible += char;
+          continue;
+        }
+        pending += char;
+        const tag = hidden ? '</think>' : '<think>';
+        if (tag.startsWith(pending.toLowerCase())) {
+          if (pending.length === tag.length) {
+            hidden = !hidden;
+            pending = '';
+          }
+        } else {
+          if (!hidden) visible += pending;
+          pending = '';
+        }
+      }
+      return visible;
+    };
     const calls: ToolCall[] = [];
     for await (const part of result.fullStream) {
       if (part.type === 'text-delta') {
-        text += part.text;
-        onText(part.text);
+        const visible = visibleText(part.text);
+        text += visible;
+        if (visible) onText(visible);
       }
       if (part.type === 'tool-call')
         calls.push({
@@ -246,6 +275,10 @@ export class AiSdkGateway implements ModelGateway {
           input: part.input as Record<string, unknown>,
         });
       if (part.type === 'error') throw part.error;
+    }
+    if (pending && !hidden) {
+      text += pending;
+      onText(pending);
     }
     const usage = await result.usage;
     const response = await result.response;

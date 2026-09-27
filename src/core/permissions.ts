@@ -36,6 +36,7 @@ export function decisionFor(
       'finish_task',
       'list_memory',
       'save_memory',
+      'remember_preference',
     ].includes(call.name)
   )
     return { decision: 'deny', reason: '未知工具' };
@@ -69,6 +70,7 @@ export function decisionFor(
       'claim_task',
       'finish_task',
       'list_memory',
+      'remember_preference',
     ].includes(call.name)
   )
     return { decision: 'allow', reason: '读取状态或更新规划' };

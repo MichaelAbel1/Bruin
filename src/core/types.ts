@@ -25,7 +25,8 @@ export type ToolName =
   | 'claim_task'
   | 'finish_task'
   | 'list_memory'
-  | 'save_memory';
+  | 'save_memory'
+  | 'remember_preference';
 export interface ModelProfile {
   alias: string;
   provider: ProviderKind;

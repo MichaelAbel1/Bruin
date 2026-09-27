@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CronExpressionParser } from 'cron-parser';
@@ -36,6 +36,11 @@ export interface MemoryPage {
   content: string;
   updatedAt: string;
 }
+export interface UserPreference {
+  id: string;
+  content: string;
+  createdAt: string;
+}
 
 /** Storage port: a PostgreSQL implementation must preserve append ordering and atomic append semantics. */
 export interface EventStore {
@@ -70,6 +75,9 @@ export interface EventStore {
   markCronJob(id: string, status: string): void;
   listMemory(workspace: string): MemoryPage[];
   saveMemory(workspace: string, key: string, content: string): void;
+  listPreferences(): UserPreference[];
+  savePreference(sessionId: string, content: string): UserPreference;
+  deletePreference(id: string): void;
   setProfile(id: string, profile: ModelProfile, leaseOwner?: string): void;
   events(id: string): SessionEvent[];
   append(id: string, type: EventType, payload: Record<string, unknown>): SessionEvent;
@@ -87,7 +95,7 @@ export class SqliteEventStore implements EventStore {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     const schemaVersion = this.db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 6) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
+    if (schemaVersion > 7) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY, workspace TEXT NOT NULL, profile_json TEXT NOT NULL,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -122,6 +130,10 @@ export class SqliteEventStore implements EventStore {
     CREATE TABLE IF NOT EXISTS memory_pages (
       workspace TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL,
       PRIMARY KEY (workspace, key)
+    );
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      id TEXT PRIMARY KEY, content TEXT NOT NULL, source_session_id TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );`);
     if (schemaVersion < 6)
       this.db.transaction(() => {
@@ -132,6 +144,7 @@ export class SqliteEventStore implements EventStore {
         FROM task_nodes t JOIN sessions s ON s.id = t.session_id`);
         this.db.pragma('user_version = 6');
       })();
+    if (schemaVersion < 7) this.db.pragma('user_version = 7');
   }
   createSession(workspace: string, profile: ModelProfile): Session {
     const now = new Date().toISOString();
@@ -595,6 +608,40 @@ export class SqliteEventStore implements EventStore {
       ON CONFLICT(workspace, key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
       )
       .run(workspace, key, content.trim(), new Date().toISOString());
+  }
+  listPreferences(): UserPreference[] {
+    return (
+      this.db
+        .prepare('SELECT id, content, created_at FROM user_preferences ORDER BY created_at, id')
+        .all() as Array<{ id: string; content: string; created_at: string }>
+    ).map((row) => ({ id: row.id, content: row.content, createdAt: row.created_at }));
+  }
+  savePreference(sessionId: string, content: string): UserPreference {
+    const value = content.trim();
+    const lastUser = [...this.events(sessionId)].reverse().find((event) => event.type === 'user');
+    if (
+      !value ||
+      value.length > 1000 ||
+      !lastUser ||
+      !String(lastUser.payload.text ?? '').includes(value) ||
+      /(?:sk-|gsk_|AIza|xai-)[A-Za-z0-9_-]{16,}/i.test(value)
+    )
+      throw new Error('偏好必须是本轮用户明确表达的原文，且不能包含密钥');
+    const id = createHash('sha256').update(value).digest('hex').slice(0, 32);
+    this.db.transaction(() => {
+      const count = (
+        this.db.prepare('SELECT COUNT(*) AS n FROM user_preferences').get() as { n: number }
+      ).n;
+      if (count >= 50 && !this.db.prepare('SELECT 1 FROM user_preferences WHERE id = ?').get(id))
+        throw new Error('用户偏好已达到 50 项上限');
+      this.db
+        .prepare('INSERT OR IGNORE INTO user_preferences VALUES (?, ?, ?, ?)')
+        .run(id, value, sessionId, new Date().toISOString());
+    })();
+    return this.listPreferences().find((item) => item.id === id)!;
+  }
+  deletePreference(id: string): void {
+    this.db.prepare('DELETE FROM user_preferences WHERE id = ?').run(id);
   }
   scrubSecrets(secrets: string[]): number {
     const values = [...new Set(secrets.filter((value) => value.length >= 12))];

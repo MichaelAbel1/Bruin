@@ -91,6 +91,14 @@ export class RuntimeServices {
     switch (call.name) {
       case 'list_memory':
         return { output: JSON.stringify(this.store.listMemory(session.workspace)), isError: false };
+      case 'remember_preference': {
+        try {
+          const preference = this.store.savePreference(session.id, String(input.content ?? ''));
+          return { output: JSON.stringify(preference), isError: false };
+        } catch (error) {
+          return { output: error instanceof Error ? error.message : String(error), isError: true };
+        }
+      }
       case 'save_memory':
         this.store.saveMemory(
           session.workspace,

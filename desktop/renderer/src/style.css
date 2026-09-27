@@ -212,6 +212,62 @@ pre {
   color: #78807e;
   padding: 10px;
 }
+.workspace-explorer {
+  border-top: 1px solid #2a2e2e;
+  max-height: 40vh;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.explorer-toggle,
+.explorer-entry {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+.explorer-toggle {
+  font-weight: 600;
+}
+.explorer-entry:hover,
+.explorer-toggle:hover {
+  background: #24292a;
+}
+.explorer-entry span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.explorer-list {
+  overflow: auto;
+}
+.explorer-children {
+  padding-left: 11px;
+}
+.explorer-children small {
+  color: #85908d;
+  padding: 6px;
+}
+.preference-row {
+  display: flex;
+  align-items: start;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #dddddd33;
+}
+.preference-row span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.preference-row button {
+  flex: none;
+}
 .sidebar-footer {
   border-top: 1px solid #2a2e2e;
   padding-top: 12px;
@@ -1414,6 +1470,13 @@ pre {
 :root[data-theme='light'] .sidebar {
   background: #fff;
   border-right-color: #e5e7eb;
+}
+:root[data-theme='light'] .workspace-explorer {
+  border-color: #e5e7eb;
+}
+:root[data-theme='light'] .explorer-entry:hover,
+:root[data-theme='light'] .explorer-toggle:hover {
+  background: #f1f2f3;
 }
 :root[data-theme='light'] .topbar,
 :root[data-theme='light'] .sidebar-footer,

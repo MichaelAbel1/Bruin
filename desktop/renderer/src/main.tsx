@@ -8,6 +8,8 @@ import {
   ChevronDown,
   CircleAlert,
   Code2,
+  FileText,
+  Folder,
   FolderOpen,
   Layers,
   LoaderCircle,
@@ -119,6 +121,8 @@ type HostEvent = {
   call?: Approval['call'];
   reason?: string;
 };
+type WorkspaceEntry = { name: string; path: string; kind: 'file' | 'directory' };
+type UserPreference = { id: string; content: string; createdAt: string };
 
 declare global {
   interface Window {
@@ -182,7 +186,7 @@ function App() {
   const [composer, setComposer] = useState('');
   const [approval, setApproval] = useState<Approval | null>(null);
   const [dialog, setDialog] = useState<
-    'model' | 'new' | 'skills' | 'appearance' | 'runtime' | null
+    'model' | 'new' | 'skills' | 'appearance' | 'runtime' | 'preferences' | null
   >(null);
   const [iconBackground, setIconBackground] = useState('white');
   const [uiTheme, setUiTheme] = useState<'light' | 'dark'>('light');
@@ -190,6 +194,7 @@ function App() {
   const [notice, setNotice] = useState('');
   const [securityNotice, setSecurityNotice] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(false);
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [modelLoading, setModelLoading] = useState(false);
@@ -503,6 +508,19 @@ function App() {
           ))}
           {!sessions.length && <div className="empty-sidebar">从一个项目文件夹开始。</div>}
         </div>
+        {view && (
+          <div className="workspace-explorer">
+            <button className="explorer-toggle" onClick={() => setFilesOpen((open) => !open)}>
+              {filesOpen ? <ChevronDown size={15} /> : <Folder size={15} />}
+              项目文件 · {short(view.session.workspace)}
+            </button>
+            {filesOpen && (
+              <div className="explorer-list" key={view.session.id}>
+                <WorkspaceFolder sessionId={view.session.id} path="" fail={fail} />
+              </div>
+            )}
+          </div>
+        )}
         <div className="sidebar-footer">
           <button onClick={() => setDialog('appearance')}>
             <Palette size={17} /> 外观
@@ -513,6 +531,9 @@ function App() {
           <button onClick={() => setDialog('runtime')}>
             <Terminal size={17} /> MCP 与自动化
           </button>
+          <button onClick={() => setDialog('preferences')}>
+            <Sparkles size={17} /> 用户偏好
+          </button>
           <button onClick={() => setDialog('model')}>
             <Settings2 size={17} /> 模型设置
           </button>
@@ -522,7 +543,10 @@ function App() {
         <header className="topbar">
           <button
             className="mobile-menu icon-button"
-            onClick={() => setSidebarOpen((x) => !x)}
+            onClick={() => {
+              setSidebarOpen((open) => !open);
+              setFilesOpen(true);
+            }}
             aria-label="菜单"
           >
             <Menu size={20} />
@@ -888,7 +912,110 @@ function App() {
           fail={fail}
         />
       )}
+      {dialog === 'preferences' && <PreferencesDialog close={() => setDialog(null)} fail={fail} />}
     </div>
+  );
+}
+
+function WorkspaceFolder({
+  sessionId,
+  path,
+  fail,
+}: {
+  sessionId: string;
+  path: string;
+  fail: (error: unknown) => void;
+}) {
+  const [entries, setEntries] = useState<WorkspaceEntry[]>([]);
+  const [expanded, setExpanded] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void api<WorkspaceEntry[]>('listWorkspaceEntries', { sessionId, path })
+      .then((items) => {
+        if (!cancelled) setEntries(items);
+      })
+      .catch(fail)
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, path]);
+  return (
+    <div className="explorer-children">
+      {loading && <small>正在读取…</small>}
+      {!loading && !entries.length && <small>空文件夹</small>}
+      {!loading && entries.length === 300 && <small>仅显示前 300 项</small>}
+      {entries.map((entry) => (
+        <React.Fragment key={entry.path}>
+          <button
+            className="explorer-entry"
+            title={entry.path}
+            onClick={() => {
+              if (entry.kind === 'directory')
+                setExpanded((current) =>
+                  current.includes(entry.path)
+                    ? current.filter((item) => item !== entry.path)
+                    : [...current, entry.path],
+                );
+              else void api('openFileWindow', { sessionId, path: entry.path }).catch(fail);
+            }}
+          >
+            {entry.kind === 'directory' ? (
+              expanded.includes(entry.path) ? (
+                <ChevronDown size={14} />
+              ) : (
+                <Folder size={14} />
+              )
+            ) : (
+              <FileText size={14} />
+            )}
+            <span>{entry.name}</span>
+          </button>
+          {entry.kind === 'directory' && expanded.includes(entry.path) && (
+            <WorkspaceFolder sessionId={sessionId} path={entry.path} fail={fail} />
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function PreferencesDialog({ close, fail }: { close: () => void; fail: (error: unknown) => void }) {
+  const [items, setItems] = useState<UserPreference[]>([]);
+  const [confirmId, setConfirmId] = useState('');
+  useEffect(() => {
+    void api<UserPreference[]>('listPreferences').then(setItems).catch(fail);
+  }, []);
+  return (
+    <Modal title="用户偏好" eyebrow="LOCAL MEMORY" close={close}>
+      <p>对话中明确表达的长期偏好保存在本机 SQLite，并在后续会话中按需加入提示词。</p>
+      {!items.length && <p>还没有保存的偏好。</p>}
+      {items.map((item) => (
+        <div className="preference-row" key={item.id}>
+          <span>{item.content}</span>
+          <button
+            onClick={() => {
+              if (confirmId !== item.id) {
+                setConfirmId(item.id);
+                return;
+              }
+              void api<UserPreference[]>('deletePreference', { id: item.id })
+                .then((next) => {
+                  setItems(next);
+                  setConfirmId('');
+                })
+                .catch(fail);
+            }}
+          >
+            {confirmId === item.id ? '确认删除' : '删除'}
+          </button>
+        </div>
+      ))}
+    </Modal>
   );
 }
 

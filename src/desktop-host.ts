@@ -34,6 +34,7 @@ import {
 } from './skills/registry.js';
 import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
+import { listWorkspaceEntries, readWorkspaceFile } from './core/workspace-files.js';
 import {
   approvePlan,
   planBlocks,
@@ -143,7 +144,11 @@ function redactEvents(events: ReturnType<typeof store.events>, alias: string) {
   };
   return events.map((item) => ({
     ...item,
-    payload: scrub(item.payload) as Record<string, unknown>,
+    payload: scrub(
+      Object.fromEntries(
+        Object.entries(item.payload).filter(([key]) => key !== 'providerMessages'),
+      ),
+    ) as Record<string, unknown>,
   }));
 }
 async function startRun(session: Session, prompt?: string): Promise<{ started: boolean }> {
@@ -200,6 +205,15 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       };
     case 'listSessions':
       return store.listSessions();
+    case 'listWorkspaceEntries':
+      return listWorkspaceEntries(getSession(p.sessionId).workspace, String(p.path ?? ''));
+    case 'readWorkspaceFile':
+      return readWorkspaceFile(getSession(p.sessionId).workspace, String(p.path ?? ''));
+    case 'listPreferences':
+      return store.listPreferences();
+    case 'deletePreference':
+      store.deletePreference(String(p.id ?? ''));
+      return store.listPreferences();
     case 'listTasks':
       return store.listTasks(getSession(p.sessionId).id);
     case 'syncTasks': {
@@ -372,6 +386,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           'finish_task',
           'list_memory',
           'save_memory',
+          'remember_preference',
           'spawn_subagent',
           'subagent_status',
         ].includes(name)
