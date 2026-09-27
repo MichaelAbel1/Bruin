@@ -9,10 +9,19 @@ export interface TaskNode {
   id: string;
   sessionId: string;
   title: string;
+  description: string;
   dependencies: string[];
+  blocks: string[];
   status: 'pending' | 'running' | 'completed' | 'failed' | 'unknown';
   owner?: string;
   expiresAt?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface TaskUpdate {
+  title?: string;
+  description?: string;
+  addBlockedBy?: string[];
 }
 export interface CronJob {
   id: string;
@@ -39,8 +48,16 @@ export interface EventStore {
   releaseLease(id: string, owner: string): void;
   isLeased(id: string): boolean;
   scrubSecrets(secrets: string[]): number;
-  createTask(sessionId: string, title: string, dependencies: string[]): TaskNode;
+  createTask(
+    sessionId: string,
+    title: string,
+    dependencies: string[],
+    description?: string,
+  ): TaskNode;
+  getTask(sessionId: string, id: string): TaskNode | undefined;
+  updateTask(sessionId: string, id: string, update: TaskUpdate): TaskNode;
   listTasks(sessionId: string): TaskNode[];
+  syncTasks(sessionId: string): void;
   claimTask(sessionId: string, owner: string, ttlMs: number): TaskNode | undefined;
   renewTask(id: string, owner: string, ttlMs: number): boolean;
   finishTask(id: string, owner: string, success: boolean): void;
@@ -70,7 +87,7 @@ export class SqliteEventStore implements EventStore {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     const schemaVersion = this.db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 5) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
+    if (schemaVersion > 6) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY, workspace TEXT NOT NULL, profile_json TEXT NOT NULL,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -90,6 +107,13 @@ export class SqliteEventStore implements EventStore {
       title TEXT NOT NULL, dependencies_json TEXT NOT NULL, status TEXT NOT NULL,
       owner TEXT, expires_at INTEGER, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS workspace_tasks (
+      id TEXT PRIMARY KEY, workspace TEXT NOT NULL, origin_session_id TEXT NOT NULL,
+      title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', dependencies_json TEXT NOT NULL,
+      status TEXT NOT NULL, owner TEXT, expires_at INTEGER,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS workspace_tasks_workspace_idx ON workspace_tasks(workspace, created_at, id);
     CREATE TABLE IF NOT EXISTS cron_jobs (
       id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
       expression TEXT NOT NULL, prompt TEXT NOT NULL, next_run_at INTEGER NOT NULL,
@@ -99,7 +123,15 @@ export class SqliteEventStore implements EventStore {
       workspace TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL,
       PRIMARY KEY (workspace, key)
     );`);
-    this.db.pragma('user_version = 5');
+    if (schemaVersion < 6)
+      this.db.transaction(() => {
+        this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
+        (id, workspace, origin_session_id, title, description, dependencies_json, status, owner, expires_at, created_at, updated_at)
+        SELECT t.id, s.workspace, t.session_id, t.title, '', t.dependencies_json,
+          t.status, t.owner, t.expires_at, t.created_at, t.created_at
+        FROM task_nodes t JOIN sessions s ON s.id = t.session_id`);
+        this.db.pragma('user_version = 6');
+      })();
   }
   createSession(workspace: string, profile: ModelProfile): Session {
     const now = new Date().toISOString();
@@ -185,113 +217,283 @@ export class SqliteEventStore implements EventStore {
         .get(id, Date.now()),
     );
   }
-  private rowToTask(row: any): TaskNode {
-    return {
+  private taskWorkspace(sessionId: string): string {
+    const session = this.getSession(sessionId);
+    if (!session) throw new Error('会话不存在');
+    return session.workspace;
+  }
+  private taskRows(workspace: string): TaskNode[] {
+    const rows = this.db
+      .prepare('SELECT * FROM workspace_tasks WHERE workspace = ? ORDER BY created_at, id')
+      .all(workspace) as any[];
+    const blocks = new Map<string, string[]>();
+    for (const row of rows)
+      for (const dependency of JSON.parse(row.dependencies_json) as string[])
+        blocks.set(dependency, [...(blocks.get(dependency) ?? []), row.id]);
+    return rows.map((row) => ({
       id: row.id,
-      sessionId: row.session_id,
+      sessionId: row.origin_session_id,
       title: row.title,
+      description: row.description,
       dependencies: JSON.parse(row.dependencies_json),
+      blocks: blocks.get(row.id) ?? [],
       status: row.status,
       ...(row.owner ? { owner: row.owner } : {}),
       ...(row.expires_at ? { expiresAt: row.expires_at } : {}),
-    };
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
   }
-  createTask(sessionId: string, title: string, dependencies: string[]): TaskNode {
-    if (!this.getSession(sessionId)) throw new Error('会话不存在');
+  /** SQLite owns concurrency; .tasks is a repairable, human-readable workspace projection. */
+  private ensureTaskDirectory(workspace: string): string {
+    const directory = path.join(fs.realpathSync(workspace), '.tasks');
+    try {
+      fs.mkdirSync(directory, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    if (!fs.lstatSync(directory).isDirectory() || fs.realpathSync(directory) !== directory)
+      throw new Error('.tasks 必须是工作区内的真实目录');
+    return directory;
+  }
+  private syncTaskFiles(workspace: string): void {
+    const tasks = this.taskRows(workspace);
+    if (!tasks.length) return;
+    const directory = this.ensureTaskDirectory(workspace);
+    for (const task of tasks) {
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(task.id)) throw new Error('任务 ID 无法用作快照文件名');
+      if (fs.realpathSync(directory) !== directory) throw new Error('.tasks 目录已被替换');
+      const filename = path.join(directory, `${task.id}.json`);
+      const content =
+        JSON.stringify(
+          {
+            version: 1,
+            id: task.id,
+            subject: task.title,
+            description: task.description,
+            status: task.status,
+            owner: task.owner ?? null,
+            blockedBy: task.dependencies,
+            blocks: task.blocks,
+            createdAt: task.createdAt,
+            updatedAt: task.updatedAt,
+            originSessionId: task.sessionId,
+          },
+          null,
+          2,
+        ) + '\n';
+      try {
+        const stat = fs.lstatSync(filename);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('任务快照不能是符号链接');
+        if (fs.readFileSync(filename, 'utf8') === content) continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      const temp = path.join(directory, `.${task.id}.${randomUUID()}.tmp`);
+      try {
+        fs.writeFileSync(temp, content, { mode: 0o600, flag: 'wx' });
+        fs.renameSync(temp, filename);
+      } finally {
+        try {
+          fs.unlinkSync(temp);
+        } catch {
+          /* Renamed or already removed. */
+        }
+      }
+    }
+  }
+  private repairTaskFiles(workspace: string): void {
+    try {
+      this.syncTaskFiles(workspace);
+    } catch (error) {
+      process.stderr.write(
+        `Bruin task snapshot sync failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+  createTask(sessionId: string, title: string, dependencies: string[], description = ''): TaskNode {
+    const workspace = this.taskWorkspace(sessionId);
     if (
       !title.trim() ||
       title.length > 500 ||
+      description.length > 8000 ||
       dependencies.length > 30 ||
       new Set(dependencies).size !== dependencies.length
     )
       throw new Error('无效任务');
-    return this.db.transaction(() => {
+    this.ensureTaskDirectory(workspace);
+    this.syncTaskFiles(workspace);
+    const id = this.db.transaction(() => {
       const count = (
         this.db
-          .prepare('SELECT COUNT(*) AS n FROM task_nodes WHERE session_id = ?')
-          .get(sessionId) as { n: number }
+          .prepare('SELECT COUNT(*) AS n FROM workspace_tasks WHERE workspace = ?')
+          .get(workspace) as { n: number }
       ).n;
-      if (count >= 200) throw new Error('会话任务已达到 200 项上限');
-      for (const id of dependencies) {
-        const row = this.db
-          .prepare('SELECT 1 FROM task_nodes WHERE id = ? AND session_id = ?')
-          .get(id, sessionId);
-        if (!row) throw new Error('依赖任务不存在或不属于当前会话');
-      }
+      if (count >= 200) throw new Error('工作区任务已达到 200 项上限');
+      for (const dependency of dependencies)
+        if (
+          !this.db
+            .prepare('SELECT 1 FROM workspace_tasks WHERE id = ? AND workspace = ?')
+            .get(dependency, workspace)
+        )
+          throw new Error('依赖任务不存在或不属于当前工作区');
       const id = randomUUID();
+      const now = new Date().toISOString();
       this.db
-        .prepare(`INSERT INTO task_nodes VALUES (?, ?, ?, ?, 'pending', NULL, NULL, ?)`)
-        .run(id, sessionId, title.trim(), JSON.stringify(dependencies), new Date().toISOString());
-      return this.rowToTask(this.db.prepare('SELECT * FROM task_nodes WHERE id = ?').get(id));
+        .prepare(
+          `INSERT INTO workspace_tasks VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`,
+        )
+        .run(
+          id,
+          workspace,
+          sessionId,
+          title.trim(),
+          description.trim(),
+          JSON.stringify(dependencies),
+          now,
+          now,
+        );
+      return id;
     })();
+    this.repairTaskFiles(workspace);
+    return this.taskRows(workspace).find((task) => task.id === id)!;
   }
   listTasks(sessionId: string): TaskNode[] {
-    return (
+    const workspace = this.taskWorkspace(sessionId);
+    return this.taskRows(workspace);
+  }
+  syncTasks(sessionId: string): void {
+    this.syncTaskFiles(this.taskWorkspace(sessionId));
+  }
+  getTask(sessionId: string, id: string): TaskNode | undefined {
+    return this.listTasks(sessionId).find((task) => task.id === id);
+  }
+  updateTask(sessionId: string, id: string, update: TaskUpdate): TaskNode {
+    const workspace = this.taskWorkspace(sessionId);
+    this.syncTaskFiles(workspace);
+    this.db.transaction(() => {
+      const tasks = this.taskRows(workspace);
+      const current = tasks.find((task) => task.id === id);
+      if (!current) throw new Error('任务不存在或不属于当前工作区');
+      if (
+        update.title === undefined &&
+        update.description === undefined &&
+        update.addBlockedBy === undefined
+      )
+        throw new Error('没有任务修改内容');
+      const title = update.title ?? current.title;
+      const description = update.description ?? current.description;
+      if (!title.trim() || title.length > 500 || description.length > 8000)
+        throw new Error('无效任务内容');
+      const additions = update.addBlockedBy ?? [];
+      if (!Array.isArray(additions) || additions.some((dep) => typeof dep !== 'string'))
+        throw new Error('无效依赖任务');
+      const dependencies = [...new Set([...current.dependencies, ...additions])];
+      if (dependencies.length > 30) throw new Error('任务依赖已达到 30 项上限');
+      if (additions.length && current.status !== 'pending')
+        throw new Error('只能修改待执行任务的依赖');
+      const byId = new Map(tasks.map((task) => [task.id, task]));
+      for (const dependency of dependencies) {
+        if (!byId.has(dependency)) throw new Error('依赖任务不存在或不属于当前工作区');
+        const visited = new Set<string>();
+        const stack = [dependency];
+        while (stack.length) {
+          const node = stack.pop()!;
+          if (node === id) throw new Error('任务依赖会形成环');
+          if (visited.has(node)) continue;
+          visited.add(node);
+          stack.push(...(byId.get(node)?.dependencies ?? []));
+        }
+      }
       this.db
-        .prepare('SELECT * FROM task_nodes WHERE session_id = ? ORDER BY created_at, id')
-        .all(sessionId) as any[]
-    ).map((row) => this.rowToTask(row));
+        .prepare(
+          `UPDATE workspace_tasks SET title = ?, description = ?, dependencies_json = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(
+          title.trim(),
+          description.trim(),
+          JSON.stringify(dependencies),
+          new Date().toISOString(),
+          id,
+        );
+    })();
+    this.repairTaskFiles(workspace);
+    return this.taskRows(workspace).find((task) => task.id === id)!;
   }
   claimTask(sessionId: string, owner: string, ttlMs: number): TaskNode | undefined {
     if (!owner || ttlMs < 1000 || ttlMs > 3600000) throw new Error('无效任务租约');
-    return this.db.transaction(() => {
+    const workspace = this.taskWorkspace(sessionId);
+    const id = this.db.transaction(() => {
       this.db
         .prepare(
-          `UPDATE task_nodes SET status = 'unknown', owner = NULL, expires_at = NULL
-        WHERE session_id = ? AND status = 'running' AND expires_at < ?`,
+          `UPDATE workspace_tasks SET status = 'unknown', owner = NULL, expires_at = NULL, updated_at = ?
+        WHERE workspace = ? AND status = 'running' AND expires_at < ?`,
         )
-        .run(sessionId, Date.now());
-      const tasks = this.listTasks(sessionId);
+        .run(new Date().toISOString(), workspace, Date.now());
+      const tasks = this.taskRows(workspace);
+      const held = tasks.find((task) => task.status === 'running' && task.owner === owner);
+      if (held) return undefined;
       const completed = new Set(
         tasks.filter((task) => task.status === 'completed').map((task) => task.id),
       );
       const candidate = tasks.find(
-        (task) => task.status === 'pending' && task.dependencies.every((id) => completed.has(id)),
+        (task) => task.status === 'pending' && task.dependencies.every((dep) => completed.has(dep)),
       );
       if (!candidate) return undefined;
       this.db
-        .prepare(`UPDATE task_nodes SET status = 'running', owner = ?, expires_at = ? WHERE id = ?`)
-        .run(owner, Date.now() + ttlMs, candidate.id);
-      return this.rowToTask(
-        this.db.prepare('SELECT * FROM task_nodes WHERE id = ?').get(candidate.id),
-      );
+        .prepare(
+          `UPDATE workspace_tasks SET status = 'running', owner = ?, expires_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(owner, Date.now() + ttlMs, new Date().toISOString(), candidate.id);
+      return candidate.id;
     })();
+    this.repairTaskFiles(workspace);
+    return id ? this.taskRows(workspace).find((task) => task.id === id) : undefined;
   }
   renewTask(id: string, owner: string, ttlMs: number): boolean {
     if (ttlMs < 1000 || ttlMs > 3600000) throw new Error('无效任务租约');
     return (
       this.db
         .prepare(
-          `UPDATE task_nodes SET expires_at = ? WHERE id = ? AND owner = ? AND status = 'running' AND expires_at >= ?`,
+          `UPDATE workspace_tasks SET expires_at = ?
+      WHERE id = ? AND owner = ? AND status = 'running' AND expires_at >= ?`,
         )
         .run(Date.now() + ttlMs, id, owner, Date.now()).changes === 1
     );
   }
   finishTask(id: string, owner: string, success: boolean): void {
+    const row = this.db.prepare('SELECT workspace FROM workspace_tasks WHERE id = ?').get(id) as
+      { workspace: string } | undefined;
     const result = this.db
       .prepare(
-        `UPDATE task_nodes SET status = ?, owner = NULL, expires_at = NULL
+        `UPDATE workspace_tasks SET status = ?, owner = NULL, expires_at = NULL, updated_at = ?
       WHERE id = ? AND owner = ? AND status = 'running' AND expires_at >= ?`,
       )
-      .run(success ? 'completed' : 'failed', id, owner, Date.now());
+      .run(success ? 'completed' : 'failed', new Date().toISOString(), id, owner, Date.now());
     if (!result.changes) throw new Error('任务租约已失效或不属于当前进程');
+    if (row) this.repairTaskFiles(row.workspace);
   }
   releaseTask(id: string, owner: string): void {
+    const row = this.db.prepare('SELECT workspace FROM workspace_tasks WHERE id = ?').get(id) as
+      { workspace: string } | undefined;
     this.db
       .prepare(
-        `UPDATE task_nodes SET status = 'pending', owner = NULL, expires_at = NULL
+        `UPDATE workspace_tasks SET status = 'pending', owner = NULL, expires_at = NULL, updated_at = ?
       WHERE id = ? AND owner = ? AND status = 'running'`,
       )
-      .run(id, owner);
+      .run(new Date().toISOString(), id, owner);
+    if (row) this.repairTaskFiles(row.workspace);
   }
   retryTask(sessionId: string, id: string): void {
+    const workspace = this.taskWorkspace(sessionId);
     const result = this.db
       .prepare(
-        `UPDATE task_nodes SET status = 'pending', owner = NULL, expires_at = NULL
-      WHERE id = ? AND session_id = ? AND status IN ('failed', 'unknown')`,
+        `UPDATE workspace_tasks SET status = 'pending', owner = NULL, expires_at = NULL, updated_at = ?
+      WHERE id = ? AND workspace = ? AND status IN ('failed', 'unknown')`,
       )
-      .run(id, sessionId);
+      .run(new Date().toISOString(), id, workspace);
     if (!result.changes) throw new Error('只有失败或结果未知的任务可以重试');
+    this.repairTaskFiles(workspace);
   }
   private rowToCronJob(row: any): CronJob {
     return {
@@ -316,9 +518,17 @@ export class SqliteEventStore implements EventStore {
       .next()
       .getTime();
     const id = randomUUID();
-    this.db
-      .prepare('INSERT INTO cron_jobs VALUES (?, ?, ?, ?, ?, NULL)')
-      .run(id, sessionId, expression, prompt.trim(), nextRunAt);
+    this.db.transaction(() => {
+      const count = (
+        this.db
+          .prepare('SELECT COUNT(*) AS n FROM cron_jobs WHERE session_id = ?')
+          .get(sessionId) as { n: number }
+      ).n;
+      if (count >= 50) throw new Error('会话定时任务已达到 50 项上限');
+      this.db
+        .prepare('INSERT INTO cron_jobs VALUES (?, ?, ?, ?, ?, NULL)')
+        .run(id, sessionId, expression, prompt.trim(), nextRunAt);
+    })();
     return this.rowToCronJob(this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id));
   }
   listCronJobs(sessionId: string): CronJob[] {

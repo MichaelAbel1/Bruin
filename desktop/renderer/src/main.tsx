@@ -69,7 +69,14 @@ type CronJob = {
   nextRunAt: number;
   lastStatus?: string;
 };
-type TaskNode = { id: string; title: string; status: string; dependencies: string[] };
+type TaskNode = {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+  dependencies: string[];
+  blocks: string[];
+};
 type Skill = {
   name: string;
   description: string;
@@ -1019,6 +1026,7 @@ function RuntimeDialog({
   const [cronPrompt, setCronPrompt] = useState('');
   const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
   const [taskTitle, setTaskTitle] = useState('');
+  const [taskDescription, setTaskDescription] = useState('');
   const [taskDependencies, setTaskDependencies] = useState('');
   const [graphTaskId, setGraphTaskId] = useState('');
   const [graphTasks, setGraphTasks] = useState<TaskNode[]>([]);
@@ -1293,12 +1301,18 @@ function RuntimeDialog({
         </button>
         <small>桌面客户端运行时调度；工具调用仍需逐项批准。</small>
         <h3>任务图与本机进程认领</h3>
+        <small>
+          任务跨同一工作区的会话共享，并同步为工作区 .tasks/*.json；SQLite 负责原子认领。
+        </small>
         {graphTasks.map((task) => (
           <div className="runtime-row" key={task.id}>
             <span>
               <strong>{task.title}</strong> · {task.status} · {task.id.slice(0, 8)} · 依赖{' '}
               {task.dependencies.length}
             </span>
+            <button disabled={working} onClick={() => void runtime('get_task', { id: task.id })}>
+              详情
+            </button>
             {(task.status === 'unknown' || task.status === 'failed') && (
               <button disabled={working} onClick={() => void retryTask(task.id)}>
                 {retryConfirmId === task.id ? '确认重试' : '检查后重试'}
@@ -1322,6 +1336,7 @@ function RuntimeDialog({
             onClick={() =>
               void runtime('create_task', {
                 title: taskTitle,
+                description: taskDescription,
                 dependencies: taskDependencies
                   .split(',')
                   .map((x) => x.trim())
@@ -1332,9 +1347,25 @@ function RuntimeDialog({
             添加任务
           </button>
         </div>
+        <textarea
+          value={taskDescription}
+          onChange={(e) => setTaskDescription(e.target.value)}
+          placeholder="任务详细描述（可选）"
+        />
         <div className="runtime-row">
           <button disabled={working || !session} onClick={() => void runtime('list_tasks')}>
             查看任务图
+          </button>
+          <button
+            disabled={working || !session}
+            onClick={() => {
+              if (!session) return;
+              void api<TaskNode[]>('syncTasks', { sessionId: session.id })
+                .then(setGraphTasks)
+                .catch(fail);
+            }}
+          >
+            修复 .tasks 快照
           </button>
           <button disabled={working || !session} onClick={() => void runtime('claim_task')}>
             认领就绪任务
@@ -1349,6 +1380,20 @@ function RuntimeDialog({
             onClick={() => void runtime('finish_task', { id: graphTaskId, success: true })}
           >
             标记完成
+          </button>
+          <button
+            disabled={working || !session || !graphTaskId.trim() || !taskDependencies.trim()}
+            onClick={() =>
+              void runtime('update_task', {
+                id: graphTaskId,
+                addBlockedBy: taskDependencies
+                  .split(',')
+                  .map((x) => x.trim())
+                  .filter(Boolean),
+              })
+            }
+          >
+            增加依赖
           </button>
         </div>
         <h3>工作区记忆</h3>

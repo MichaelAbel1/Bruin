@@ -32,6 +32,7 @@ import {
 } from './skills/registry.js';
 import { searchSkillsSh, installSkillsSh } from './skills/skills-sh.js';
 import type { ModelProfile, ProviderKind, ToolCall } from './core/types.js';
+import { RuntimeServices } from './runtime/services.js';
 
 const help = `Bruin — local coding agent
 
@@ -214,7 +215,23 @@ async function main(): Promise<void> {
         return /^y(es)?$/i.test(answer.trim());
       },
     };
-    const runner = new AgentRunner(store, new AiSdkGateway(), executor, io);
+    const services = new RuntimeServices(store, executor, (childSession, childPrompt, signal) =>
+      new AgentRunner(
+        store,
+        new AiSdkGateway('read-only'),
+        executor,
+        {
+          text() {},
+          notice() {},
+          async approve() {
+            return false;
+          },
+        },
+        undefined,
+        true,
+      ).run(childSession, childPrompt, signal),
+    );
+    const runner = new AgentRunner(store, new AiSdkGateway('full'), executor, io, services);
     const controller = new AbortController();
     const leaseOwner = randomUUID();
     const leaseSessionId = session.id;
@@ -265,6 +282,7 @@ async function main(): Promise<void> {
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       if (leaseAcquired) store.releaseLease(leaseSessionId, leaseOwner);
+      await services.close();
       await executor.close();
       rl.close();
     }

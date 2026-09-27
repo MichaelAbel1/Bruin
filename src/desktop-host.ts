@@ -16,7 +16,7 @@ import {
   hookSchema,
 } from './config.js';
 import { SqliteEventStore } from './storage/event-store.js';
-import { AiSdkGateway } from './providers/gateway.js';
+import { AiSdkGateway, toolSchemas } from './providers/gateway.js';
 import { discoverModels } from './providers/catalog.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
@@ -202,6 +202,11 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       return store.listSessions();
     case 'listTasks':
       return store.listTasks(getSession(p.sessionId).id);
+    case 'syncTasks': {
+      const session = getSession(p.sessionId);
+      store.syncTasks(session.id);
+      return store.listTasks(session.id);
+    }
     case 'retryTask': {
       const session = getSession(p.sessionId);
       store.retryTask(session.id, String(p.id ?? ''));
@@ -361,6 +366,8 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           'cancel_background',
           'create_task',
           'list_tasks',
+          'get_task',
+          'update_task',
           'claim_task',
           'finish_task',
           'list_memory',
@@ -370,10 +377,12 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         ].includes(name)
       )
         throw new Error('不支持此界面操作');
+      const parsed = toolSchemas[name].inputSchema.safeParse(p.input ?? {});
+      if (!parsed.success) throw new Error('工具参数不符合 schema');
       const call: ToolCall = {
         id: randomUUID(),
         name,
-        input: (p.input ?? {}) as Record<string, unknown>,
+        input: parsed.data as Record<string, unknown>,
       };
       if (planBlocks(call, planState(store.events(session.id))))
         throw new Error('规划模式等待用户批准计划');
@@ -544,6 +553,8 @@ async function scheduleTick() {
     }
     for (const session of store.listSessions()) {
       if (store.isLeased(session.id) || needsReview(session.id)) continue;
+      const plan = planState(store.events(session.id));
+      if (plan.enabled && !plan.approved) continue;
       const task = services.claimReadyTask(session);
       if (!task) continue;
       try {

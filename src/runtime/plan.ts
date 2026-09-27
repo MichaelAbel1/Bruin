@@ -40,6 +40,7 @@ export function planBlocks(call: ToolCall, state: PlanState): boolean {
       'subagent_status',
       'background_status',
       'list_tasks',
+      'get_task',
       'list_memory',
     ].includes(call.name)
   );

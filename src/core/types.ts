@@ -20,6 +20,8 @@ export type ToolName =
   | 'update_plan_progress'
   | 'create_task'
   | 'list_tasks'
+  | 'get_task'
+  | 'update_task'
   | 'claim_task'
   | 'finish_task'
   | 'list_memory'

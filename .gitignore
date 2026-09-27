@@ -2,6 +2,7 @@ node_modules/
 dist/
 .npm-cache/
 .bruin/
+.tasks/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

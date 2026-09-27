@@ -99,26 +99,54 @@ export class RuntimeServices {
         );
         return { output: '工作区记忆已保存', isError: false };
       case 'create_task': {
-        const task = this.store.createTask(
-          session.id,
-          String(input.title ?? ''),
-          Array.isArray(input.dependencies) ? input.dependencies.map(String) : [],
-        );
-        return { output: JSON.stringify(task), isError: false };
+        try {
+          const task = this.store.createTask(
+            session.id,
+            String(input.title ?? ''),
+            Array.isArray(input.dependencies) ? input.dependencies.map(String) : [],
+            String(input.description ?? ''),
+          );
+          return { output: JSON.stringify(task), isError: false };
+        } catch (error) {
+          return { output: error instanceof Error ? error.message : String(error), isError: true };
+        }
       }
       case 'list_tasks':
         return { output: JSON.stringify(this.store.listTasks(session.id)), isError: false };
+      case 'get_task': {
+        const task = this.store.getTask(session.id, String(input.id ?? ''));
+        if (!task) return { output: '任务不存在或不属于当前工作区', isError: true };
+        return { output: JSON.stringify(task), isError: false };
+      }
+      case 'update_task': {
+        try {
+          const task = this.store.updateTask(session.id, String(input.id ?? ''), {
+            ...(typeof input.title === 'string' ? { title: input.title } : {}),
+            ...(typeof input.description === 'string' ? { description: input.description } : {}),
+            ...(Array.isArray(input.addBlockedBy)
+              ? { addBlockedBy: input.addBlockedBy.map(String) }
+              : {}),
+          });
+          return { output: JSON.stringify(task), isError: false };
+        } catch (error) {
+          return { output: error instanceof Error ? error.message : String(error), isError: true };
+        }
+      }
       case 'claim_task': {
         const task = this.claimReadyTask(session);
         return { output: JSON.stringify(task ?? null), isError: false };
       }
       case 'finish_task': {
-        const id = String(input.id ?? '');
-        if (!this.store.listTasks(session.id).some((task) => task.id === id))
-          throw new Error('任务不属于当前会话');
-        this.store.finishTask(id, this.taskOwner, input.success === true);
-        this.claimedTasks.delete(id);
-        return { output: '任务状态已保存', isError: false };
+        try {
+          const id = String(input.id ?? '');
+          if (!this.store.listTasks(session.id).some((task) => task.id === id))
+            throw new Error('任务不属于当前工作区');
+          this.store.finishTask(id, this.taskOwner, input.success === true);
+          this.claimedTasks.delete(id);
+          return { output: '任务状态已保存', isError: false };
+        } catch (error) {
+          return { output: error instanceof Error ? error.message : String(error), isError: true };
+        }
       }
       case 'mcp_list_tools': {
         const server = loadConfig().mcpServers.find((item) => item.name === input.server);

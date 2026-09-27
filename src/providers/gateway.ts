@@ -104,15 +104,30 @@ export const toolSchemas = {
   },
   create_task: {
     description:
-      'Add a task to the durable session task graph. Dependencies must be existing task IDs.',
+      'Add a task to the workspace task graph. Dependencies must be existing task IDs in this workspace.',
     inputSchema: z.object({
       title: z.string().min(1).max(500),
+      description: z.string().max(8000).default(''),
       dependencies: z.array(z.string()).max(30).default([]),
     }),
   },
   list_tasks: {
-    description: 'List durable tasks and their dependencies for this session',
+    description: 'List durable tasks and their dependencies for this workspace',
     inputSchema: z.object({}),
+  },
+  get_task: {
+    description: 'Read full details, owner and dependencies of one workspace task',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  update_task: {
+    description:
+      'Edit a workspace task and add dependencies; cycles are rejected. Requires approval.',
+    inputSchema: z.object({
+      id: z.string(),
+      title: z.string().min(1).max(500).optional(),
+      description: z.string().max(8000).optional(),
+      addBlockedBy: z.array(z.string()).max(30).optional(),
+    }),
   },
   claim_task: {
     description: 'Atomically claim the next ready task for this local Bruin process',

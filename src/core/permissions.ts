@@ -30,6 +30,8 @@ export function decisionFor(
       'update_plan_progress',
       'create_task',
       'list_tasks',
+      'get_task',
+      'update_task',
       'claim_task',
       'finish_task',
       'list_memory',
@@ -38,6 +40,10 @@ export function decisionFor(
   )
     return { decision: 'deny', reason: '未知工具' };
   if (call.name === 'shell') return { decision: 'ask', reason: 'Shell 命令可执行任意程序' };
+  if (call.name === 'create_task')
+    return { decision: 'ask', reason: '创建任务会写入工作区 .tasks 目录' };
+  if (call.name === 'update_task')
+    return { decision: 'ask', reason: '修改任务会写入工作区 .tasks 目录' };
   if (
     [
       'mcp_call',
@@ -58,8 +64,8 @@ export function decisionFor(
       'cancel_background',
       'update_plan',
       'update_plan_progress',
-      'create_task',
       'list_tasks',
+      'get_task',
       'claim_task',
       'finish_task',
       'list_memory',
