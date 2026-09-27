@@ -1,5 +1,8 @@
 import type { ModelProfile } from '../core/types.js';
 import { resolveApiKey } from './gateway.js';
+import { createHash } from 'node:crypto';
+
+const modelCache = new Map<string, { until: number; models: string[] }>();
 
 const defaultBaseUrls = {
   openai: 'https://api.openai.com/v1',
@@ -7,7 +10,7 @@ const defaultBaseUrls = {
   google: 'https://generativelanguage.googleapis.com/v1beta',
 } as const;
 
-export async function discoverModels(profile: ModelProfile): Promise<string[]> {
+export async function discoverModels(profile: ModelProfile, refresh = false): Promise<string[]> {
   const base =
     profile.baseUrl ??
     (profile.provider === 'openai-compatible' ? '' : defaultBaseUrls[profile.provider]);
@@ -16,6 +19,15 @@ export async function discoverModels(profile: ModelProfile): Promise<string[]> {
   if (!['http:', 'https:'].includes(endpoint.protocol))
     throw new Error('模型目录仅支持 HTTP 或 HTTPS');
   const key = resolveApiKey(profile);
+  const cacheKey = JSON.stringify({
+    provider: profile.provider,
+    base,
+    credential: createHash('sha256')
+      .update(key ?? '')
+      .digest('hex'),
+  });
+  const cached = modelCache.get(cacheKey);
+  if (!refresh && cached && cached.until > Date.now()) return [...cached.models];
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (profile.provider === 'anthropic') {
     if (key) headers['x-api-key'] = key;
@@ -91,5 +103,7 @@ export async function discoverModels(profile: ModelProfile): Promise<string[]> {
       endpoint.searchParams.set('after_id', result.last_id);
     } else break;
   }
-  return [...ids].sort((a, b) => a.localeCompare(b));
+  const models = [...ids].sort((a, b) => a.localeCompare(b));
+  modelCache.set(cacheKey, { until: Date.now() + 5 * 60_000, models });
+  return models;
 }

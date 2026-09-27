@@ -6,6 +6,10 @@ import type { ModelProfile } from './core/types.js';
 
 const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const runtimeKeys = new Map<string, string>();
+let migratedLegacyKey = false;
+export function legacyKeyWasMigrated(): boolean {
+  return migratedLegacyKey;
+}
 export function validApiKeyEnv(name: string): boolean {
   return envNamePattern.test(name);
 }
@@ -88,6 +92,7 @@ export function loadConfig(): AppConfig {
     if (profile.alias && looksLikeApiKey(value)) setRuntimeApiKey(profile.alias, value);
     delete profile.apiKeyEnv;
     migrated = true;
+    migratedLegacyKey = true;
   }
   const config = configSchema.parse(raw);
   if (migrated) saveConfig(config);

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs');
@@ -12,6 +12,55 @@ const development = Boolean(process.env.BRUIN_RENDERER_URL);
 const iconThemes = new Set(['white', 'black', 'sage', 'blue', 'orange']);
 let iconBackground = 'white';
 let uiTheme = 'light';
+let hostReady = Promise.resolve();
+
+function secretsPath() {
+  return path.join(
+    process.env.BRUIN_HOME || path.join(app.getPath('home'), '.bruin'),
+    'keys.enc.json',
+  );
+}
+function secureStorageAvailable() {
+  return (
+    safeStorage.isEncryptionAvailable() &&
+    (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text')
+  );
+}
+function readEncryptedKeys() {
+  try {
+    const value = JSON.parse(fs.readFileSync(secretsPath(), 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.assign(Object.create(null), value)
+      : Object.create(null);
+  } catch (error) {
+    if (error.code === 'ENOENT') return Object.create(null);
+    throw new Error('已保存的密钥文件损坏或不可读取');
+  }
+}
+function writeEncryptedKeys(keys) {
+  const file = secretsPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(keys), { mode: 0o600 });
+  fs.renameSync(temp, file);
+}
+function updateStoredKey(alias, ciphertext, remove) {
+  const keys = readEncryptedKeys();
+  if (remove) delete keys[alias];
+  else if (ciphertext) keys[alias] = ciphertext;
+  writeEncryptedKeys(keys);
+}
+async function restoreStoredKeys() {
+  const keys = readEncryptedKeys();
+  if (!Object.keys(keys).length) return;
+  if (!secureStorageAvailable()) throw new Error('系统安全存储不可用，无法恢复 API Key');
+  const restored = {};
+  for (const [alias, ciphertext] of Object.entries(keys)) {
+    if (typeof ciphertext !== 'string') continue;
+    restored[alias] = safeStorage.decryptString(Buffer.from(ciphertext, 'base64'));
+  }
+  await requestHost('restoreApiKeys', { keys: restored });
+}
 
 function appearancePath() {
   return path.join(
@@ -147,9 +196,10 @@ function createWindow() {
 app.whenReady().then(() => {
   loadAppearance();
   startHost();
+  hostReady = restoreStoredKeys();
   createWindow();
   applyIcon();
-  ipcMain.handle('bruin:request', (event, method, params) => {
+  ipcMain.handle('bruin:request', async (event, method, params) => {
     if (
       !window ||
       event.sender !== window.webContents ||
@@ -163,7 +213,31 @@ app.whenReady().then(() => {
     if (method === 'getAppearance') return { iconBackground, uiTheme };
     if (method === 'setIconBackground') return saveAppearance({ iconBackground: params?.theme });
     if (method === 'setTheme') return saveAppearance({ uiTheme: params?.theme });
-    return requestHost(method, params || {});
+    if (method === 'restoreApiKeys') throw new Error('不支持此界面操作');
+    await hostReady;
+    if (method === 'saveProfile' && params?.apiKey && !secureStorageAvailable())
+      throw new Error('系统安全存储不可用，无法持久保存 API Key');
+    const encryptedKey =
+      method === 'saveProfile' && params?.apiKey
+        ? safeStorage.encryptString(params.apiKey).toString('base64')
+        : undefined;
+    const previousProfile =
+      method === 'saveProfile'
+        ? (await requestHost('bootstrap')).config.profiles.find(
+            (item) => item.alias === params?.alias,
+          )
+        : null;
+    const result = await requestHost(method, params || {});
+    if (method === 'saveProfile') {
+      const removeKey = Boolean(
+        params?.clearApiKey ||
+        (previousProfile && previousProfile.provider !== params?.provider && !params?.apiKey),
+      );
+      if (params?.apiKey || removeKey)
+        updateStoredKey(String(params.alias), encryptedKey, removeKey);
+    }
+    if (method === 'removeProfile') updateStoredKey(String(params?.alias), undefined, true);
+    return result;
   });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

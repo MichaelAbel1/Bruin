@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import {
@@ -215,8 +216,17 @@ async function main(): Promise<void> {
     };
     const runner = new AgentRunner(store, new AiSdkGateway(), executor, io);
     const controller = new AbortController();
+    const leaseOwner = randomUUID();
+    const leaseSessionId = session.id;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let leaseAcquired = false;
     process.once('SIGINT', () => controller.abort());
     try {
+      store.acquireLease(leaseSessionId, leaseOwner, 30_000);
+      leaseAcquired = true;
+      heartbeat = setInterval(() => {
+        if (!store.renewLease(leaseSessionId, leaseOwner, 30_000)) controller.abort();
+      }, 10_000);
       const unknown = resume ? runner.recover(session) : 0;
       if (unknown) {
         const answer = await rl.question(
@@ -243,7 +253,7 @@ async function main(): Promise<void> {
         const line = await rl.question('\n你> ');
         if (line.trim() === '/exit') break;
         if (line.startsWith('/model ')) {
-          store.setProfile(session.id, findProfile(line.slice(7).trim()));
+          store.setProfile(session.id, findProfile(line.slice(7).trim()), leaseOwner);
           session = store.getSession(session.id)!;
           console.log(`模型已切换为 ${session.profile.alias}`);
           continue;
@@ -253,6 +263,8 @@ async function main(): Promise<void> {
         stdout.write('\n');
       }
     } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      if (leaseAcquired) store.releaseLease(leaseSessionId, leaseOwner);
       await executor.close();
       rl.close();
     }

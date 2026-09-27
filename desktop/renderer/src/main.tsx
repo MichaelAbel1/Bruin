@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   Bot,
   Check,
@@ -19,6 +21,7 @@ import {
   Sparkles,
   Square,
   Terminal,
+  Trash2,
   X,
 } from 'lucide-react';
 import './style.css';
@@ -57,7 +60,16 @@ type SessionView = {
   plan: { enabled: boolean; steps: string[]; approved: boolean; progress: Record<number, string> };
   needsReview: boolean;
   recoveredUnknown?: number;
+  tasks?: TaskNode[];
 };
+type CronJob = {
+  id: string;
+  expression: string;
+  prompt: string;
+  nextRunAt: number;
+  lastStatus?: string;
+};
+type TaskNode = { id: string; title: string; status: string; dependencies: string[] };
 type Skill = {
   name: string;
   description: string;
@@ -120,6 +132,29 @@ const date = (value: string) =>
     hour: '2-digit',
     minute: '2-digit',
   });
+function MarkdownMessage({ text }: { text: string }) {
+  return (
+    <div className="message-text markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        components={{
+          a: ({ href, children }) =>
+            href?.startsWith('https://') ? (
+              <a href={href} target="_blank" rel="noopener noreferrer">
+                {children}
+              </a>
+            ) : (
+              <span>{children}</span>
+            ),
+          img: ({ alt }) => <span>[图片：{alt || '未加载'}]</span>,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
 function sessionTitle(session: Session, events?: SessionEvent[]) {
   const user = events?.find((e) => e.type === 'user');
   const label = typeof user?.payload.text === 'string' ? user.payload.text : '';
@@ -146,11 +181,13 @@ function App() {
   const [uiTheme, setUiTheme] = useState<'light' | 'dark'>('light');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [securityNotice, setSecurityNotice] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [modelLoading, setModelLoading] = useState(false);
   const [modelRefresh, setModelRefresh] = useState(0);
+  const [deletingSession, setDeletingSession] = useState<string | null>(null);
   const selected = useRef<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
 
@@ -160,6 +197,20 @@ function App() {
   };
   async function refreshSessions() {
     setSessions(await api<Session[]>('listSessions'));
+  }
+  async function deleteSession(id: string) {
+    try {
+      const remaining = await api<Session[]>('deleteSession', { sessionId: id });
+      setSessions(remaining);
+      setDeletingSession(null);
+      if (selected.current === id) {
+        selected.current = null;
+        setView(null);
+        if (remaining[0]) await openSession(remaining[0].id);
+      }
+    } catch (err) {
+      fail(err);
+    }
   }
   async function openSession(id: string) {
     try {
@@ -184,15 +235,23 @@ function App() {
         }
       })
       .catch(fail);
-    void api<{ config: Config; sessions: Session[]; skills: Skill[]; busySessionId?: string }>(
-      'bootstrap',
-    )
+    void api<{
+      config: Config;
+      sessions: Session[];
+      skills: Skill[];
+      busySessionId?: string;
+      legacyKeyExposure?: boolean;
+    }>('bootstrap')
       .then((data) => {
         if (disposed) return;
         setConfig(data.config);
         setSessions(data.sessions);
         setSkills(data.skills);
         setBusy(Boolean(data.busySessionId));
+        if (data.legacyKeyExposure)
+          setSecurityNotice(
+            '检测到旧版本曾保存 API Key。请在服务商后台轮换该密钥；旧数据库页和备份可能仍有副本。',
+          );
         if (data.sessions[0]) void openSession(data.sessions[0].id);
         else if (!data.config.profiles.length) setDialog('model');
       })
@@ -267,7 +326,7 @@ function App() {
     setModelLoading(true);
     setDiscoveredModels([]);
     setModelDiscoveryError('');
-    void api<string[]>('discoverModels', { alias })
+    void api<string[]>('discoverModels', { alias, refresh: modelRefresh > 0 })
       .then((models) => {
         if (!cancelled) setDiscoveredModels(models);
       })
@@ -401,22 +460,39 @@ function App() {
         </div>
         <div className="session-list">
           {sessions.map((session) => (
-            <button
-              key={session.id}
-              className={`session-item ${view?.session.id === session.id ? 'active' : ''}`}
-              onClick={() => void openSession(session.id)}
-              disabled={busy && view?.session.id !== session.id}
-            >
-              <MessageSquare size={16} />
-              <span className="session-copy">
-                <strong>
-                  {sessionTitle(session, view?.session.id === session.id ? view.events : undefined)}
-                </strong>
-                <small>
-                  {short(session.workspace)} · {date(session.updatedAt)}
-                </small>
-              </span>
-            </button>
+            <div className="session-row" key={session.id}>
+              <button
+                className={`session-item ${view?.session.id === session.id ? 'active' : ''}`}
+                onClick={() => void openSession(session.id)}
+                disabled={busy && view?.session.id !== session.id}
+              >
+                <MessageSquare size={16} />
+                <span className="session-copy">
+                  <strong>
+                    {sessionTitle(
+                      session,
+                      view?.session.id === session.id ? view.events : undefined,
+                    )}
+                  </strong>
+                  <small>
+                    {short(session.workspace)} · {date(session.updatedAt)}
+                  </small>
+                </span>
+              </button>
+              <button
+                className="session-delete"
+                aria-label={deletingSession === session.id ? '确认删除会话' : '删除会话'}
+                title={deletingSession === session.id ? '再次点击，删除本地会话记录' : '删除会话'}
+                disabled={busy && view?.session.id === session.id}
+                onClick={() =>
+                  deletingSession === session.id
+                    ? void deleteSession(session.id)
+                    : setDeletingSession(session.id)
+                }
+              >
+                {deletingSession === session.id ? '确认删除' : <Trash2 size={15} />}
+              </button>
+            </div>
           ))}
           {!sessions.length && <div className="empty-sidebar">从一个项目文件夹开始。</div>}
         </div>
@@ -497,6 +573,15 @@ function App() {
             </div>
           </div>
         </header>
+        {securityNotice && (
+          <div className="security-banner" role="alert">
+            <ShieldCheck size={16} />
+            <span>{securityNotice}</span>
+            <button onClick={() => setSecurityNotice('')} aria-label="关闭提醒">
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {!view ? (
           <div className="welcome">
             <div className="welcome-icon">
@@ -625,7 +710,7 @@ function App() {
                     <div className="message-author">
                       Bruin <span className="live-dot" />
                     </div>
-                    <div className="message-text">{stream}</div>
+                    <MarkdownMessage text={stream} />
                   </div>
                 </div>
               )}
@@ -706,8 +791,8 @@ function App() {
         </div>
       )}
       {approval && (
-        <div className="modal-backdrop">
-          <div className="approval-modal">
+        <div className="approval-dock" role="region" aria-label="工具操作审批">
+          <div className="approval-panel">
             <div className="approval-head">
               <div className="approval-icon">
                 <ShieldCheck size={22} />
@@ -809,7 +894,7 @@ function EventCard({ event }: { event: SessionEvent }) {
           <div className="message-author">
             你 <time>{date(event.at)}</time>
           </div>
-          <div className="message-text">{String(event.payload.text ?? '')}</div>
+          <MarkdownMessage text={String(event.payload.text ?? '')} />
         </div>
       </div>
     );
@@ -828,7 +913,7 @@ function EventCard({ event }: { event: SessionEvent }) {
           <div className="message-author">
             Bruin <time>{date(event.at)}</time>
           </div>
-          {text && <div className="message-text">{text}</div>}
+          {text && <MarkdownMessage text={text} />}
           {calls.length > 0 && (
             <div className="tool-chips">
               {calls.map((call, index) => (
@@ -930,6 +1015,21 @@ function RuntimeDialog({
   const [subagentPrompt, setSubagentPrompt] = useState('');
   const [backgroundCommand, setBackgroundCommand] = useState('');
   const [taskId, setTaskId] = useState('');
+  const [cronExpression, setCronExpression] = useState('0 9 * * *');
+  const [cronPrompt, setCronPrompt] = useState('');
+  const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
+  const [taskTitle, setTaskTitle] = useState('');
+  const [taskDependencies, setTaskDependencies] = useState('');
+  const [graphTaskId, setGraphTaskId] = useState('');
+  const [graphTasks, setGraphTasks] = useState<TaskNode[]>([]);
+  const [retryConfirmId, setRetryConfirmId] = useState('');
+  const [memoryKey, setMemoryKey] = useState('');
+  const [memoryContent, setMemoryContent] = useState('');
+  useEffect(() => {
+    if (!session) return;
+    void api<CronJob[]>('listCronJobs', { sessionId: session.id }).then(setCronJobs).catch(fail);
+    void api<TaskNode[]>('listTasks', { sessionId: session.id }).then(setGraphTasks).catch(fail);
+  }, [session?.id]);
   const [output, setOutput] = useState('');
   const [working, setWorking] = useState(false);
   async function manage(method: string, params: Record<string, unknown>) {
@@ -958,6 +1058,52 @@ function RuntimeDialog({
         input,
       });
       setOutput(result.output);
+      if (name.endsWith('_task') || name === 'list_tasks')
+        setGraphTasks(await api<TaskNode[]>('listTasks', { sessionId: session.id }));
+    } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function createCron() {
+    if (!session) return;
+    setWorking(true);
+    try {
+      await api('createCronJob', {
+        sessionId: session.id,
+        expression: cronExpression,
+        prompt: cronPrompt,
+      });
+      setCronJobs(await api<CronJob[]>('listCronJobs', { sessionId: session.id }));
+      setCronPrompt('');
+    } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function removeCron(id: string) {
+    if (!session) return;
+    setWorking(true);
+    try {
+      setCronJobs(await api<CronJob[]>('deleteCronJob', { sessionId: session.id, id }));
+    } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function retryTask(id: string) {
+    if (!session) return;
+    if (retryConfirmId !== id) {
+      setRetryConfirmId(id);
+      return;
+    }
+    setWorking(true);
+    try {
+      setGraphTasks(await api<TaskNode[]>('retryTask', { sessionId: session.id, id }));
+      setRetryConfirmId('');
     } catch (error) {
       fail(error);
     } finally {
@@ -975,8 +1121,10 @@ function RuntimeDialog({
               {server.transport === 'stdio' ? server.command : server.url}
             </span>
             <button
-              disabled={working}
-              onClick={() => void manage('testMcpServer', { name: server.name })}
+              disabled={working || (server.transport === 'stdio' && !session)}
+              onClick={() =>
+                void manage('testMcpServer', { name: server.name, sessionId: session?.id })
+              }
             >
               测试工具
             </button>
@@ -1115,6 +1263,116 @@ function RuntimeDialog({
           }
         >
           保存 Hook
+        </button>
+        <h3>定时任务</h3>
+        {cronJobs.map((job) => (
+          <div className="runtime-row" key={job.id}>
+            <span>
+              <strong>{job.expression}</strong> · {job.prompt} · 下次{' '}
+              {new Date(job.nextRunAt).toLocaleString('zh-CN')} · {job.lastStatus ?? '待执行'}
+            </span>
+            <button disabled={working} onClick={() => void removeCron(job.id)}>
+              删除
+            </button>
+          </div>
+        ))}
+        <label>
+          五段 Cron 表达式
+          <input value={cronExpression} onChange={(e) => setCronExpression(e.target.value)} />
+        </label>
+        <label>
+          到点发送给 Agent 的消息
+          <input value={cronPrompt} onChange={(e) => setCronPrompt(e.target.value)} />
+        </label>
+        <button
+          className="secondary"
+          disabled={working || !session || !cronPrompt.trim()}
+          onClick={() => void createCron()}
+        >
+          添加定时任务
+        </button>
+        <small>桌面客户端运行时调度；工具调用仍需逐项批准。</small>
+        <h3>任务图与本机进程认领</h3>
+        {graphTasks.map((task) => (
+          <div className="runtime-row" key={task.id}>
+            <span>
+              <strong>{task.title}</strong> · {task.status} · {task.id.slice(0, 8)} · 依赖{' '}
+              {task.dependencies.length}
+            </span>
+            {(task.status === 'unknown' || task.status === 'failed') && (
+              <button disabled={working} onClick={() => void retryTask(task.id)}>
+                {retryConfirmId === task.id ? '确认重试' : '检查后重试'}
+              </button>
+            )}
+          </div>
+        ))}
+        <div className="runtime-row">
+          <input
+            value={taskTitle}
+            onChange={(e) => setTaskTitle(e.target.value)}
+            placeholder="任务内容"
+          />
+          <input
+            value={taskDependencies}
+            onChange={(e) => setTaskDependencies(e.target.value)}
+            placeholder="依赖任务 ID，逗号分隔"
+          />
+          <button
+            disabled={working || !session || !taskTitle.trim()}
+            onClick={() =>
+              void runtime('create_task', {
+                title: taskTitle,
+                dependencies: taskDependencies
+                  .split(',')
+                  .map((x) => x.trim())
+                  .filter(Boolean),
+              })
+            }
+          >
+            添加任务
+          </button>
+        </div>
+        <div className="runtime-row">
+          <button disabled={working || !session} onClick={() => void runtime('list_tasks')}>
+            查看任务图
+          </button>
+          <button disabled={working || !session} onClick={() => void runtime('claim_task')}>
+            认领就绪任务
+          </button>
+          <input
+            value={graphTaskId}
+            onChange={(e) => setGraphTaskId(e.target.value)}
+            placeholder="已认领任务 ID"
+          />
+          <button
+            disabled={working || !session || !graphTaskId.trim()}
+            onClick={() => void runtime('finish_task', { id: graphTaskId, success: true })}
+          >
+            标记完成
+          </button>
+        </div>
+        <h3>工作区记忆</h3>
+        <div className="runtime-row">
+          <button disabled={working || !session} onClick={() => void runtime('list_memory')}>
+            查看记忆
+          </button>
+          <input
+            value={memoryKey}
+            onChange={(e) => setMemoryKey(e.target.value)}
+            placeholder="记忆名称"
+          />
+        </div>
+        <textarea
+          value={memoryContent}
+          onChange={(e) => setMemoryContent(e.target.value)}
+          placeholder="项目约定或背景信息"
+        />
+        <button
+          className="secondary"
+          disabled={working || !session || !memoryKey.trim() || !memoryContent.trim()}
+          onClick={() => void runtime('save_memory', { key: memoryKey, content: memoryContent })}
+        >
+          保存工作区记忆
         </button>
         <h3>工作树与后台任务</h3>
         <div className="runtime-row">
@@ -1392,6 +1650,7 @@ function ModelDialog({
   const [apiKey, setApiKey] = useState('');
   const [clearApiKey, setClearApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deletingAlias, setDeletingAlias] = useState<string | null>(null);
   const formRef = useRef<HTMLDivElement>(null);
   function reset() {
     setEditingAlias(null);
@@ -1446,6 +1705,15 @@ function ModelDialog({
       fail(err);
     }
   }
+  async function removeProfile(value: string) {
+    try {
+      changed(await api<Config>('removeProfile', { alias: value }));
+      if (editingAlias === value) reset();
+      setDeletingAlias(null);
+    } catch (err) {
+      fail(err);
+    }
+  }
   return (
     <Modal title="模型设置" eyebrow="MODEL PROVIDERS" close={close}>
       <div className="settings-list">
@@ -1473,6 +1741,16 @@ function ModelDialog({
             )}
             <button className="subtle-button" disabled={busy} onClick={() => edit(p)}>
               编辑
+            </button>
+            <button
+              className="subtle-button"
+              disabled={busy}
+              title={deletingAlias === p.alias ? '再次点击，删除本地模型配置' : '删除本地模型配置'}
+              onClick={() =>
+                deletingAlias === p.alias ? void removeProfile(p.alias) : setDeletingAlias(p.alias)
+              }
+            >
+              {deletingAlias === p.alias ? '确认删除' : '删除'}
             </button>
           </div>
         ))}
@@ -1530,7 +1808,7 @@ function ModelDialog({
             setApiKey(e.target.value);
             setClearApiKey(false);
           }}
-          placeholder={editingAlias ? '留空则保留本次运行中的密钥' : '仅保存在本次运行的内存中'}
+          placeholder={editingAlias ? '留空则保留已保存的密钥' : '保存在系统安全存储中'}
         />
         {editingAlias && (
           <label className="checkbox-line">
@@ -1542,7 +1820,7 @@ function ModelDialog({
                 if (e.target.checked) setApiKey('');
               }}
             />{' '}
-            清除本次运行中的密钥，改用环境变量
+            清除已保存的密钥，改用环境变量
           </label>
         )}
         <details className="model-advanced" open={Boolean(apiKeyEnv)}>
@@ -1556,7 +1834,7 @@ function ModelDialog({
           <p className="form-help">只填变量名。请在启动 Bruin 的环境中设置该变量。</p>
         </details>
         <p className="form-help">
-          直接输入的 API Key 不写入配置或会话数据库。重启应用后需重新输入，或使用环境变量。
+          直接输入的 API Key 使用系统安全存储加密，不写入配置或会话数据库；也可使用环境变量。
         </p>
         <div className="modal-actions">
           <button className="secondary" onClick={close}>

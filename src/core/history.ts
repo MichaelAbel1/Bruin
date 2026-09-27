@@ -8,11 +8,17 @@ export function buildPrompt(
   profileAlias?: string,
   protocol?: string,
 ): ModelMessage[] {
-  // Preserve the last ten user turns with their entire tool-call/result pairs.
-  // Older text becomes a bounded summary; durable events remain untouched.
+  // Keep whole turns within a conservative character budget. Durable events remain untouched.
   const userIndexes = events.flatMap((e, i) => (e.type === 'user' ? [i] : []));
-  if (userIndexes.length > 10) {
-    const cut = userIndexes[userIndexes.length - 10];
+  const maxHistoryChars = 100_000;
+  let firstTurn = Math.max(0, userIndexes.length - 10);
+  while (
+    firstTurn < userIndexes.length - 1 &&
+    JSON.stringify(events.slice(userIndexes[firstTurn])).length > maxHistoryChars
+  )
+    firstTurn++;
+  if (firstTurn > 0) {
+    const cut = userIndexes[firstTurn];
     const old = events
       .slice(0, cut)
       .filter((e) => e.type === 'user' || e.type === 'assistant')
@@ -51,13 +57,14 @@ export function buildPrompt(
         protocol &&
         event.payload.protocol === protocol &&
         Array.isArray(raw) &&
-        raw.length
+        raw.length &&
+        JSON.stringify(raw).length < 30_000
       ) {
         messages.push(...(raw as ModelMessage[]));
         continue;
       }
       const calls = (event.payload.calls ?? []) as ToolCall[];
-      const text = String(event.payload.text ?? '');
+      const text = String(event.payload.text ?? '').slice(0, 40_000);
       if (calls.length)
         messages.push({
           role: 'assistant',
@@ -87,7 +94,7 @@ export function buildPrompt(
             toolName: String(event.payload.name),
             output: {
               type: 'text',
-              value: `${event.type !== 'tool_finished' || Boolean(event.payload.isError) ? 'ERROR: ' : ''}${String(event.payload.output ?? '')}`,
+              value: `${event.type !== 'tool_finished' || Boolean(event.payload.isError) ? 'ERROR: ' : ''}${String(event.payload.output ?? '').slice(0, 12_000)}`,
             },
           },
         ],

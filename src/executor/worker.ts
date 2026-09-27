@@ -24,8 +24,12 @@ function checkedPath(workspace: string, input: unknown, creating = false): strin
   return target;
 }
 function readBounded(file: string, max: number): ToolResult {
-  const fd = fs.openSync(file, 'r');
+  const fd = fs.openSync(
+    file,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+  );
   try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('只能读取普通文件');
     const buffer = Buffer.alloc(Math.max(1, max + 1));
     const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
     const truncated = count > max;
@@ -38,6 +42,14 @@ function readBounded(file: string, max: number): ToolResult {
     };
   } finally {
     fs.closeSync(fd);
+  }
+}
+function replaceFd(fd: number, content: Buffer): void {
+  fs.ftruncateSync(fd, 0);
+  for (let offset = 0; offset < content.length;) {
+    const written = fs.writeSync(fd, content, offset, content.length - offset, offset);
+    if (!written) throw new Error('文件写入未完成');
+    offset += written;
   }
 }
 const active = new Map<string, () => void>();
@@ -121,7 +133,21 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       const parent = path.dirname(file);
       if (!fs.existsSync(parent)) throw new Error('父目录不存在');
       checkedPath(req.workspace, path.relative(req.workspace, parent));
-      fs.writeFileSync(file, String(req.input.content ?? ''), { flag: 'w', mode: 0o600 });
+      const fd = fs.openSync(
+        file,
+        fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_NOFOLLOW |
+          fs.constants.O_NONBLOCK,
+        0o600,
+      );
+      try {
+        if (!fs.fstatSync(fd).isFile()) throw new Error('只能写入普通文件');
+        const content = Buffer.from(String(req.input.content ?? ''));
+        replaceFd(fd, content);
+      } finally {
+        fs.closeSync(fd);
+      }
       return { output: `已写入 ${path.relative(req.workspace, file)}`, isError: false };
     }
     case 'edit_file': {
@@ -129,9 +155,19 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       const old = String(req.input.oldText ?? '');
       const replacement = String(req.input.newText ?? '');
       if (!old) throw new Error('oldText 不能为空');
-      const source = fs.readFileSync(file, 'utf8');
-      if (source.split(old).length !== 2) throw new Error('oldText 必须恰好出现一次');
-      fs.writeFileSync(file, source.replace(old, replacement));
+      const fd = fs.openSync(
+        file,
+        fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      );
+      try {
+        if (!fs.fstatSync(fd).isFile()) throw new Error('只能编辑普通文件');
+        const source = fs.readFileSync(fd, 'utf8');
+        if (source.split(old).length !== 2) throw new Error('oldText 必须恰好出现一次');
+        const updated = Buffer.from(source.replace(old, replacement));
+        replaceFd(fd, updated);
+      } finally {
+        fs.closeSync(fd);
+      }
       return { output: `已编辑 ${path.relative(req.workspace, file)}`, isError: false };
     }
     case 'search': {

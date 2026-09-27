@@ -8,6 +8,7 @@ import {
   getRuntimeApiKey,
   loadConfig,
   looksLikeApiKey,
+  legacyKeyWasMigrated,
   saveConfig,
   setRuntimeApiKey,
   validApiKeyEnv,
@@ -47,19 +48,29 @@ const event = (type: string, data: Record<string, unknown> = {}) => send({ type,
 const store = new SqliteEventStore(path.join(dataDir(), 'sessions.sqlite'));
 const executor = new ProcessExecutor();
 let active: { sessionId: string; controller: AbortController } | undefined;
+let activeRun: Promise<unknown> | undefined;
 const approvals = new Map<string, (approved: boolean) => void>();
 const reviewed = new Set<string>();
 
 // Remove secrets accidentally persisted by older desktop versions from session profiles.
 const startupConfig = loadConfig();
+let legacyKeyExposure = legacyKeyWasMigrated();
 for (const session of store.listSessions()) {
+  if (store.isLeased(session.id)) continue;
   const legacyValue = session.profile.apiKeyEnv;
   if (!legacyValue || validApiKeyEnv(legacyValue)) continue;
+  legacyKeyExposure = true;
   if (!getRuntimeApiKey(session.profile.alias) && looksLikeApiKey(legacyValue))
     setRuntimeApiKey(session.profile.alias, legacyValue);
   const current = startupConfig.profiles.find((p) => p.alias === session.profile.alias);
   const cleanProfile = current ?? { ...session.profile, apiKeyEnv: undefined };
   store.setProfile(session.id, cleanProfile);
+}
+if (legacyKeyExposure) {
+  const knownKeys = startupConfig.profiles
+    .map((profile) => getRuntimeApiKey(profile.alias))
+    .filter((key): key is string => Boolean(key));
+  store.scrubSecrets(knownKeys);
 }
 
 const services = new RuntimeServices(store, executor, (session, prompt, signal) =>
@@ -111,6 +122,7 @@ function viewSession(session: Session) {
     session,
     events: redactEvents(events, session.profile.alias),
     plan: planState(events),
+    tasks: store.listTasks(session.id),
     needsReview: needsReview(session.id),
   };
 }
@@ -137,10 +149,15 @@ function redactEvents(events: ReturnType<typeof store.events>, alias: string) {
 async function startRun(session: Session, prompt?: string): Promise<{ started: boolean }> {
   if (active) throw new Error('已有任务正在运行');
   if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认继续');
+  const owner = randomUUID();
+  store.acquireLease(session.id, owner, 30_000);
   const controller = new AbortController();
+  const heartbeat = setInterval(() => {
+    if (!store.renewLease(session.id, owner, 30_000)) controller.abort();
+  }, 10_000);
   active = { sessionId: session.id, controller };
   event('runStarted', { sessionId: session.id });
-  void runner
+  activeRun = runner
     .run(session, prompt, controller.signal)
     .then(() =>
       event('runFinished', { sessionId: session.id, events: viewSession(session).events }),
@@ -153,7 +170,10 @@ async function startRun(session: Session, prompt?: string): Promise<{ started: b
       }),
     )
     .finally(() => {
+      clearInterval(heartbeat);
+      store.releaseLease(session.id, owner);
       active = undefined;
+      activeRun = undefined;
       for (const resolve of approvals.values()) resolve(false);
       approvals.clear();
     });
@@ -161,15 +181,50 @@ async function startRun(session: Session, prompt?: string): Promise<{ started: b
 }
 async function dispatch(method: string, p: Record<string, unknown>) {
   switch (method) {
+    case 'restoreApiKeys': {
+      const keys = p.keys;
+      if (!keys || typeof keys !== 'object' || Array.isArray(keys))
+        throw new Error('无效的密钥数据');
+      const aliases = new Set(loadConfig().profiles.map((profile) => profile.alias));
+      for (const [alias, key] of Object.entries(keys))
+        if (aliases.has(alias) && typeof key === 'string') setRuntimeApiKey(alias, key);
+      return { restored: true };
+    }
     case 'bootstrap':
       return {
         config: loadConfig(),
         sessions: store.listSessions(),
         skills: listSkills(),
         busySessionId: active?.sessionId,
+        legacyKeyExposure,
       };
     case 'listSessions':
       return store.listSessions();
+    case 'listTasks':
+      return store.listTasks(getSession(p.sessionId).id);
+    case 'retryTask': {
+      const session = getSession(p.sessionId);
+      store.retryTask(session.id, String(p.id ?? ''));
+      return store.listTasks(session.id);
+    }
+    case 'listCronJobs':
+      return store.listCronJobs(getSession(p.sessionId).id);
+    case 'createCronJob': {
+      const session = getSession(p.sessionId);
+      return store.createCronJob(session.id, String(p.expression ?? ''), String(p.prompt ?? ''));
+    }
+    case 'deleteCronJob': {
+      const session = getSession(p.sessionId);
+      store.deleteCronJob(session.id, String(p.id ?? ''));
+      return store.listCronJobs(session.id);
+    }
+    case 'deleteSession': {
+      const session = getSession(p.sessionId);
+      if (active?.sessionId === session.id) throw new Error('运行中的会话不能删除');
+      store.deleteSession(session.id);
+      reviewed.delete(session.id);
+      return store.listSessions();
+    }
     case 'createSession': {
       const workspace = fs.realpathSync(String(p.workspace ?? ''));
       if (!fs.statSync(workspace).isDirectory()) throw new Error('工作区必须是目录');
@@ -183,7 +238,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         if (active.sessionId !== session.id) throw new Error('请等待当前任务完成');
         return { ...viewSession(session), recoveredUnknown: 0 };
       }
-      const unknown = runner.recover(session);
+      const unknown = store.isLeased(session.id) ? 0 : runner.recover(session);
       return { ...viewSession(session), recoveredUnknown: unknown };
     }
     case 'reviewUnknown': {
@@ -227,7 +282,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     }
     case 'discoverModels': {
       const profile = findProfile(String(p.alias ?? ''));
-      return discoverModels(profile);
+      return discoverModels(profile, p.refresh === true);
     }
     case 'setPlanMode': {
       if (active) throw new Error('运行中不能切换规划模式');
@@ -273,7 +328,9 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'testMcpServer': {
       const server = loadConfig().mcpServers.find((item) => item.name === p.name);
       if (!server) throw new Error('MCP 服务器未配置');
-      return services.mcp.listTools(server);
+      const workspace =
+        server.transport === 'stdio' ? getSession(p.sessionId).workspace : undefined;
+      return services.mcp.listTools(server, workspace);
     }
     case 'saveHook': {
       if (active) throw new Error('请等待当前任务完成后再修改 Hook');
@@ -302,6 +359,12 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           'start_background',
           'background_status',
           'cancel_background',
+          'create_task',
+          'list_tasks',
+          'claim_task',
+          'finish_task',
+          'list_memory',
+          'save_memory',
           'spawn_subagent',
           'subagent_status',
         ].includes(name)
@@ -347,6 +410,8 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const baseUrl = String(p.baseUrl ?? '').trim();
       if (
         !alias ||
+        alias.length > 80 ||
+        /[\u0000-\u001f]/.test(alias) ||
         !model ||
         !['openai', 'anthropic', 'google', 'openai-compatible'].includes(provider)
       )
@@ -366,6 +431,12 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       };
       const config = loadConfig();
       const previous = config.profiles.find((x) => x.alias === alias);
+      if (
+        store
+          .listSessions()
+          .some((session) => session.profile.alias === alias && store.isLeased(session.id))
+      )
+        throw new Error('该模型关联的会话正在另一个进程中运行');
       config.profiles = config.profiles.filter((x) => x.alias !== alias);
       config.profiles.push(profile);
       config.defaultProfile ??= alias;
@@ -396,6 +467,24 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       if (!config.profiles.some((x) => x.alias === alias)) throw new Error('模型配置不存在');
       config.defaultProfile = alias;
       saveConfig(config);
+      return loadConfig();
+    }
+    case 'removeProfile': {
+      if (active) throw new Error('请等待当前任务完成后再删除模型配置');
+      const alias = String(p.alias ?? '');
+      if (
+        store
+          .listSessions()
+          .some((session) => session.profile.alias === alias && store.isLeased(session.id))
+      )
+        throw new Error('该模型关联的会话正在另一个进程中运行');
+      const config = loadConfig();
+      if (!config.profiles.some((profile) => profile.alias === alias))
+        throw new Error('模型配置不存在');
+      config.profiles = config.profiles.filter((profile) => profile.alias !== alias);
+      if (config.defaultProfile === alias) config.defaultProfile = config.profiles[0]?.alias;
+      saveConfig(config);
+      setRuntimeApiKey(alias, undefined);
       return loadConfig();
     }
     case 'listSkills':
@@ -430,6 +519,61 @@ async function dispatch(method: string, p: Record<string, unknown>) {
   }
 }
 
+let scheduling = false;
+async function scheduleTick() {
+  if (active || scheduling) return;
+  scheduling = true;
+  try {
+    const job = store.takeDueCronJobs(Date.now())[0];
+    if (job) {
+      const session = store.getSession(job.sessionId);
+      if (!session) return;
+      try {
+        await startRun(session, job.prompt);
+        await activeRun;
+        const last = store.events(session.id).at(-1);
+        store.markCronJob(job.id, last?.type === 'turn_completed' ? 'completed' : 'needs_review');
+      } catch (error) {
+        store.markCronJob(job.id, 'skipped_busy');
+        event('notice', {
+          sessionId: session.id,
+          message: `定时任务未启动: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      return;
+    }
+    for (const session of store.listSessions()) {
+      if (store.isLeased(session.id) || needsReview(session.id)) continue;
+      const task = services.claimReadyTask(session);
+      if (!task) continue;
+      try {
+        await startRun(
+          session,
+          `Execute claimed task ${task.id}: ${task.title}. Respect dependencies and tool approvals. Call finish_task with this ID only after verifying the result. If blocked, report why; do not claim success.`,
+        );
+        await activeRun;
+        services.finishClaimIfOpen(task.id);
+      } catch (error) {
+        services.releaseClaim(task.id);
+        event('notice', {
+          sessionId: session.id,
+          message: `任务认领未启动: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      return;
+    }
+  } catch (error) {
+    event('notice', {
+      message: `调度检查失败: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  } finally {
+    scheduling = false;
+  }
+}
+const scheduler = setInterval(() => {
+  void scheduleTick();
+}, 15_000);
+
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on('line', (line) => {
   let request: Request;
@@ -445,9 +589,11 @@ lines.on('line', (line) => {
     );
 });
 async function shutdown() {
+  clearInterval(scheduler);
   active?.controller.abort();
   for (const resolve of approvals.values()) resolve(false);
   approvals.clear();
+  await activeRun;
   await services.close();
   await executor.close();
   store.close();

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { EventStore } from '../storage/event-store.js';
+import type { TaskNode } from '../storage/event-store.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { Session, ToolCall, ToolResult } from '../core/types.js';
 import { dataDir, loadConfig, type HookConfig } from '../config.js';
@@ -26,6 +27,9 @@ type Subagent = {
 
 export class RuntimeServices {
   readonly mcp = new McpManager();
+  private readonly taskOwner = randomUUID();
+  private readonly claimedTasks = new Set<string>();
+  private readonly taskHeartbeat: ReturnType<typeof setInterval>;
   private background = new Map<string, Background>();
   private subagents = new Map<string, Subagent>();
   private pending = new Set<Promise<unknown>>();
@@ -33,7 +37,30 @@ export class RuntimeServices {
     private store: EventStore,
     private executor: ToolExecutor,
     private runSubagent: (session: Session, prompt: string, signal: AbortSignal) => Promise<void>,
-  ) {}
+  ) {
+    this.taskHeartbeat = setInterval(() => {
+      for (const id of this.claimedTasks)
+        if (!this.store.renewTask(id, this.taskOwner, 3_600_000)) this.claimedTasks.delete(id);
+    }, 60_000);
+    this.taskHeartbeat.unref();
+  }
+  claimReadyTask(session: Session): TaskNode | undefined {
+    const task = this.store.claimTask(session.id, this.taskOwner, 3_600_000);
+    if (task) this.claimedTasks.add(task.id);
+    return task;
+  }
+  releaseClaim(id: string): void {
+    this.store.releaseTask(id, this.taskOwner);
+    this.claimedTasks.delete(id);
+  }
+  finishClaimIfOpen(id: string): void {
+    if (!this.claimedTasks.has(id)) return;
+    try {
+      this.store.finishTask(id, this.taskOwner, false);
+    } finally {
+      this.claimedTasks.delete(id);
+    }
+  }
 
   async runHooks(event: HookConfig['event'], session: Session, signal: AbortSignal): Promise<void> {
     for (const hook of loadConfig().hooks.filter((item) => item.enabled && item.event === event)) {
@@ -62,10 +89,50 @@ export class RuntimeServices {
   async execute(call: ToolCall, session: Session, signal: AbortSignal): Promise<ToolResult> {
     const input = call.input;
     switch (call.name) {
+      case 'list_memory':
+        return { output: JSON.stringify(this.store.listMemory(session.workspace)), isError: false };
+      case 'save_memory':
+        this.store.saveMemory(
+          session.workspace,
+          String(input.key ?? ''),
+          String(input.content ?? ''),
+        );
+        return { output: '工作区记忆已保存', isError: false };
+      case 'create_task': {
+        const task = this.store.createTask(
+          session.id,
+          String(input.title ?? ''),
+          Array.isArray(input.dependencies) ? input.dependencies.map(String) : [],
+        );
+        return { output: JSON.stringify(task), isError: false };
+      }
+      case 'list_tasks':
+        return { output: JSON.stringify(this.store.listTasks(session.id)), isError: false };
+      case 'claim_task': {
+        const task = this.claimReadyTask(session);
+        return { output: JSON.stringify(task ?? null), isError: false };
+      }
+      case 'finish_task': {
+        const id = String(input.id ?? '');
+        if (!this.store.listTasks(session.id).some((task) => task.id === id))
+          throw new Error('任务不属于当前会话');
+        this.store.finishTask(id, this.taskOwner, input.success === true);
+        this.claimedTasks.delete(id);
+        return { output: '任务状态已保存', isError: false };
+      }
       case 'mcp_list_tools': {
         const server = loadConfig().mcpServers.find((item) => item.name === input.server);
         if (!server) throw new Error('MCP 服务器未配置');
-        return { output: JSON.stringify(await this.mcp.listTools(server)), isError: false };
+        const tools = await this.mcp.listTools(server, session.workspace);
+        this.store.append(session.id, 'mcp_capabilities', {
+          server: server.name,
+          transport: server.transport,
+          tools: tools.map((tool) => tool.name),
+        });
+        return {
+          output: JSON.stringify(tools),
+          isError: false,
+        };
       }
       case 'mcp_call': {
         const server = loadConfig().mcpServers.find((item) => item.name === input.server);
@@ -74,6 +141,7 @@ export class RuntimeServices {
           server,
           String(input.tool ?? ''),
           (input.arguments ?? {}) as Record<string, unknown>,
+          session.workspace,
         );
       }
       case 'update_plan': {
@@ -298,6 +366,7 @@ export class RuntimeServices {
     }
   }
   async close(): Promise<void> {
+    clearInterval(this.taskHeartbeat);
     for (const task of this.background.values())
       if (task.status === 'running') task.controller.abort();
     for (const task of this.subagents.values())

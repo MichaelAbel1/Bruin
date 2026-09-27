@@ -1,0 +1,33 @@
+name: Desktop validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run check
+      - run: npm run desktop:check
+      - run: npm test
+      - run: npm run desktop:dist -- --mac zip
+      - run: unzip -tq desktop/release-current/Bruin-*-mac.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bruin-macos-unsigned
+          path: desktop/release-current/Bruin-*-mac.zip
+          if-no-files-found: error

@@ -28,6 +28,12 @@ export function decisionFor(
       'cancel_background',
       'update_plan',
       'update_plan_progress',
+      'create_task',
+      'list_tasks',
+      'claim_task',
+      'finish_task',
+      'list_memory',
+      'save_memory',
     ].includes(call.name)
   )
     return { decision: 'deny', reason: '未知工具' };
@@ -35,22 +41,28 @@ export function decisionFor(
   if (
     [
       'mcp_call',
+      'mcp_list_tools',
       'create_worktree',
       'remove_worktree',
       'start_background',
       'spawn_subagent',
+      'save_memory',
     ].includes(call.name)
   )
     return { decision: 'ask', reason: '此操作可能启动进程、访问外部服务或更改工作区' };
   if (
     [
-      'mcp_list_tools',
       'subagent_status',
       'list_worktrees',
       'background_status',
       'cancel_background',
       'update_plan',
       'update_plan_progress',
+      'create_task',
+      'list_tasks',
+      'claim_task',
+      'finish_task',
+      'list_memory',
     ].includes(call.name)
   )
     return { decision: 'allow', reason: '读取状态或更新规划' };

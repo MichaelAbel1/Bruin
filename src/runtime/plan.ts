@@ -39,6 +39,8 @@ export function planBlocks(call: ToolCall, state: PlanState): boolean {
       'list_worktrees',
       'subagent_status',
       'background_status',
+      'list_tasks',
+      'list_memory',
     ].includes(call.name)
   );
 }

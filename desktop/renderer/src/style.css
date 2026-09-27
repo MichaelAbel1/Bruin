@@ -122,7 +122,8 @@ pre {
   overflow: auto;
 }
 .session-item {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   border: 0;
   background: transparent;
   text-align: left;
@@ -133,6 +134,46 @@ pre {
   gap: 10px;
   align-items: flex-start;
   margin: 2px 0;
+}
+.session-row {
+  display: flex;
+  align-items: center;
+  padding-right: 4px;
+}
+.session-delete {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: #82908d;
+  padding: 8px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.session-delete:hover {
+  color: #e69b91;
+  background: #342322;
+}
+.security-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: #3c3020;
+  color: #f7dca8;
+  font-size: 12px;
+}
+.security-banner span {
+  flex: 1;
+}
+.security-banner button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+:root[data-theme='light'] .security-banner {
+  background: #fff3d9;
+  color: #765119;
 }
 .session-item svg {
   flex: none;
@@ -492,6 +533,99 @@ pre {
 .message.user .message-text {
   color: #f1f2ef;
 }
+.markdown-body {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body pre,
+.markdown-body table {
+  margin: 0.6em 0;
+}
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.6em;
+}
+.markdown-body li + li {
+  margin-top: 0.2em;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  line-height: 1.35;
+  margin: 1em 0 0.45em;
+  color: inherit;
+}
+.markdown-body h1 {
+  font-size: 1.5em;
+}
+.markdown-body h2 {
+  font-size: 1.3em;
+}
+.markdown-body h3 {
+  font-size: 1.15em;
+}
+.markdown-body a {
+  color: #85baec;
+  text-decoration: underline;
+}
+.markdown-body blockquote {
+  border-left: 3px solid #84978d;
+  padding-left: 0.9em;
+  opacity: 0.85;
+}
+.markdown-body pre {
+  overflow-x: auto;
+  padding: 0.8em;
+  border-radius: 8px;
+  background: #18231d;
+}
+.markdown-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+}
+.markdown-body :not(pre) > code {
+  padding: 0.1em 0.3em;
+  border-radius: 4px;
+  background: #27332c;
+}
+.markdown-body table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid #5b6c61;
+  padding: 0.35em 0.6em;
+}
+.markdown-body hr {
+  border: 0;
+  border-top: 1px solid #5b6c61;
+}
+:root[data-theme='light'] .markdown-body a {
+  color: #1763ad;
+}
+:root[data-theme='light'] .markdown-body pre {
+  background: #f1f3f2;
+}
+:root[data-theme='light'] .markdown-body :not(pre) > code {
+  background: #edf0ee;
+}
+:root[data-theme='light'] .markdown-body th,
+:root[data-theme='light'] .markdown-body td {
+  border-color: #d5ddd7;
+}
 .live-dot {
   width: 6px;
   height: 6px;
@@ -788,6 +922,28 @@ pre {
   box-shadow: 0 24px 80px #000b;
   padding: 24px;
 }
+.approval-dock {
+  position: fixed;
+  z-index: 19;
+  right: 24px;
+  bottom: 24px;
+  width: min(500px, calc(100vw - 48px));
+  pointer-events: none;
+}
+.approval-panel {
+  pointer-events: auto;
+  max-height: min(520px, 75vh);
+  overflow: auto;
+  background: #1b201e;
+  border: 1px solid #6a785f;
+  border-radius: 14px;
+  box-shadow: 0 20px 65px #0009;
+  padding: 20px;
+}
+.approval-panel h2 {
+  margin: 5px 0 0;
+  font-size: 18px;
+}
 .modal-top {
   display: flex;
   align-items: flex-start;
@@ -986,7 +1142,8 @@ pre {
   display: grid;
   place-items: center;
 }
-.approval-modal > p {
+.approval-modal > p,
+.approval-panel > p {
   color: #a2b3a2;
   font-size: 12px;
   margin: 18px 0 12px;
@@ -1000,7 +1157,8 @@ pre {
     monospace;
   color: #c8e2b0;
 }
-.approval-modal pre {
+.approval-modal pre,
+.approval-panel pre {
   font-size: 10px;
   color: #ced6ca;
   line-height: 1.65;
@@ -1398,7 +1556,8 @@ pre {
   background: #0a0d1399;
 }
 :root[data-theme='light'] .modal,
-:root[data-theme='light'] .approval-modal {
+:root[data-theme='light'] .approval-modal,
+:root[data-theme='light'] .approval-panel {
   background: #fff;
   border-color: #e0e3e5;
   box-shadow: 0 24px 80px #00000033;
@@ -1433,11 +1592,14 @@ pre {
   color: #315b32;
 }
 :root[data-theme='light'] .approval-modal > p,
+:root[data-theme='light'] .approval-panel > p,
 :root[data-theme='light'] .approval-name,
-:root[data-theme='light'] .approval-modal pre {
+:root[data-theme='light'] .approval-modal pre,
+:root[data-theme='light'] .approval-panel pre {
   color: #39434b;
 }
 :root[data-theme='light'] .approval-modal pre,
+:root[data-theme='light'] .approval-panel pre,
 :root[data-theme='light'] .skill-preview {
   background: #f7f8f8;
   border-color: #e1e4e3;

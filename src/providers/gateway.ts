@@ -102,6 +102,34 @@ export const toolSchemas = {
       status: z.enum(['pending', 'in_progress', 'completed']),
     }),
   },
+  create_task: {
+    description:
+      'Add a task to the durable session task graph. Dependencies must be existing task IDs.',
+    inputSchema: z.object({
+      title: z.string().min(1).max(500),
+      dependencies: z.array(z.string()).max(30).default([]),
+    }),
+  },
+  list_tasks: {
+    description: 'List durable tasks and their dependencies for this session',
+    inputSchema: z.object({}),
+  },
+  claim_task: {
+    description: 'Atomically claim the next ready task for this local Bruin process',
+    inputSchema: z.object({}),
+  },
+  finish_task: {
+    description: 'Mark a task claimed by this process completed or failed',
+    inputSchema: z.object({ id: z.string(), success: z.boolean() }),
+  },
+  list_memory: {
+    description: 'Read persistent memory for this workspace',
+    inputSchema: z.object({}),
+  },
+  save_memory: {
+    description: 'Save a persistent memory page for this workspace. Requires user approval.',
+    inputSchema: z.object({ key: z.string(), content: z.string() }),
+  },
 };
 export function resolveApiKey(profile: ModelProfile): string | undefined {
   const keyName =

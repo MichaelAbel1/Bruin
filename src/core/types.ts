@@ -17,7 +17,13 @@ export type ToolName =
   | 'background_status'
   | 'cancel_background'
   | 'update_plan'
-  | 'update_plan_progress';
+  | 'update_plan_progress'
+  | 'create_task'
+  | 'list_tasks'
+  | 'claim_task'
+  | 'finish_task'
+  | 'list_memory'
+  | 'save_memory';
 export interface ModelProfile {
   alias: string;
   provider: ProviderKind;
@@ -52,7 +58,8 @@ export type EventType =
   | 'subagent_finished'
   | 'background_started'
   | 'background_finished'
-  | 'hook_finished';
+  | 'hook_finished'
+  | 'mcp_capabilities';
 export interface SessionEvent {
   sessionId: string;
   seq: number;
