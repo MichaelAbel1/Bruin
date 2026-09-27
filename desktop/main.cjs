@@ -9,6 +9,61 @@ let window;
 let host;
 const pending = new Map();
 const development = Boolean(process.env.BRUIN_RENDERER_URL);
+const iconThemes = new Set(['white', 'black', 'sage', 'blue', 'orange']);
+let iconBackground = 'white';
+let uiTheme = 'light';
+
+function appearancePath() {
+  return path.join(
+    process.env.BRUIN_HOME || path.join(app.getPath('home'), '.bruin'),
+    'appearance.json',
+  );
+}
+function iconPath(theme) {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'icons', `icon-${theme}.png`)
+    : path.join(__dirname, 'assets', `icon-${theme}.png`);
+}
+function loadAppearance() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(appearancePath(), 'utf8'));
+    if (iconThemes.has(stored.iconBackground)) iconBackground = stored.iconBackground;
+    if (stored.uiTheme === 'light' || stored.uiTheme === 'dark') uiTheme = stored.uiTheme;
+  } catch {
+    /* Keep the white default for a missing or invalid settings file. */
+  }
+}
+function applyIcon() {
+  const icon = iconPath(iconBackground);
+  if (process.platform === 'darwin' && app.dock) app.dock.setIcon(icon);
+  if (window && !window.isDestroyed() && process.platform !== 'darwin') window.setIcon(icon);
+}
+function saveAppearance(next) {
+  let nextIconBackground = iconBackground;
+  let nextUiTheme = uiTheme;
+  if (next.iconBackground !== undefined) {
+    if (!iconThemes.has(next.iconBackground)) throw new Error('不支持的图标背景颜色');
+    nextIconBackground = next.iconBackground;
+  }
+  if (next.uiTheme !== undefined) {
+    if (next.uiTheme !== 'light' && next.uiTheme !== 'dark') throw new Error('不支持的界面主题');
+    nextUiTheme = next.uiTheme;
+  }
+  const file = appearancePath();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(
+    temp,
+    JSON.stringify({ iconBackground: nextIconBackground, uiTheme: nextUiTheme }),
+    { mode: 0o600 },
+  );
+  fs.renameSync(temp, file);
+  iconBackground = nextIconBackground;
+  uiTheme = nextUiTheme;
+  applyIcon();
+  window?.setBackgroundColor(uiTheme === 'light' ? '#FFFFFF' : '#111315');
+  return { iconBackground, uiTheme };
+}
 
 function startHost() {
   const runtime = app.isPackaged
@@ -70,7 +125,8 @@ function createWindow() {
     minWidth: 980,
     minHeight: 650,
     title: 'Bruin',
-    backgroundColor: '#111315',
+    backgroundColor: uiTheme === 'light' ? '#FFFFFF' : '#111315',
+    icon: iconPath(iconBackground),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -89,8 +145,10 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  loadAppearance();
   startHost();
   createWindow();
+  applyIcon();
   ipcMain.handle('bruin:request', (event, method, params) => {
     if (
       !window ||
@@ -102,6 +160,9 @@ app.whenReady().then(() => {
       return dialog
         .showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
         .then((result) => (result.canceled ? null : result.filePaths[0]));
+    if (method === 'getAppearance') return { iconBackground, uiTheme };
+    if (method === 'setIconBackground') return saveAppearance({ iconBackground: params?.theme });
+    if (method === 'setTheme') return saveAppearance({ uiTheme: params?.theme });
     return requestHost(method, params || {});
   });
   app.on('activate', () => {

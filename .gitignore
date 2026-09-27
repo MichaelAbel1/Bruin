@@ -14,3 +14,4 @@ dist/
 .desktop-runtime/
 desktop/build/
 desktop/release*/
+desktop/assets/icon-*.png

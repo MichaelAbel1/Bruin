@@ -1,5 +1,23 @@
 export type ProviderKind = 'openai' | 'anthropic' | 'google' | 'openai-compatible';
-export type ToolName = 'read_file' | 'write_file' | 'edit_file' | 'search' | 'shell' | 'load_skill';
+export type ToolName =
+  | 'read_file'
+  | 'write_file'
+  | 'edit_file'
+  | 'search'
+  | 'shell'
+  | 'load_skill'
+  | 'mcp_list_tools'
+  | 'mcp_call'
+  | 'spawn_subagent'
+  | 'subagent_status'
+  | 'create_worktree'
+  | 'list_worktrees'
+  | 'remove_worktree'
+  | 'start_background'
+  | 'background_status'
+  | 'cancel_background'
+  | 'update_plan'
+  | 'update_plan_progress';
 export interface ModelProfile {
   alias: string;
   provider: ProviderKind;
@@ -25,7 +43,16 @@ export type EventType =
   | 'model_error'
   | 'summary'
   | 'skill_loaded'
-  | 'model_switched';
+  | 'model_switched'
+  | 'plan_mode'
+  | 'plan_updated'
+  | 'plan_approved'
+  | 'plan_progress'
+  | 'subagent_started'
+  | 'subagent_finished'
+  | 'background_started'
+  | 'background_finished'
+  | 'hook_finished';
 export interface SessionEvent {
   sessionId: string;
   seq: number;

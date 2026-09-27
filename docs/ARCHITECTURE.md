@@ -13,6 +13,7 @@ CLI (src/cli.ts)                     Electron + React (desktop/)
                   │     ├── EventStore → SqliteEventStore → sessions.sqlite
                   │     ├── ProcessExecutor → IPC → worker process → 文件工具 / 搜索 / Shell
                   │     └── Skills registry → BRUIN_HOME/skills
+                  │     └── RuntimeServices → MCP / 子 Agent / Git 工作树 / 后台任务 / Hook / 规划
                   └── 配置 → BRUIN_HOME/config.json
 ```
 
@@ -27,6 +28,10 @@ Agent 后台进程掌握模型密钥、权限判断和事件事务；工具子�
 5. 模型无工具调用时写 `turn_completed`。每轮最多 24 次模型调用，以防无限循环。
 
 批准与执行分成不同事件，方便审计。事件记录包含工具输入与输出，因此会话数据库可能含源代码、用户输入和模型输出，应视为敏感数据。`providerMessages` 用于同一模型配置下保留供应商所需的响应细节；跨模型切换时使用通用消息重建。模型不会从供应商侧“恢复远程会话”，而是从本地事件构造请求。
+
+## 桌面编排时序
+
+桌面扩展经 `RuntimeServices` 执行，继续使用 `tool_requested`、`tool_approved`、`tool_started`、`tool_finished` / `tool_unknown` 链；MCP 及编排工具不进入文件工具子进程。后台 Shell 和 Hook 仍经 `ProcessExecutor` 的受限 Shell 路径执行。规划的 `plan_mode`、`plan_updated`、`plan_approved`、`plan_progress` 事件可从日志重建；子 Agent 和后台任务另有开始、结束事件。详见 [桌面 Agent 扩展能力](RUNTIME_CAPABILITIES.md)。
 
 ## 崩溃恢复语义
 

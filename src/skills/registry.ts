@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { dataDir, loadConfig, saveConfig } from '../config.js';
 
@@ -16,6 +17,50 @@ export interface SkillInfo {
 }
 function skillRoot(): string {
   return path.join(dataDir(), 'skills');
+}
+const builtinRoot = fileURLToPath(new URL('../../skills/builtin/', import.meta.url));
+function builtinSettingsPath(): string {
+  return path.join(dataDir(), 'builtin-skills.json');
+}
+function builtinSettings(): Record<string, boolean> {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(builtinSettingsPath(), 'utf8'));
+    if (value && typeof value === 'object' && !Array.isArray(value))
+      return Object.fromEntries(
+        Object.entries(value).filter(([_, enabled]) => typeof enabled === 'boolean'),
+      ) as Record<string, boolean>;
+  } catch {
+    /* Default built-in skills are enabled. */
+  }
+  return {};
+}
+function setBuiltinEnabled(name: string, enabled: boolean): void {
+  const settings = { ...builtinSettings(), [name]: enabled };
+  fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
+  const temp = `${builtinSettingsPath()}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  fs.renameSync(temp, builtinSettingsPath());
+}
+function builtinSkills(): SkillInfo[] {
+  if (!fs.existsSync(builtinRoot)) return [];
+  const settings = builtinSettings();
+  return fs
+    .readdirSync(builtinRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const dir = path.join(builtinRoot, entry.name);
+      const manifest = parseManifest(dir);
+      const revision = createHash('sha256')
+        .update(fs.readFileSync(path.join(dir, 'SKILL.md')))
+        .digest('hex');
+      return {
+        ...manifest,
+        path: dir,
+        source: `builtin:${manifest.name}`,
+        revision,
+        enabled: settings[manifest.name] !== false,
+      };
+    });
 }
 function safeName(name: string): string {
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name))
@@ -72,6 +117,8 @@ function copySafe(source: string, destination: string): void {
 }
 function installDirectory(dir: string, source: string, revision: string): SkillInfo {
   const manifest = parseManifest(dir);
+  if (builtinSkills().some((skill) => skill.name === manifest.name))
+    throw new Error('此名称已由内置 Skill 使用');
   const root = skillRoot();
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const final = path.join(root, manifest.name);
@@ -129,28 +176,33 @@ export function installGithub(repo: string, subdir: string, ref = 'HEAD'): Skill
 }
 export function listSkills(): SkillInfo[] {
   const root = skillRoot();
-  if (!fs.existsSync(root)) return [];
-  return fs
-    .readdirSync(root, { withFileTypes: true })
-    .filter((x) => x.isDirectory() && !x.name.startsWith('.'))
-    .flatMap((x) => {
-      const dir = path.join(root, x.name);
-      try {
-        const manifest = parseManifest(dir);
-        const source = JSON.parse(fs.readFileSync(path.join(dir, '.bruin-source.json'), 'utf8'));
-        return [
-          {
-            ...manifest,
-            path: dir,
-            source: source.source,
-            revision: source.revision,
-            enabled: Boolean(source.enabled),
-          },
-        ];
-      } catch {
-        return [];
-      }
-    });
+  const installed = !fs.existsSync(root)
+    ? []
+    : fs
+        .readdirSync(root, { withFileTypes: true })
+        .filter((x) => x.isDirectory() && !x.name.startsWith('.'))
+        .flatMap((x) => {
+          const dir = path.join(root, x.name);
+          try {
+            const manifest = parseManifest(dir);
+            const source = JSON.parse(
+              fs.readFileSync(path.join(dir, '.bruin-source.json'), 'utf8'),
+            );
+            return [
+              {
+                ...manifest,
+                path: dir,
+                source: source.source,
+                revision: source.revision,
+                enabled: Boolean(source.enabled),
+              },
+            ];
+          } catch {
+            return [];
+          }
+        });
+  const installedNames = new Set(installed.map((skill) => skill.name));
+  return [...builtinSkills().filter((skill) => !installedNames.has(skill.name)), ...installed];
 }
 export function readSkill(name: string): string {
   const skill = listSkills().find((x) => x.name === name);
@@ -167,6 +219,10 @@ export function loadSkill(name: string): string {
 export function setSkillEnabled(name: string, enabled: boolean): void {
   const skill = listSkills().find((x) => x.name === name);
   if (!skill) throw new Error('Skill 不存在');
+  if (skill.source.startsWith('builtin:')) {
+    setBuiltinEnabled(name, enabled);
+    return;
+  }
   const file = path.join(skill.path, '.bruin-source.json');
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   data.enabled = enabled;
@@ -175,11 +231,13 @@ export function setSkillEnabled(name: string, enabled: boolean): void {
 export function uninstallSkill(name: string): void {
   const skill = listSkills().find((x) => x.name === name);
   if (!skill) throw new Error('Skill 不存在');
+  if (skill.source.startsWith('builtin:')) throw new Error('内置 Skill 不能卸载，可选择停用');
   fs.rmSync(skill.path, { recursive: true });
 }
 export async function updateSkill(name: string): Promise<SkillInfo> {
   const skill = listSkills().find((x) => x.name === name);
   if (!skill) throw new Error('Skill 不存在');
+  if (skill.source.startsWith('builtin:')) throw new Error('内置 Skill 随应用版本更新');
   if (skill.source.startsWith('local:')) return installLocal(skill.source.slice(6));
   if (skill.source.startsWith('skills.sh:')) {
     const { installSkillsSh } = await import('./skills-sh.js');

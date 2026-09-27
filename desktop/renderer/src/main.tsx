@@ -12,6 +12,7 @@ import {
   Menu,
   MessageSquare,
   Plus,
+  Palette,
   Send,
   Settings2,
   ShieldCheck,
@@ -21,6 +22,19 @@ import {
   X,
 } from 'lucide-react';
 import './style.css';
+import bearWhite from '../../assets/icon-white.png';
+import bearBlack from '../../assets/icon-black.png';
+import bearSage from '../../assets/icon-sage.png';
+import bearBlue from '../../assets/icon-blue.png';
+import bearOrange from '../../assets/icon-orange.png';
+
+const iconOptions = [
+  { id: 'white', label: '纯白', image: bearWhite },
+  { id: 'black', label: '黑色', image: bearBlack },
+  { id: 'sage', label: '鼠尾草绿', image: bearSage },
+  { id: 'blue', label: '浅蓝', image: bearBlue },
+  { id: 'orange', label: '暖橙', image: bearOrange },
+] as const;
 
 type Profile = {
   alias: string;
@@ -40,6 +54,7 @@ type SessionEvent = { seq: number; type: string; at: string; payload: Record<str
 type SessionView = {
   session: Session;
   events: SessionEvent[];
+  plan: { enabled: boolean; steps: string[]; approved: boolean; progress: Record<number, string> };
   needsReview: boolean;
   recoveredUnknown?: number;
 };
@@ -59,7 +74,22 @@ type Approval = {
   call: { name: string; input: Record<string, unknown> };
   reason: string;
 };
-type Config = { profiles: Profile[]; defaultProfile?: string; marketplaces: Market[] };
+type McpServer =
+  | { name: string; transport: 'stdio'; command: string; args: string[]; envNames: string[] }
+  | { name: string; transport: 'http'; url: string; tokenEnv?: string };
+type Hook = {
+  name: string;
+  event: 'before_tool' | 'after_tool' | 'turn_started' | 'turn_finished';
+  command: string;
+  enabled: boolean;
+};
+type Config = {
+  profiles: Profile[];
+  defaultProfile?: string;
+  marketplaces: Market[];
+  mcpServers: McpServer[];
+  hooks: Hook[];
+};
 type HostEvent = {
   type: string;
   sessionId?: string;
@@ -96,7 +126,12 @@ function sessionTitle(session: Session, events?: SessionEvent[]) {
   return label ? label.slice(0, 36) : short(session.workspace);
 }
 function App() {
-  const [config, setConfig] = useState<Config>({ profiles: [], marketplaces: [] });
+  const [config, setConfig] = useState<Config>({
+    profiles: [],
+    marketplaces: [],
+    mcpServers: [],
+    hooks: [],
+  });
   const [sessions, setSessions] = useState<Session[]>([]);
   const [view, setView] = useState<SessionView | null>(null);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -104,10 +139,18 @@ function App() {
   const [stream, setStream] = useState('');
   const [composer, setComposer] = useState('');
   const [approval, setApproval] = useState<Approval | null>(null);
-  const [dialog, setDialog] = useState<'model' | 'new' | 'skills' | null>(null);
+  const [dialog, setDialog] = useState<
+    'model' | 'new' | 'skills' | 'appearance' | 'runtime' | null
+  >(null);
+  const [iconBackground, setIconBackground] = useState('white');
+  const [uiTheme, setUiTheme] = useState<'light' | 'dark'>('light');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+  const [modelDiscoveryError, setModelDiscoveryError] = useState('');
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelRefresh, setModelRefresh] = useState(0);
   const selected = useRef<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
 
@@ -133,6 +176,14 @@ function App() {
   }
   useEffect(() => {
     let disposed = false;
+    void api<{ iconBackground: string; uiTheme: 'light' | 'dark' }>('getAppearance')
+      .then((data) => {
+        if (!disposed) {
+          setIconBackground(data.iconBackground);
+          setUiTheme(data.uiTheme);
+        }
+      })
+      .catch(fail);
     void api<{ config: Config; sessions: Session[]; skills: Skill[]; busySessionId?: string }>(
       'bootstrap',
     )
@@ -189,6 +240,12 @@ function App() {
               : previous,
           );
         void refreshSessions().catch(fail);
+        if (message.sessionId)
+          void api<SessionView>('openSession', { sessionId: message.sessionId })
+            .then((next) => {
+              if (selected.current === message.sessionId) setView(next);
+            })
+            .catch(fail);
         if (message.type === 'runFailed') fail(new Error(message.message ?? '执行失败'));
       }
     });
@@ -197,6 +254,33 @@ function App() {
       unsubscribe();
     };
   }, []);
+  useEffect(() => {
+    document.documentElement.dataset.theme = uiTheme;
+  }, [uiTheme]);
+  useEffect(() => {
+    const alias = view?.session.profile.alias;
+    if (!alias) {
+      setDiscoveredModels([]);
+      return;
+    }
+    let cancelled = false;
+    setModelLoading(true);
+    setDiscoveredModels([]);
+    setModelDiscoveryError('');
+    void api<string[]>('discoverModels', { alias })
+      .then((models) => {
+        if (!cancelled) setDiscoveredModels(models);
+      })
+      .catch((err) => {
+        if (!cancelled) setModelDiscoveryError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setModelLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [view?.session.profile.alias, config, modelRefresh]);
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: 'smooth' });
   }, [view?.events.length, stream, notice, approval]);
@@ -243,10 +327,12 @@ function App() {
       fail(err);
     }
   }
-  async function switchModel(alias: string) {
+  async function switchModel(alias: string, modelId?: string) {
     if (!view) return;
     try {
-      setView(await api<SessionView>('setSessionModel', { sessionId: view.session.id, alias }));
+      setView(
+        await api<SessionView>('setSessionModel', { sessionId: view.session.id, alias, modelId }),
+      );
       await refreshSessions();
     } catch (err) {
       fail(err);
@@ -267,6 +353,14 @@ function App() {
     try {
       setView(await api<SessionView>('reviewUnknown', { sessionId: view.session.id }));
       setNotice('已确认检查工作区。可继续会话。');
+    } catch (err) {
+      fail(err);
+    }
+  }
+  async function planAction(method: string, params: Record<string, unknown>) {
+    if (!view) return;
+    try {
+      setView(await api<SessionView>(method, { sessionId: view.session.id, ...params }));
     } catch (err) {
       fail(err);
     }
@@ -323,8 +417,14 @@ function App() {
           {!sessions.length && <div className="empty-sidebar">从一个项目文件夹开始。</div>}
         </div>
         <div className="sidebar-footer">
+          <button onClick={() => setDialog('appearance')}>
+            <Palette size={17} /> 外观
+          </button>
           <button onClick={() => setDialog('skills')}>
             <Layers size={17} /> Skills <span>{skills.filter((x) => x.enabled).length}</span>
+          </button>
+          <button onClick={() => setDialog('runtime')}>
+            <Terminal size={17} /> MCP 与自动化
           </button>
           <button onClick={() => setDialog('model')}>
             <Settings2 size={17} /> 模型设置
@@ -364,9 +464,45 @@ function App() {
                     </option>
                   ))}
                 </select>
+                <select
+                  className="model-select model-id-select"
+                  aria-label="当前模型 ID"
+                  title={
+                    modelDiscoveryError ||
+                    (modelLoading ? '正在获取模型列表' : '选择当前 API 提供的模型')
+                  }
+                  value={view.session.profile.model}
+                  onChange={(e) => void switchModel(view.session.profile.alias, e.target.value)}
+                  disabled={busy || modelLoading}
+                >
+                  {[...new Set([view.session.profile.model, ...discoveredModels])].map((id) => (
+                    <option value={id} key={id}>
+                      {id}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="icon-button model-refresh"
+                  aria-label="刷新可用模型"
+                  title={modelDiscoveryError || '刷新可用模型'}
+                  disabled={busy || modelLoading}
+                  onClick={() => setModelRefresh((value) => value + 1)}
+                >
+                  <LoaderCircle size={15} className={modelLoading ? 'spinning' : ''} />
+                </button>
+                {modelDiscoveryError && (
+                  <span className="model-catalog-error" title={modelDiscoveryError}>
+                    模型列表不可用
+                  </span>
+                )}
               </>
             )}
-            <div className="avatar">B</div>
+            <div className="avatar">
+              <img
+                src={iconOptions.find((x) => x.id === iconBackground)?.image ?? bearWhite}
+                alt="Bruin 熊图标"
+              />
+            </div>
           </div>
         </header>
         {!view ? (
@@ -422,6 +558,58 @@ function App() {
                   <button onClick={() => void acknowledge()}>我已检查</button>
                 </div>
               )}
+              <div className="plan-panel">
+                <div className="plan-heading">
+                  <strong>规划模式</strong>
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() => void planAction('setPlanMode', { enabled: !view.plan.enabled })}
+                  >
+                    {view.plan.enabled ? '关闭' : '开启'}
+                  </button>
+                </div>
+                {view.plan.enabled && (
+                  <>
+                    {view.plan.steps.length ? (
+                      <ol>
+                        {view.plan.steps.map((step, index) => (
+                          <li key={`${index}-${step}`}>
+                            <span>{step}</span>
+                            {view.plan.approved && (
+                              <select
+                                value={view.plan.progress[index] ?? 'pending'}
+                                onChange={(e) =>
+                                  void planAction('setPlanProgress', {
+                                    index,
+                                    status: e.target.value,
+                                  })
+                                }
+                              >
+                                <option value="pending">待处理</option>
+                                <option value="in_progress">进行中</option>
+                                <option value="completed">已完成</option>
+                              </select>
+                            )}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <p>请让 Bruin 先生成计划；批准前只能使用只读工具。</p>
+                    )}
+                    {view.plan.steps.length > 0 && !view.plan.approved && (
+                      <button
+                        className="primary"
+                        disabled={busy}
+                        onClick={() => void planAction('approvePlan', {})}
+                      >
+                        批准计划并允许执行
+                      </button>
+                    )}
+                    {view.plan.approved && <small>计划已批准。修改仍遵循逐项工具审批。</small>}
+                  </>
+                )}
+              </div>
               {view.events
                 .filter((e) =>
                   [
@@ -585,6 +773,16 @@ function App() {
           fail={fail}
         />
       )}
+      {dialog === 'appearance' && (
+        <AppearanceDialog
+          selected={iconBackground}
+          uiTheme={uiTheme}
+          close={() => setDialog(null)}
+          changed={setIconBackground}
+          themeChanged={setUiTheme}
+          fail={fail}
+        />
+      )}
       {dialog === 'skills' && (
         <SkillsDialog
           skills={skills}
@@ -594,6 +792,15 @@ function App() {
           marketsChanged={(markets) =>
             setConfig((previous) => ({ ...previous, marketplaces: markets }))
           }
+          fail={fail}
+        />
+      )}
+      {dialog === 'runtime' && (
+        <RuntimeDialog
+          config={config}
+          session={view?.session}
+          close={() => setDialog(null)}
+          changed={setConfig}
           fail={fail}
         />
       )}
@@ -705,6 +912,311 @@ function Modal({
     </div>
   );
 }
+function RuntimeDialog({
+  config,
+  session,
+  close,
+  changed,
+  fail,
+}: {
+  config: Config;
+  session?: Session;
+  close: () => void;
+  changed: (next: Config) => void;
+  fail: (error: unknown) => void;
+}) {
+  const [transport, setTransport] = useState<'stdio' | 'http'>('stdio');
+  const [serverName, setServerName] = useState('');
+  const [endpoint, setEndpoint] = useState('');
+  const [args, setArgs] = useState('');
+  const [envName, setEnvName] = useState('');
+  const [hookName, setHookName] = useState('');
+  const [hookEvent, setHookEvent] = useState<Hook['event']>('before_tool');
+  const [hookCommand, setHookCommand] = useState('');
+  const [worktreeName, setWorktreeName] = useState('');
+  const [worktreePath, setWorktreePath] = useState('');
+  const [subagentPrompt, setSubagentPrompt] = useState('');
+  const [backgroundCommand, setBackgroundCommand] = useState('');
+  const [taskId, setTaskId] = useState('');
+  const [output, setOutput] = useState('');
+  const [working, setWorking] = useState(false);
+  async function manage(method: string, params: Record<string, unknown>) {
+    setWorking(true);
+    try {
+      const result = await api<unknown>(method, params);
+      const latest = await api<{ config: Config }>('bootstrap');
+      changed(latest.config);
+      setOutput(JSON.stringify(result, null, 2));
+    } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function runtime(name: string, input: Record<string, unknown> = {}) {
+    if (!session) {
+      fail(new Error('请先选择一个会话'));
+      return;
+    }
+    setWorking(true);
+    try {
+      const result = await api<{ output: string }>('runtimeTool', {
+        sessionId: session.id,
+        name,
+        input,
+      });
+      setOutput(result.output);
+    } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  return (
+    <Modal title="MCP 与自动化" eyebrow="AGENT CAPABILITIES" close={close}>
+      <div className="runtime-settings form-stack">
+        <h3>MCP 服务器</h3>
+        {config.mcpServers.map((server) => (
+          <div className="runtime-row" key={server.name}>
+            <span>
+              <strong>{server.name}</strong> ·{' '}
+              {server.transport === 'stdio' ? server.command : server.url}
+            </span>
+            <button
+              disabled={working}
+              onClick={() => void manage('testMcpServer', { name: server.name })}
+            >
+              测试工具
+            </button>
+            <button
+              disabled={working}
+              onClick={() => void manage('removeMcpServer', { name: server.name })}
+            >
+              移除
+            </button>
+          </div>
+        ))}
+        <label>
+          传输方式
+          <select
+            value={transport}
+            onChange={(e) => setTransport(e.target.value as 'stdio' | 'http')}
+          >
+            <option value="stdio">stdio 进程</option>
+            <option value="http">Streamable HTTP</option>
+          </select>
+        </label>
+        <label>
+          名称
+          <input
+            value={serverName}
+            onChange={(e) => setServerName(e.target.value)}
+            placeholder="filesystem"
+          />
+        </label>
+        <label>
+          {transport === 'stdio' ? '启动命令' : '服务器 URL'}
+          <input
+            value={endpoint}
+            onChange={(e) => setEndpoint(e.target.value)}
+            placeholder={transport === 'stdio' ? 'npx' : 'https://example.com/mcp'}
+          />
+        </label>
+        {transport === 'stdio' && (
+          <label>
+            参数（每行一个）
+            <textarea
+              value={args}
+              onChange={(e) => setArgs(e.target.value)}
+              placeholder={'-y\n@modelcontextprotocol/server-filesystem'}
+            />
+          </label>
+        )}
+        <label>
+          {transport === 'stdio'
+            ? '允许传给服务器的环境变量名（逗号分隔）'
+            : 'Bearer Token 环境变量名'}
+          <input
+            value={envName}
+            onChange={(e) => setEnvName(e.target.value)}
+            placeholder="MCP_TOKEN"
+          />
+        </label>
+        <button
+          className="secondary"
+          disabled={working || !serverName.trim() || !endpoint.trim()}
+          onClick={() =>
+            void manage(
+              'saveMcpServer',
+              transport === 'stdio'
+                ? {
+                    name: serverName.trim(),
+                    transport,
+                    command: endpoint.trim(),
+                    args: args
+                      .split('\n')
+                      .map((x) => x.trim())
+                      .filter(Boolean),
+                    envNames: envName
+                      .split(',')
+                      .map((x) => x.trim())
+                      .filter(Boolean),
+                  }
+                : {
+                    name: serverName.trim(),
+                    transport,
+                    url: endpoint.trim(),
+                    ...(envName.trim() ? { tokenEnv: envName.trim() } : {}),
+                  },
+            )
+          }
+        >
+          保存 MCP 服务器
+        </button>
+        <h3>Hooks</h3>
+        {config.hooks.map((hook) => (
+          <div className="runtime-row" key={hook.name}>
+            <span>
+              <strong>{hook.name}</strong> · {hook.event} · {hook.enabled ? '启用' : '关闭'}
+            </span>
+            <button
+              disabled={working}
+              onClick={() => void manage('saveHook', { ...hook, enabled: !hook.enabled })}
+            >
+              {hook.enabled ? '关闭' : '启用'}
+            </button>
+            <button
+              disabled={working}
+              onClick={() => void manage('removeHook', { name: hook.name })}
+            >
+              移除
+            </button>
+          </div>
+        ))}
+        <label>
+          Hook 名称
+          <input value={hookName} onChange={(e) => setHookName(e.target.value)} />
+        </label>
+        <label>
+          触发时机
+          <select value={hookEvent} onChange={(e) => setHookEvent(e.target.value as Hook['event'])}>
+            <option value="turn_started">回合开始</option>
+            <option value="before_tool">工具执行前</option>
+            <option value="after_tool">工具执行后</option>
+            <option value="turn_finished">回合结束</option>
+          </select>
+        </label>
+        <label>
+          Shell 命令
+          <input value={hookCommand} onChange={(e) => setHookCommand(e.target.value)} />
+        </label>
+        <button
+          className="secondary"
+          disabled={working || !hookName.trim() || !hookCommand.trim()}
+          onClick={() =>
+            void manage('saveHook', {
+              name: hookName.trim(),
+              event: hookEvent,
+              command: hookCommand,
+              enabled: true,
+            })
+          }
+        >
+          保存 Hook
+        </button>
+        <h3>工作树与后台任务</h3>
+        <div className="runtime-row">
+          <input
+            value={worktreeName}
+            onChange={(e) => setWorktreeName(e.target.value)}
+            placeholder="工作树名称（可留空）"
+          />
+          <button
+            disabled={working || !session}
+            onClick={() =>
+              void runtime('create_worktree', worktreeName ? { name: worktreeName } : {})
+            }
+          >
+            创建工作树
+          </button>
+          <button disabled={working || !session} onClick={() => void runtime('list_worktrees')}>
+            列出
+          </button>
+        </div>
+        <div className="runtime-row">
+          <input
+            value={worktreePath}
+            onChange={(e) => setWorktreePath(e.target.value)}
+            placeholder="要移除的 Bruin 工作树完整路径"
+          />
+          <button
+            disabled={working || !session || !worktreePath.trim()}
+            onClick={() => void runtime('remove_worktree', { path: worktreePath.trim() })}
+          >
+            移除干净的工作树
+          </button>
+        </div>
+        <div className="runtime-row">
+          <input
+            value={subagentPrompt}
+            onChange={(e) => setSubagentPrompt(e.target.value)}
+            placeholder="只读子 Agent 任务"
+          />
+          <button
+            disabled={working || !session || !subagentPrompt.trim()}
+            onClick={() =>
+              void runtime('spawn_subagent', {
+                prompt: subagentPrompt,
+                ...(worktreePath.trim() ? { worktree: worktreePath.trim() } : {}),
+              })
+            }
+          >
+            启动子 Agent
+          </button>
+        </div>
+        <div className="runtime-row">
+          <input
+            value={backgroundCommand}
+            onChange={(e) => setBackgroundCommand(e.target.value)}
+            placeholder="后台 Shell 命令"
+          />
+          <button
+            disabled={working || !session || !backgroundCommand.trim()}
+            onClick={() => void runtime('start_background', { command: backgroundCommand })}
+          >
+            启动后台任务
+          </button>
+        </div>
+        <div className="runtime-row">
+          <input
+            value={taskId}
+            onChange={(e) => setTaskId(e.target.value)}
+            placeholder="子 Agent 或后台任务 ID"
+          />
+          <button
+            disabled={working || !session || !taskId.trim()}
+            onClick={() => void runtime('subagent_status', { id: taskId })}
+          >
+            子 Agent 状态
+          </button>
+          <button
+            disabled={working || !session || !taskId.trim()}
+            onClick={() => void runtime('background_status', { id: taskId })}
+          >
+            后台状态
+          </button>
+          <button
+            disabled={working || !session || !taskId.trim()}
+            onClick={() => void runtime('cancel_background', { id: taskId })}
+          >
+            停止后台
+          </button>
+        </div>
+        {output && <pre className="runtime-output">{output}</pre>}
+      </div>
+    </Modal>
+  );
+}
 function NewSessionDialog({
   profiles,
   defaultProfile,
@@ -784,6 +1296,84 @@ function NewSessionDialog({
             {saving ? '创建中…' : '创建会话'}
           </button>
         </div>
+      </div>
+    </Modal>
+  );
+}
+function AppearanceDialog({
+  selected,
+  uiTheme,
+  close,
+  changed,
+  themeChanged,
+  fail,
+}: {
+  selected: string;
+  uiTheme: 'light' | 'dark';
+  close: () => void;
+  changed: (value: string) => void;
+  themeChanged: (value: 'light' | 'dark') => void;
+  fail: (error: unknown) => void;
+}) {
+  const [saving, setSaving] = useState(false);
+  async function choose(theme: string) {
+    try {
+      setSaving(true);
+      const result = await api<{ iconBackground: string }>('setIconBackground', { theme });
+      changed(result.iconBackground);
+    } catch (error) {
+      fail(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function chooseTheme(theme: 'light' | 'dark') {
+    try {
+      setSaving(true);
+      const result = await api<{ uiTheme: 'light' | 'dark' }>('setTheme', { theme });
+      themeChanged(result.uiTheme);
+    } catch (error) {
+      fail(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <Modal title="外观" eyebrow="BRUIN ICON" close={close}>
+      <h3 className="appearance-heading">界面背景</h3>
+      <div className="theme-options">
+        <button
+          className={uiTheme === 'light' ? 'selected' : ''}
+          disabled={saving}
+          onClick={() => void chooseTheme('light')}
+        >
+          纯白（默认）
+        </button>
+        <button
+          className={uiTheme === 'dark' ? 'selected' : ''}
+          disabled={saving}
+          onClick={() => void chooseTheme('dark')}
+        >
+          黑色
+        </button>
+      </div>
+      <h3 className="appearance-heading">熊图标背景</h3>
+      <p className="form-help">
+        选择熊图标背景色。默认纯白；更改会立即应用到 Dock 或任务栏，并在下次启动时保留。
+      </p>
+      <div className="icon-grid">
+        {iconOptions.map((option) => (
+          <button
+            className={`icon-choice ${selected === option.id ? 'selected' : ''}`}
+            key={option.id}
+            disabled={saving}
+            onClick={() => void choose(option.id)}
+          >
+            <img src={option.image} alt="" />
+            <span>{option.label}</span>
+            {selected === option.id && <Check size={16} />}
+          </button>
+        ))}
       </div>
     </Modal>
   );
@@ -1069,7 +1659,7 @@ function SkillsDialog({
               <div className="skill-copy" onClick={() => void show(skill)}>
                 <strong>{skill.name}</strong>
                 <small>{skill.description}</small>
-                <em>{skill.source}</em>
+                <em>{skill.source.startsWith('builtin:') ? 'Bruin 内置' : skill.source}</em>
               </div>
               <button
                 className={`toggle ${skill.enabled ? 'on' : ''}`}
@@ -1107,29 +1697,33 @@ function SkillsDialog({
               </div>
               <pre>{content}</pre>
               <div>
-                <button
-                  className="subtle-button"
-                  onClick={() =>
-                    void act<Skill[]>('updateSkill', { name: selected.name }, (value) => {
-                      changed(value);
-                      setSelected(null);
-                    })
-                  }
-                >
-                  更新
-                </button>
-                <button
-                  className="danger-text"
-                  onClick={() => {
-                    if (window.confirm(`卸载 ${selected.name}？`))
-                      void act<Skill[]>('removeSkill', { name: selected.name }, (value) => {
+                {!selected.source.startsWith('builtin:') && (
+                  <button
+                    className="subtle-button"
+                    onClick={() =>
+                      void act<Skill[]>('updateSkill', { name: selected.name }, (value) => {
                         changed(value);
                         setSelected(null);
-                      });
-                  }}
-                >
-                  卸载
-                </button>
+                      })
+                    }
+                  >
+                    更新
+                  </button>
+                )}
+                {!selected.source.startsWith('builtin:') && (
+                  <button
+                    className="danger-text"
+                    onClick={() => {
+                      if (window.confirm(`卸载 ${selected.name}？`))
+                        void act<Skill[]>('removeSkill', { name: selected.name }, (value) => {
+                          changed(value);
+                          setSelected(null);
+                        });
+                    }}
+                  >
+                    卸载
+                  </button>
+                )}
               </div>
             </div>
           )}

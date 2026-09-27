@@ -239,7 +239,7 @@ test('local skill installs and loads on demand', () => {
   );
   const info = installLocal(skillDir);
   assert.equal(info.name, 'sample');
-  assert.equal(listSkills().length, 1);
+  assert.ok(listSkills().some((skill) => skill.name === 'sample'));
   assert.match(loadSkill('sample'), /Do the work/);
   delete process.env.BRUIN_HOME;
   fs.rmSync(dir, { recursive: true, force: true });
@@ -287,4 +287,40 @@ test('agent persists request, approval and result before continuing', async () =
   );
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+test('model errors redact the active API key before persistence and display', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  const secret = 'test-only-provider-secret';
+  setRuntimeApiKey(profile.alias, secret);
+  const gateway: ModelGateway = {
+    async complete() {
+      throw new Error(`provider rejected ${secret}`);
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('unused');
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return false;
+      },
+    });
+    await assert.rejects(runner.run(session, 'hello'), (error) => {
+      assert.doesNotMatch(String(error), /test-only-provider-secret/);
+      return true;
+    });
+    assert.doesNotMatch(JSON.stringify(store.events(session.id)), /test-only-provider-secret/);
+  } finally {
+    setRuntimeApiKey(profile.alias, undefined);
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

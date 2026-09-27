@@ -27,10 +27,44 @@ const profileSchema = z.object({
   baseUrl: z.string().url().optional(),
   apiKeyEnv: z.string().regex(envNamePattern).optional(),
 });
+export const mcpServerSchema = z.discriminatedUnion('transport', [
+  z.object({
+    name: z.string().min(1).max(80),
+    transport: z.literal('stdio'),
+    command: z.string().min(1),
+    args: z.array(z.string()).default([]),
+    envNames: z.array(z.string().regex(envNamePattern)).default([]),
+  }),
+  z.object({
+    name: z.string().min(1).max(80),
+    transport: z.literal('http'),
+    url: z
+      .string()
+      .url()
+      .refine((value) => {
+        const url = new URL(value);
+        return (
+          url.protocol === 'https:' ||
+          (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+        );
+      }, '远程 MCP 服务器必须使用 HTTPS'),
+    tokenEnv: z.string().regex(envNamePattern).optional(),
+  }),
+]);
+export type McpServerConfig = z.infer<typeof mcpServerSchema>;
+export const hookSchema = z.object({
+  name: z.string().min(1).max(80),
+  event: z.enum(['before_tool', 'after_tool', 'turn_started', 'turn_finished']),
+  command: z.string().min(1),
+  enabled: z.boolean().default(true),
+});
+export type HookConfig = z.infer<typeof hookSchema>;
 const configSchema = z.object({
   profiles: z.array(profileSchema).default([]),
   defaultProfile: z.string().optional(),
   marketplaces: z.array(z.object({ name: z.string(), source: z.string() })).default([]),
+  mcpServers: z.array(mcpServerSchema).default([]),
+  hooks: z.array(hookSchema).default([]),
 });
 export type AppConfig = z.infer<typeof configSchema>;
 export function dataDir(): string {
@@ -40,7 +74,8 @@ export function configPath(): string {
   return path.join(dataDir(), 'config.json');
 }
 export function loadConfig(): AppConfig {
-  if (!fs.existsSync(configPath())) return { profiles: [], marketplaces: [] };
+  if (!fs.existsSync(configPath()))
+    return { profiles: [], marketplaces: [], mcpServers: [], hooks: [] };
   const raw = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as {
     profiles?: Array<{ alias?: string; apiKeyEnv?: string }>;
   };

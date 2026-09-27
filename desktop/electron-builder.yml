@@ -10,10 +10,18 @@ files:
 extraResources:
   - from: .desktop-runtime
     to: runtime
+  - from: .desktop-runtime/node_modules
+    to: runtime/node_modules
+    filter:
+      - '**/*'
+  - from: desktop/assets
+    to: icons
+    filter:
+      - icon-*.png
 npmRebuild: false
 asar: true
 mac:
-  icon: desktop/assets/icon.png
+  icon: desktop/assets/icon.svg
   target:
     - dmg
     - zip

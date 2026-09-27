@@ -46,8 +46,64 @@ export const toolSchemas = {
     description: 'Run a shell command in the workspace. Requires user approval.',
     inputSchema: z.object({ command: z.string() }),
   },
+  mcp_list_tools: {
+    description: 'List tools offered by a configured MCP server',
+    inputSchema: z.object({ server: z.string() }),
+  },
+  mcp_call: {
+    description: 'Call a configured MCP server tool. Requires user approval.',
+    inputSchema: z.object({
+      server: z.string(),
+      tool: z.string(),
+      arguments: z.record(z.string(), z.unknown()).default({}),
+    }),
+  },
+  spawn_subagent: {
+    description: 'Start a read-only subagent for a bounded research task',
+    inputSchema: z.object({ prompt: z.string(), worktree: z.string().optional() }),
+  },
+  subagent_status: {
+    description: 'Read a subagent result by ID',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  create_worktree: {
+    description: 'Create an isolated Git worktree at HEAD',
+    inputSchema: z.object({ name: z.string().optional() }),
+  },
+  list_worktrees: {
+    description: 'List Git worktrees for this workspace',
+    inputSchema: z.object({}),
+  },
+  remove_worktree: {
+    description: 'Remove a clean Bruin-managed Git worktree. Requires approval.',
+    inputSchema: z.object({ path: z.string() }),
+  },
+  start_background: {
+    description: 'Start a sandboxed shell command in the background. Requires approval.',
+    inputSchema: z.object({ command: z.string() }),
+  },
+  background_status: {
+    description: 'Read a background command status and output',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  cancel_background: {
+    description: 'Stop a background command',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  update_plan: {
+    description:
+      'Create or revise a step-by-step execution plan. A revised plan needs user approval before changes.',
+    inputSchema: z.object({ steps: z.array(z.string().min(1)).min(1).max(30) }),
+  },
+  update_plan_progress: {
+    description: 'Mark an approved plan step pending, in progress or completed',
+    inputSchema: z.object({
+      index: z.number().int().min(0),
+      status: z.enum(['pending', 'in_progress', 'completed']),
+    }),
+  },
 };
-function apiKey(profile: ModelProfile): string | undefined {
+export function resolveApiKey(profile: ModelProfile): string | undefined {
   const keyName =
     profile.apiKeyEnv ??
     (
@@ -70,7 +126,7 @@ function apiKey(profile: ModelProfile): string | undefined {
   return key;
 }
 export function providerModel(profile: ModelProfile) {
-  const key = apiKey(profile);
+  const key = resolveApiKey(profile);
   switch (profile.provider) {
     case 'openai':
       return createOpenAI({ apiKey: key, baseURL: profile.baseUrl }).responses(profile.model);
@@ -89,6 +145,7 @@ export function providerModel(profile: ModelProfile) {
   }
 }
 export class AiSdkGateway implements ModelGateway {
+  constructor(private mode: 'basic' | 'full' | 'read-only' = 'basic') {}
   async complete(
     profile: ModelProfile,
     prompt: ModelMessage[],
@@ -98,7 +155,23 @@ export class AiSdkGateway implements ModelGateway {
     const result = streamText({
       model: providerModel(profile),
       messages: prompt,
-      tools: toolSchemas,
+      tools:
+        this.mode === 'full'
+          ? toolSchemas
+          : this.mode === 'read-only'
+            ? {
+                read_file: toolSchemas.read_file,
+                search: toolSchemas.search,
+                load_skill: toolSchemas.load_skill,
+              }
+            : {
+                read_file: toolSchemas.read_file,
+                write_file: toolSchemas.write_file,
+                edit_file: toolSchemas.edit_file,
+                search: toolSchemas.search,
+                load_skill: toolSchemas.load_skill,
+                shell: toolSchemas.shell,
+              },
       abortSignal: signal,
       maxRetries: 2,
     });

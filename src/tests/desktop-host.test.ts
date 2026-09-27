@@ -15,6 +15,11 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
   let modelCalls = 0;
   const authHeaders: string[] = [];
   const server = http.createServer((req, response) => {
+    if (req.url === '/v1/models') {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ data: [{ id: 'test' }, { id: 'other' }] }));
+      return;
+    }
     authHeaders.push(String(req.headers.authorization ?? ''));
     modelCalls++;
     response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -106,6 +111,7 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     assert.equal(created.session.profile.alias, 'local');
     const opened = await request('openSession', { sessionId: created.session.id });
     assert.deepEqual(opened.events, []);
+    assert.deepEqual(await request('discoverModels', { alias: 'local' }), ['other', 'test']);
     const edited = await request('saveProfile', {
       alias: 'local',
       provider: 'openai-compatible',
@@ -116,6 +122,33 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     const reopened = await request('openSession', { sessionId: created.session.id });
     assert.equal(reopened.session.profile.model, 'test-edited');
     assert.equal(reopened.events.at(-1).type, 'model_switched');
+    const switched = await request('setSessionModel', {
+      sessionId: created.session.id,
+      alias: 'local',
+      modelId: 'other',
+    });
+    assert.equal(switched.session.profile.model, 'other');
+    const switchCount = switched.events.length;
+    const repeated = await request('setSessionModel', {
+      sessionId: created.session.id,
+      alias: 'local',
+      modelId: 'other',
+    });
+    assert.equal(repeated.events.length, switchCount);
+    await request('saveProfile', {
+      alias: 'local',
+      provider: 'openai-compatible',
+      model: 'new-default',
+      baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    });
+    assert.equal(
+      (await request('openSession', { sessionId: created.session.id })).session.profile.model,
+      'other',
+    );
+    assert.equal(
+      (await request('openSession', { sessionId: created.session.id })).events.length,
+      switchCount,
+    );
     const skillDir = path.join(dir, 'skill');
     fs.mkdirSync(skillDir);
     fs.writeFileSync(
@@ -123,8 +156,7 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       '---\nname: example\ndescription: A local skill\n---\nInstructions.\n',
     );
     const skills = await request('installLocal', { directory: skillDir });
-    assert.equal(skills[0].name, 'example');
-    assert.equal(skills[0].enabled, true);
+    assert.equal(skills.find((skill: { name: string }) => skill.name === 'example')?.enabled, true);
     assert.match(await request('readSkill', { name: 'example' }), /Instructions/);
     await assert.rejects(
       request('send', { sessionId: created.session.id, prompt: '' }),
@@ -172,6 +204,7 @@ test('desktop startup repairs a legacy session profile containing a key', async 
   );
   const store = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
   const session = store.createSession(dir, profile);
+  store.append(session.id, 'model_error', { message: `Missing API key: ${key}` });
   store.close();
   const script = fileURLToPath(new URL('../desktop-host.js', import.meta.url));
   const child = spawn(process.execPath, [script], {
@@ -191,6 +224,19 @@ test('desktop startup repairs a legacy session profile containing a key', async 
     const boot = await reply;
     assert.equal(boot.sessions[0].id, session.id);
     assert.equal(boot.sessions[0].profile.apiKeyEnv, undefined);
+    const opened = new Promise<any>((resolve, reject) => {
+      readline.createInterface({ input: child.stdout }).on('line', (line) => {
+        const message = JSON.parse(line);
+        if (message.id === 'open')
+          message.error ? reject(new Error(message.error)) : resolve(message.result);
+      });
+    });
+    child.stdin.write(
+      JSON.stringify({ id: 'open', method: 'openSession', params: { sessionId: session.id } }) +
+        '\n',
+    );
+    const view = await opened;
+    assert.doesNotMatch(JSON.stringify(view.events), /sk-test-legacy/);
     assert.doesNotMatch(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), /sk-test-legacy/);
     const reopened = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
     try {

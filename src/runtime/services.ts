@@ -1,0 +1,308 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import type { EventStore } from '../storage/event-store.js';
+import type { ToolExecutor } from '../executor/client.js';
+import type { Session, ToolCall, ToolResult } from '../core/types.js';
+import { dataDir, loadConfig, type HookConfig } from '../config.js';
+import { McpManager } from './mcp.js';
+import { planState, setPlanProgress } from './plan.js';
+
+const execFileAsync = promisify(execFile);
+type Background = {
+  sessionId: string;
+  controller: AbortController;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  result?: ToolResult;
+};
+type Subagent = {
+  sessionId: string;
+  controller: AbortController;
+  status: 'running' | 'completed' | 'failed';
+  error?: string;
+};
+
+export class RuntimeServices {
+  readonly mcp = new McpManager();
+  private background = new Map<string, Background>();
+  private subagents = new Map<string, Subagent>();
+  private pending = new Set<Promise<unknown>>();
+  constructor(
+    private store: EventStore,
+    private executor: ToolExecutor,
+    private runSubagent: (session: Session, prompt: string, signal: AbortSignal) => Promise<void>,
+  ) {}
+
+  async runHooks(event: HookConfig['event'], session: Session, signal: AbortSignal): Promise<void> {
+    for (const hook of loadConfig().hooks.filter((item) => item.enabled && item.event === event)) {
+      const result = await this.executor.execute(
+        {
+          requestId: randomUUID(),
+          name: 'shell',
+          input: { command: hook.command },
+          workspace: session.workspace,
+          timeoutMs: 30_000,
+          maxOutputBytes: 10_000,
+        },
+        signal,
+      );
+      this.store.append(session.id, 'hook_finished', {
+        name: hook.name,
+        event,
+        isError: result.isError,
+        output: result.output,
+      });
+      if (result.isError && (event === 'before_tool' || event === 'turn_started'))
+        throw new Error(`Hook ${hook.name} 失败: ${result.output}`);
+    }
+  }
+
+  async execute(call: ToolCall, session: Session, signal: AbortSignal): Promise<ToolResult> {
+    const input = call.input;
+    switch (call.name) {
+      case 'mcp_list_tools': {
+        const server = loadConfig().mcpServers.find((item) => item.name === input.server);
+        if (!server) throw new Error('MCP 服务器未配置');
+        return { output: JSON.stringify(await this.mcp.listTools(server)), isError: false };
+      }
+      case 'mcp_call': {
+        const server = loadConfig().mcpServers.find((item) => item.name === input.server);
+        if (!server) throw new Error('MCP 服务器未配置');
+        return this.mcp.callTool(
+          server,
+          String(input.tool ?? ''),
+          (input.arguments ?? {}) as Record<string, unknown>,
+        );
+      }
+      case 'update_plan': {
+        if (!planState(this.store.events(session.id)).enabled)
+          throw new Error('当前会话未开启规划模式');
+        const steps = input.steps;
+        if (
+          !Array.isArray(steps) ||
+          !steps.length ||
+          steps.length > 30 ||
+          !steps.every((x) => typeof x === 'string' && x.trim().length > 0 && x.length <= 500)
+        )
+          throw new Error('规划需要 1 至 30 个有效步骤');
+        this.store.append(session.id, 'plan_updated', { steps });
+        return { output: '规划已保存。等待用户在界面批准后才能执行修改。', isError: false };
+      }
+      case 'update_plan_progress': {
+        const state = setPlanProgress(
+          this.store,
+          session.id,
+          Number(input.index),
+          String(input.status) as 'pending' | 'in_progress' | 'completed',
+        );
+        return { output: JSON.stringify(state), isError: false };
+      }
+      case 'list_worktrees': {
+        const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+          cwd: session.workspace,
+          timeout: 10_000,
+          maxBuffer: 100_000,
+        });
+        return { output: stdout, isError: false };
+      }
+      case 'create_worktree': {
+        const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
+          cwd: session.workspace,
+          timeout: 10_000,
+        });
+        const root = fs.realpathSync(stdout.trim());
+        const name =
+          typeof input.name === 'string' && input.name ? input.name : randomUUID().slice(0, 8);
+        if (!/^[a-z][a-z0-9-]{0,39}$/.test(name))
+          throw new Error('工作树名称必须以字母开头，仅包含小写字母、数字和连字符');
+        const parent = path.join(dataDir(), 'worktrees');
+        fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+        const destination = path.join(parent, name);
+        if (fs.existsSync(destination)) throw new Error('工作树名称已存在');
+        await execFileAsync('git', ['worktree', 'add', '--detach', destination, 'HEAD'], {
+          cwd: root,
+          timeout: 30_000,
+          maxBuffer: 100_000,
+        });
+        return { output: destination, isError: false };
+      }
+      case 'remove_worktree': {
+        const parent = path.join(dataDir(), 'worktrees');
+        const destination = fs.realpathSync(String(input.path ?? ''));
+        if (
+          !destination.startsWith(fs.realpathSync(parent) + path.sep) ||
+          path.dirname(destination) !== fs.realpathSync(parent)
+        )
+          throw new Error('只能移除 Bruin 管理的工作树');
+        const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+          cwd: session.workspace,
+          timeout: 10_000,
+          maxBuffer: 100_000,
+        });
+        if (!stdout.split('\n').includes(`worktree ${destination}`))
+          throw new Error('该路径不属于当前仓库的工作树');
+        await execFileAsync('git', ['worktree', 'remove', destination], {
+          cwd: session.workspace,
+          timeout: 30_000,
+          maxBuffer: 100_000,
+        });
+        return { output: `已移除 ${destination}`, isError: false };
+      }
+      case 'spawn_subagent': {
+        if ([...this.subagents.values()].filter((x) => x.status === 'running').length >= 2)
+          throw new Error('最多同时运行两个子 Agent');
+        const prompt = String(input.prompt ?? '').trim();
+        if (!prompt || prompt.length > 10_000) throw new Error('子 Agent 任务无效');
+        const workspace = input.worktree
+          ? fs.realpathSync(String(input.worktree))
+          : session.workspace;
+        if (input.worktree) {
+          const parent = fs.realpathSync(path.join(dataDir(), 'worktrees'));
+          if (!workspace.startsWith(parent + path.sep))
+            throw new Error('子 Agent 只能使用 Bruin 创建的工作树');
+        }
+        const child = this.store.createSession(workspace, session.profile);
+        const controller = new AbortController();
+        this.subagents.set(child.id, { sessionId: child.id, controller, status: 'running' });
+        this.store.append(session.id, 'subagent_started', { childId: child.id, prompt, workspace });
+        const running = this.runSubagent(child, prompt, controller.signal)
+          .then(() => {
+            const task = this.subagents.get(child.id);
+            if (task) task.status = 'completed';
+            this.store.append(session.id, 'subagent_finished', {
+              childId: child.id,
+              status: 'completed',
+            });
+          })
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            const task = this.subagents.get(child.id);
+            if (task) {
+              task.status = 'failed';
+              task.error = message;
+            }
+            this.store.append(session.id, 'subagent_finished', {
+              childId: child.id,
+              status: 'failed',
+              error: message,
+            });
+          });
+        this.pending.add(running);
+        void running.finally(() => this.pending.delete(running));
+        return { output: `子 Agent 已启动: ${child.id}`, isError: false };
+      }
+      case 'subagent_status': {
+        const id = String(input.id ?? '');
+        if (
+          !this.store
+            .events(session.id)
+            .some((e) => e.type === 'subagent_started' && e.payload.childId === id)
+        )
+          throw new Error('子 Agent 不属于当前会话');
+        const child = this.subagents.get(id);
+        const events = this.store.events(id);
+        const ended = [...this.store.events(session.id)]
+          .reverse()
+          .find((e) => e.type === 'subagent_finished' && e.payload.childId === id);
+        const state = child?.status ?? ended?.payload.status ?? 'unknown';
+        const lastAnswer = [...events]
+          .reverse()
+          .find((e) => e.type === 'assistant' && typeof e.payload.text === 'string');
+        return {
+          output: JSON.stringify({
+            id,
+            status: state,
+            answer: String(lastAnswer?.payload.text ?? '').slice(0, 20_000),
+            error: child?.error,
+          }),
+          isError: false,
+        };
+      }
+      case 'start_background': {
+        if ([...this.background.values()].filter((x) => x.status === 'running').length >= 2)
+          throw new Error('最多同时运行两个后台任务');
+        const command = String(input.command ?? '').trim();
+        if (!command || command.length > 10_000) throw new Error('后台命令无效');
+        const id = randomUUID();
+        const controller = new AbortController();
+        this.background.set(id, { sessionId: session.id, controller, status: 'running' });
+        this.store.append(session.id, 'background_started', { id, command });
+        const running = this.executor
+          .execute(
+            {
+              requestId: id,
+              name: 'shell',
+              input: { command },
+              workspace: session.workspace,
+              timeoutMs: 600_000,
+              maxOutputBytes: 100_000,
+            },
+            controller.signal,
+          )
+          .then((result) => {
+            const task = this.background.get(id);
+            if (task) {
+              if (task.status !== 'cancelled')
+                task.status = result.isError ? 'failed' : 'completed';
+              task.result = result;
+            }
+            this.store.append(session.id, 'background_finished', {
+              id,
+              status: task?.status,
+              result,
+            });
+          })
+          .catch((error) => {
+            const task = this.background.get(id);
+            if (task && task.status !== 'cancelled') task.status = 'failed';
+            this.store.append(session.id, 'background_finished', {
+              id,
+              status: task?.status ?? 'failed',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        this.pending.add(running);
+        void running.finally(() => this.pending.delete(running));
+        return { output: `后台任务已启动: ${id}`, isError: false };
+      }
+      case 'background_status':
+      case 'cancel_background': {
+        const id = String(input.id ?? '');
+        if (
+          !this.store
+            .events(session.id)
+            .some((e) => e.type === 'background_started' && e.payload.id === id)
+        )
+          throw new Error('后台任务不属于当前会话');
+        const task = this.background.get(id);
+        if (call.name === 'cancel_background' && task?.status === 'running') {
+          task.status = 'cancelled';
+          task.controller.abort();
+        }
+        const finished = [...this.store.events(session.id)]
+          .reverse()
+          .find((e) => e.type === 'background_finished' && e.payload.id === id);
+        return {
+          output: JSON.stringify({
+            id,
+            status: task?.status ?? finished?.payload.status ?? 'unknown',
+            result: task?.result ?? finished?.payload.result,
+          }),
+          isError: false,
+        };
+      }
+      default:
+        throw new Error('此工具不属于运行时服务');
+    }
+  }
+  async close(): Promise<void> {
+    for (const task of this.background.values())
+      if (task.status === 'running') task.controller.abort();
+    for (const task of this.subagents.values())
+      if (task.status === 'running') task.controller.abort();
+    await Promise.allSettled([...this.pending]);
+    await this.mcp.close();
+  }
+}

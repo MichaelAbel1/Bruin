@@ -26,7 +26,11 @@ npm run desktop:pack   # 生成当前平台的未签名应用目录
 npm run desktop:dist   # 生成当前平台安装包
 ```
 
-桌面版提供会话列表、流式对话、工具操作与审批弹窗、模型配置和 Skills 管理。macOS 打包目录为 `desktop/release-current/mac-arm64/Bruin.app`（或对应架构目录）。首次打开可从界面添加模型、选择工作区，再开始聊天。已添加的模型可在模型设置中点击“编辑”，修改会同步到使用该模型的已有会话。API Key 应填在“API Key”输入框，仅供本次运行使用；“环境变量名称”只填写如 `OPENAI_API_KEY` 的变量名，并要求在启动 Bruin 前设置该环境变量。API Key 不写入配置或事件库；重启后需重新输入，或使用环境变量。
+桌面版提供会话列表、流式对话、工具审批、模型配置、Skills 管理、MCP、子 Agent、工作树、后台任务、Hook 和规划模式。macOS 打包目录为 `desktop/release-current/mac-arm64/Bruin.app`（或对应架构目录）。首次打开可从界面添加模型、选择工作区，再开始聊天。已添加的模型可在模型设置中点击“编辑”，修改会同步到使用该模型的已有会话。API Key 应填在“API Key”输入框，仅供本次运行使用；“环境变量名称”只填写如 `OPENAI_API_KEY` 的变量名，并要求在启动 Bruin 前设置该环境变量。API Key 不写入新配置或事件；重启后需重新输入，或使用环境变量。历史版本可能已经把密钥写入事件；桌面界面会脱敏显示，但仍应轮换并安全处理旧数据库。
+
+图标采用纯白背景的熊头；侧边栏“外观”可切换黑色、鼠尾草绿、浅蓝和暖橙背景，选择会记住并即时更新 Dock/任务栏图标。安装包在 Finder 中的静态图标始终为默认纯白款。打开会话时，Bruin 会从当前 Provider 的模型目录获取模型 ID；顶部第二个下拉框可切换同一 API 下的其他模型，旁边可手动刷新。若接口不提供模型目录、返回格式不同或认证失败，当前模型仍可使用，也可以在模型设置里手填模型 ID。模型列表只表示 API 报告可用，不保证每个 ID 支持聊天和工具调用。
+
+桌面界面默认纯白，可在侧边栏「外观」切换为黑色主题；图标背景配色与界面主题分别保存。侧边栏「MCP 与自动化」可配置服务器和 Hook、管理工作树及后台任务；会话上方可开启规划模式。各能力的权限、事件与恢复语义见 [桌面 Agent 扩展能力](docs/RUNTIME_CAPABILITIES.md)。
 
 打包脚本会复制当前 Node.js 可执行文件并独立安装核心的运行依赖，随 Electron 应用一起交付。因此终端 CLI 与桌面版复用同一 TypeScript 核心，也避免 Electron 与 SQLite 原生模块的 ABI 冲突。桌面进程通信、安全设置、构建限制见 [桌面实现说明](docs/DESKTOP.md)。
 
@@ -63,7 +67,11 @@ node dist/cli.js sessions show SESSION_ID
 
 `model list` 查看配置，`model default ALIAS` 设置默认模型。模型别名是会话事件中的标记；会话可以通过 `/model` 切换配置。不同 Provider 之间切换时，历史会转换成通用文本/工具调用格式，Provider 专有元数据可能丢失。
 
+桌面模型目录通过 OpenAI/兼容接口的 `GET /models`、Anthropic 的 `GET /v1/models`、Google Gemini 的 `GET /v1beta/models` 获取；自定义 Base URL 应指向 API 版本根路径，例如 `https://host/v1`。请求限制为 10 秒、每页 1 MB、最多 500 个 ID，且不跟随重定向，避免转发 API Key。会话单独选择的模型 ID 保存在 SQLite 会话快照中；编辑同别名的默认配置不会覆盖这个选择。
+
 ## Skills
+
+Bruin 自带 `plan`、`debug`、`code-review`、`test` 四个基础 Skill，默认启用，但只在 Agent 调用 `load_skill` 时读取正文。可在界面停用；内置 Skill 随应用更新，不能卸载。用户安装的 Skill 独立存放，可自行安装、启停、更新或卸载。
 
 本地安装、GitHub 仓库安装、自建 GitHub 市场以及 skills.sh 搜索/安装入口均可使用：
 
@@ -113,13 +121,17 @@ bruin market add|list|search|install|skills-sh-search|skills-sh-install ...
 | 进程隔离 | IPC 工具子进程、受限环境变量、超时与输出上限；Shell 支持 macOS 沙箱或 Docker | 适用于所有平台的强制 OS 隔离、容器取消后的强制清理验证 |
 | 上下文   | 最近十轮完整保留、旧消息截断摘要、Provider 消息保留                          | 基于 token 的预算、可靠摘要模型、长会话评估            |
 | 失败继续 | 模型错误记账、工具结果未知不自动重试                                         | 幂等工具协议、自动检查点与复杂任务调度                 |
-| Skills   | 本地/GitHub/市场安装、快照、默认停用远程来源                                 | 签名、版本锁文件、供应链扫描、市场认证                 |
+| Skills   | 四个内置基础 Skill；本地/GitHub/市场安装、快照、默认停用远程来源             | 签名、版本锁文件、供应链扫描、市场认证                 |
+| MCP      | 桌面端 stdio / Streamable HTTP、逐次调用审批、连接与输出上限                 | 交互式 OAuth、服务器沙箱和外部副作用确认               |
+| 编排     | 桌面端只读子 Agent、Git 工作树、后台 Shell、静态 Hook、持久规划门禁          | 跨重启续跑、跨进程租约、强制资源回收和长期调度         |
 
 架构、事件时序与替换 SQLite/Rust 的接口设计见 [架构说明](docs/ARCHITECTURE.md)。安全假设、隔离运行方式和已知风险见 [安全说明](docs/SECURITY.md)。
 
+本轮三次迭代的审查结果、修复证据和剩余生产风险见 [生产化审查](docs/PRODUCTION_REVIEW.md)。
+
 ## 参考项目范围
 
-实现前检查了 `learn-claude-code` 的教学架构。Bruin 借鉴了其 Agent 循环、工具、Skills、上下文与会话等能力的设计方向，但独立实现了持久事件、权限和执行进程。该教学项目中的 MCP、子 Agent、工作树、后台任务、Hook 和完整规划模式目前未实现；后续应在已有边界上逐项增加，避免把教学示例直接视为生产实现。
+实现前检查了 `learn-claude-code` 的教学架构。Bruin 借鉴了其 Agent 循环、工具、Skills、上下文与会话等能力的设计方向，并独立实现了持久事件、权限、执行进程及桌面扩展能力。扩展能力仍有明确生产边界，参见 [生产化审查](docs/PRODUCTION_REVIEW.md)。
 
 ## 开发与验证
 

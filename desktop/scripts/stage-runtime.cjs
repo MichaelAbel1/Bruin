@@ -6,6 +6,7 @@ const stage = path.join(root, '.desktop-runtime');
 fs.rmSync(stage, { recursive: true, force: true });
 fs.mkdirSync(stage, { recursive: true });
 fs.cpSync(path.join(root, 'dist'), path.join(stage, 'dist'), { recursive: true });
+fs.cpSync(path.join(root, 'skills'), path.join(stage, 'skills'), { recursive: true });
 fs.copyFileSync(
   process.execPath,
   path.join(stage, process.platform === 'win32' ? 'node.exe' : 'node'),

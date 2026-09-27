@@ -9,10 +9,51 @@ export function decisionFor(
   workspace: string,
 ): { decision: Decision; reason: string } {
   if (
-    !['read_file', 'write_file', 'edit_file', 'search', 'shell', 'load_skill'].includes(call.name)
+    ![
+      'read_file',
+      'write_file',
+      'edit_file',
+      'search',
+      'shell',
+      'load_skill',
+      'mcp_list_tools',
+      'mcp_call',
+      'spawn_subagent',
+      'subagent_status',
+      'create_worktree',
+      'list_worktrees',
+      'remove_worktree',
+      'start_background',
+      'background_status',
+      'cancel_background',
+      'update_plan',
+      'update_plan_progress',
+    ].includes(call.name)
   )
     return { decision: 'deny', reason: '未知工具' };
   if (call.name === 'shell') return { decision: 'ask', reason: 'Shell 命令可执行任意程序' };
+  if (
+    [
+      'mcp_call',
+      'create_worktree',
+      'remove_worktree',
+      'start_background',
+      'spawn_subagent',
+    ].includes(call.name)
+  )
+    return { decision: 'ask', reason: '此操作可能启动进程、访问外部服务或更改工作区' };
+  if (
+    [
+      'mcp_list_tools',
+      'subagent_status',
+      'list_worktrees',
+      'background_status',
+      'cancel_background',
+      'update_plan',
+      'update_plan_progress',
+    ].includes(call.name)
+  )
+    return { decision: 'allow', reason: '读取状态或更新规划' };
   if (call.name === 'load_skill') return { decision: 'allow', reason: '读取已安装 Skill' };
   if (call.name === 'search') return { decision: 'allow', reason: '只读工作区搜索' };
   try {
