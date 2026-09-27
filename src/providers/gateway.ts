@@ -125,11 +125,25 @@ export function resolveApiKey(profile: ModelProfile): string | undefined {
     throw new Error(`缺少 API Key 环境变量: ${keyName}`);
   return key;
 }
+export function modelProtocol(profile: ModelProfile): string {
+  if (profile.provider === 'openai') {
+    if (!profile.baseUrl || new URL(profile.baseUrl).origin === 'https://api.openai.com')
+      return 'openai-responses';
+    return 'openai-chat';
+  }
+  return profile.provider === 'openai-compatible' ? 'openai-chat' : profile.provider;
+}
 export function providerModel(profile: ModelProfile) {
   const key = resolveApiKey(profile);
   switch (profile.provider) {
     case 'openai':
-      return createOpenAI({ apiKey: key, baseURL: profile.baseUrl }).responses(profile.model);
+      return modelProtocol(profile) === 'openai-responses'
+        ? createOpenAI({ apiKey: key, baseURL: profile.baseUrl }).responses(profile.model)
+        : createOpenAICompatible({
+            name: profile.alias,
+            baseURL: profile.baseUrl!,
+            apiKey: key!,
+          }).chatModel(profile.model);
     case 'anthropic':
       return createAnthropic({ apiKey: key, baseURL: profile.baseUrl })(profile.model);
     case 'google':

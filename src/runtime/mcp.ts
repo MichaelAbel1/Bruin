@@ -11,7 +11,7 @@ export class McpManager {
     const existing = this.clients.get(server.name);
     if (existing?.signature === signature) return existing.client;
     if (existing) await this.disconnect(server.name);
-    const client = new Client({ name: 'bruin', version: '0.3.0' });
+    const client = new Client({ name: 'bruin', version: '0.3.1' });
     const transport =
       server.transport === 'stdio'
         ? new StdioClientTransport({

@@ -65,6 +65,8 @@ node dist/cli.js sessions show SESSION_ID
 
 命令格式：`model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV]`。兼容接口可用于实现 OpenAI Chat Completions 协议并支持工具调用的服务，包括部分本地模型服务及第三方平台。兼容并不保证所有模型支持工具调用、流式输出或相同参数。对本机 `localhost` / `127.0.0.1` 的兼容接口可以不设置密钥；远端接口需设置密钥环境变量。密钥不会写入配置或事件库，但会存在主进程环境中；不要将密钥放进聊天文本。
 
+`openai` 使用官方地址时采用 Responses API；填写第三方 Base URL 时默认采用 Chat Completions 协议。若服务端拒绝请求，会话错误会显示其 JSON 错误消息摘要，便于确认模型或参数是否被支持。
+
 `model list` 查看配置，`model default ALIAS` 设置默认模型。模型别名是会话事件中的标记；会话可以通过 `/model` 切换配置。不同 Provider 之间切换时，历史会转换成通用文本/工具调用格式，Provider 专有元数据可能丢失。
 
 桌面模型目录通过 OpenAI/兼容接口的 `GET /models`、Anthropic 的 `GET /v1/models`、Google Gemini 的 `GET /v1beta/models` 获取；自定义 Base URL 应指向 API 版本根路径，例如 `https://host/v1`。请求限制为 10 秒、每页 1 MB、最多 500 个 ID，且不跟随重定向，避免转发 API Key。会话单独选择的模型 ID 保存在 SQLite 会话快照中；编辑同别名的默认配置不会覆盖这个选择。

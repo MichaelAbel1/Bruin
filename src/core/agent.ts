@@ -7,7 +7,7 @@ import type { Session, ToolCall, ToolResult } from './types.js';
 import { buildPrompt } from './history.js';
 import { decisionFor } from './permissions.js';
 import { listSkills, loadSkill } from '../skills/registry.js';
-import { resolveApiKey } from '../providers/gateway.js';
+import { modelProtocol, resolveApiKey } from '../providers/gateway.js';
 import { planBlocks, planState } from '../runtime/plan.js';
 import type { RuntimeServices } from '../runtime/services.js';
 import { loadConfig } from '../config.js';
@@ -16,6 +16,25 @@ export interface AgentIO {
   text(delta: string): void;
   notice(message: string): void;
   approve(call: ToolCall, reason: string): Promise<boolean>;
+}
+export function formatModelError(err: unknown): string {
+  const error = err as { message?: unknown; statusCode?: unknown; responseBody?: unknown } | null;
+  const status = typeof error?.statusCode === 'number' ? `HTTP ${error.statusCode}: ` : '';
+  let detail = '';
+  if (typeof error?.responseBody === 'string') {
+    try {
+      const body = JSON.parse(error.responseBody) as Record<string, unknown>;
+      const nested = body.error;
+      const source =
+        nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : body;
+      if (typeof source.message === 'string') detail = source.message;
+      else if (typeof source.detail === 'string') detail = source.detail;
+    } catch {
+      // Never expose an arbitrary response body, which might contain request data.
+    }
+  }
+  const fallback = typeof error?.message === 'string' ? error.message : String(err);
+  return (status + (detail || fallback)).replace(/[\r\n\t]+/g, ' ').slice(0, 600);
 }
 export function systemPrompt(workspace: string): string {
   const skills = listSkills()
@@ -92,6 +111,7 @@ export class AgentRunner {
           planInstruction +
           mcpInstruction,
         session.profile.alias,
+        modelProtocol(session.profile),
       );
       let reply;
       try {
@@ -99,7 +119,7 @@ export class AgentRunner {
           this.io.text(delta),
         );
       } catch (err) {
-        let message = err instanceof Error ? err.message : String(err);
+        let message = formatModelError(err);
         try {
           const key = resolveApiKey(session.profile);
           if (key) message = message.replaceAll(key, '[REDACTED]');
@@ -116,6 +136,7 @@ export class AgentRunner {
         calls: reply.calls,
         usage: reply.usage,
         profileAlias: session.profile.alias,
+        protocol: modelProtocol(session.profile),
         providerMessages: reply.providerMessages,
       });
       if (!reply.calls.length) {

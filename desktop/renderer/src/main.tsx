@@ -327,11 +327,15 @@ function App() {
       fail(err);
     }
   }
-  async function switchModel(alias: string, modelId?: string) {
+  async function switchModel(modelId: string) {
     if (!view) return;
     try {
       setView(
-        await api<SessionView>('setSessionModel', { sessionId: view.session.id, alias, modelId }),
+        await api<SessionView>('setSessionModel', {
+          sessionId: view.session.id,
+          alias: view.session.profile.alias,
+          modelId,
+        }),
       );
       await refreshSessions();
     } catch (err) {
@@ -453,18 +457,6 @@ function App() {
                   {view.session.workspace}
                 </span>
                 <select
-                  className="model-select"
-                  value={view.session.profile.alias}
-                  onChange={(e) => void switchModel(e.target.value)}
-                  disabled={busy}
-                >
-                  {config.profiles.map((p) => (
-                    <option value={p.alias} key={p.alias}>
-                      {p.alias} · {p.model}
-                    </option>
-                  ))}
-                </select>
-                <select
                   className="model-select model-id-select"
                   aria-label="当前模型 ID"
                   title={
@@ -472,7 +464,7 @@ function App() {
                     (modelLoading ? '正在获取模型列表' : '选择当前 API 提供的模型')
                   }
                   value={view.session.profile.model}
-                  onChange={(e) => void switchModel(view.session.profile.alias, e.target.value)}
+                  onChange={(e) => void switchModel(e.target.value)}
                   disabled={busy || modelLoading}
                 >
                   {[...new Set([view.session.profile.model, ...discoveredModels])].map((id) => (

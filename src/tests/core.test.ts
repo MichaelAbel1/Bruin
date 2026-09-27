@@ -6,7 +6,7 @@ import path from 'node:path';
 import { SqliteEventStore } from '../storage/event-store.js';
 import { buildPrompt } from '../core/history.js';
 import { decisionFor } from '../core/permissions.js';
-import { AgentRunner } from '../core/agent.js';
+import { AgentRunner, formatModelError } from '../core/agent.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { ModelProfile, ToolResult } from '../core/types.js';
@@ -97,6 +97,44 @@ test('model switch discards old provider-specific message format', () => {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+test('history reconstructs messages when provider protocol changes', () => {
+  const events = [
+    {
+      sessionId: 's',
+      seq: 1,
+      type: 'assistant' as const,
+      at: '',
+      payload: {
+        text: 'Earlier answer',
+        profileAlias: 'remote',
+        protocol: 'openai-responses',
+        providerMessages: [{ role: 'assistant', content: 'raw Responses message' }],
+      },
+    },
+  ];
+  assert.deepEqual(buildPrompt(events, 'system', 'remote', 'openai-chat').at(-1), {
+    role: 'assistant',
+    content: 'Earlier answer',
+  });
+  assert.deepEqual(buildPrompt(events, 'system', 'remote', 'openai-responses').at(-1), {
+    role: 'assistant',
+    content: 'raw Responses message',
+  });
+});
+test('model error includes structured API detail without dumping arbitrary body', () => {
+  assert.equal(
+    formatModelError({
+      statusCode: 400,
+      message: 'Bad Request',
+      responseBody: JSON.stringify({ error: { message: 'This model does not support tools' } }),
+    }),
+    'HTTP 400: This model does not support tools',
+  );
+  assert.equal(
+    formatModelError({ statusCode: 400, message: 'Bad Request', responseBody: '<private prompt>' }),
+    'HTTP 400: Bad Request',
+  );
 });
 test('uncertain tool call is reconciled once and not replayed', () => {
   const dir = temp();

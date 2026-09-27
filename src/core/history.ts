@@ -6,6 +6,7 @@ export function buildPrompt(
   events: SessionEvent[],
   system: string,
   profileAlias?: string,
+  protocol?: string,
 ): ModelMessage[] {
   // Preserve the last ten user turns with their entire tool-call/result pairs.
   // Older text becomes a bounded summary; durable events remain untouched.
@@ -47,6 +48,8 @@ export function buildPrompt(
         event.seq > lastModelSwitchSeq &&
         profileAlias &&
         event.payload.profileAlias === profileAlias &&
+        protocol &&
+        event.payload.protocol === protocol &&
         Array.isArray(raw) &&
         raw.length
       ) {
