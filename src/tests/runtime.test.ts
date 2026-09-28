@@ -320,3 +320,46 @@ test('remote MCP configuration requires HTTPS when leaving the local machine', (
     true,
   );
 });
+
+test('services.execute returns isError for pre-execution validation and throws on runtime failure', async () => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'done', isError: false };
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  try {
+    // Deterministic pre-execution check: unconfigured server
+    const mcpRes = await services.execute(
+      { id: 'm1', name: 'mcp_list_tools', input: { server: 'nonexistent' } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(mcpRes.isError, true);
+    assert.match(mcpRes.output, /MCP 服务器未配置/);
+
+    // Deterministic pre-execution check: invalid worktree name
+    const badNameRes = await services.execute(
+      { id: 'w0', name: 'create_worktree', input: { name: '123-bad' } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(badNameRes.isError, true);
+    assert.match(badNameRes.output, /工作树名称必须以字母开头/);
+
+    // Execution phase error: git worktree on non-git directory must throw so AgentRunner records tool_unknown
+    await assert.rejects(
+      services.execute(
+        { id: 'w1', name: 'list_worktrees', input: {} },
+        f.session,
+        new AbortController().signal,
+      ),
+      /git/i,
+    );
+  } finally {
+    await services.close();
+    f.close();
+  }
+});

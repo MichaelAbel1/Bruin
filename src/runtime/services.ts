@@ -159,7 +159,7 @@ export class RuntimeServices {
       }
       case 'mcp_list_tools': {
         const server = loadConfig().mcpServers.find((item) => item.name === input.server);
-        if (!server) throw new Error('MCP 服务器未配置');
+        if (!server) return { output: 'MCP 服务器未配置', isError: true };
         const tools = await this.mcp.listTools(server, session.workspace);
         this.store.append(session.id, 'mcp_capabilities', {
           server: server.name,
@@ -173,7 +173,7 @@ export class RuntimeServices {
       }
       case 'mcp_call': {
         const server = loadConfig().mcpServers.find((item) => item.name === input.server);
-        if (!server) throw new Error('MCP 服务器未配置');
+        if (!server) return { output: 'MCP 服务器未配置', isError: true };
         return this.mcp.callTool(
           server,
           String(input.tool ?? ''),
@@ -183,7 +183,7 @@ export class RuntimeServices {
       }
       case 'update_plan': {
         if (!planState(this.store.events(session.id)).enabled)
-          throw new Error('当前会话未开启规划模式');
+          return { output: '当前会话未开启规划模式', isError: true };
         const steps = input.steps;
         if (
           !Array.isArray(steps) ||
@@ -191,11 +191,13 @@ export class RuntimeServices {
           steps.length > 30 ||
           !steps.every((x) => typeof x === 'string' && x.trim().length > 0 && x.length <= 500)
         )
-          throw new Error('规划需要 1 至 30 个有效步骤');
+          return { output: '规划需要 1 至 30 个有效步骤', isError: true };
         this.store.append(session.id, 'plan_updated', { steps });
         return { output: '规划已保存。等待用户在界面批准后才能执行修改。', isError: false };
       }
       case 'update_plan_progress': {
+        if (!planState(this.store.events(session.id)).enabled)
+          return { output: '当前会话未开启规划模式', isError: true };
         const state = setPlanProgress(
           this.store,
           session.id,
@@ -213,19 +215,22 @@ export class RuntimeServices {
         return { output: stdout, isError: false };
       }
       case 'create_worktree': {
+        const name =
+          typeof input.name === 'string' && input.name ? input.name : randomUUID().slice(0, 8);
+        if (!/^[a-z][a-z0-9-]{0,39}$/.test(name))
+          return {
+            output: '工作树名称必须以字母开头，仅包含小写字母、数字和连字符',
+            isError: true,
+          };
+        const parent = path.join(dataDir(), 'worktrees');
+        const destination = path.join(parent, name);
+        if (fs.existsSync(destination)) return { output: '工作树名称已存在', isError: true };
         const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
           cwd: session.workspace,
           timeout: 10_000,
         });
         const root = fs.realpathSync(stdout.trim());
-        const name =
-          typeof input.name === 'string' && input.name ? input.name : randomUUID().slice(0, 8);
-        if (!/^[a-z][a-z0-9-]{0,39}$/.test(name))
-          throw new Error('工作树名称必须以字母开头，仅包含小写字母、数字和连字符');
-        const parent = path.join(dataDir(), 'worktrees');
         fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
-        const destination = path.join(parent, name);
-        if (fs.existsSync(destination)) throw new Error('工作树名称已存在');
         await execFileAsync('git', ['worktree', 'add', '--detach', destination, 'HEAD'], {
           cwd: root,
           timeout: 30_000,
@@ -240,14 +245,14 @@ export class RuntimeServices {
           !destination.startsWith(fs.realpathSync(parent) + path.sep) ||
           path.dirname(destination) !== fs.realpathSync(parent)
         )
-          throw new Error('只能移除 Bruin 管理的工作树');
+          return { output: '只能移除 Bruin 管理的工作树', isError: true };
         const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
           cwd: session.workspace,
           timeout: 10_000,
           maxBuffer: 100_000,
         });
         if (!stdout.split('\n').includes(`worktree ${destination}`))
-          throw new Error('该路径不属于当前仓库的工作树');
+          return { output: '该路径不属于当前仓库的工作树', isError: true };
         await execFileAsync('git', ['worktree', 'remove', destination], {
           cwd: session.workspace,
           timeout: 30_000,
@@ -257,16 +262,17 @@ export class RuntimeServices {
       }
       case 'spawn_subagent': {
         if ([...this.subagents.values()].filter((x) => x.status === 'running').length >= 2)
-          throw new Error('最多同时运行两个子 Agent');
+          return { output: '最多同时运行两个子 Agent', isError: true };
         const prompt = String(input.prompt ?? '').trim();
-        if (!prompt || prompt.length > 10_000) throw new Error('子 Agent 任务无效');
+        if (!prompt || prompt.length > 10_000)
+          return { output: '子 Agent 任务无效', isError: true };
         const workspace = input.worktree
           ? fs.realpathSync(String(input.worktree))
           : session.workspace;
         if (input.worktree) {
           const parent = fs.realpathSync(path.join(dataDir(), 'worktrees'));
           if (!workspace.startsWith(parent + path.sep))
-            throw new Error('子 Agent 只能使用 Bruin 创建的工作树');
+            return { output: '子 Agent 只能使用 Bruin 创建的工作树', isError: true };
         }
         const child = this.store.createSession(workspace, session.profile);
         const controller = new AbortController();
@@ -305,7 +311,7 @@ export class RuntimeServices {
             .events(session.id)
             .some((e) => e.type === 'subagent_started' && e.payload.childId === id)
         )
-          throw new Error('子 Agent 不属于当前会话');
+          return { output: '子 Agent 不属于当前会话', isError: true };
         const child = this.subagents.get(id);
         const events = this.store.events(id);
         const ended = [...this.store.events(session.id)]
@@ -327,9 +333,9 @@ export class RuntimeServices {
       }
       case 'start_background': {
         if ([...this.background.values()].filter((x) => x.status === 'running').length >= 2)
-          throw new Error('最多同时运行两个后台任务');
+          return { output: '最多同时运行两个后台任务', isError: true };
         const command = String(input.command ?? '').trim();
-        if (!command || command.length > 10_000) throw new Error('后台命令无效');
+        if (!command || command.length > 10_000) return { output: '后台命令无效', isError: true };
         const id = randomUUID();
         const controller = new AbortController();
         this.background.set(id, { sessionId: session.id, controller, status: 'running' });
@@ -380,7 +386,7 @@ export class RuntimeServices {
             .events(session.id)
             .some((e) => e.type === 'background_started' && e.payload.id === id)
         )
-          throw new Error('后台任务不属于当前会话');
+          return { output: '后台任务不属于当前会话', isError: true };
         const task = this.background.get(id);
         if (call.name === 'cancel_background' && task?.status === 'running') {
           task.status = 'cancelled';

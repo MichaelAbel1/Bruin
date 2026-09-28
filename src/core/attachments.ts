@@ -165,3 +165,11 @@ export function loadAttachment(
       : {}),
   };
 }
+
+export function deleteAttachments(sessionId: string): void {
+  if (!/^[a-f0-9-]{36}$/.test(sessionId)) throw new Error('无效会话 ID');
+  const root = attachmentDir(sessionId);
+  if (fs.existsSync(root)) {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}

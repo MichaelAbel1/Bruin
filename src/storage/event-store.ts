@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CronExpressionParser } from 'cron-parser';
+import { deleteAttachments } from '../core/attachments.js';
 import type { EventType, ModelProfile, Session, SessionEvent } from '../core/types.js';
 
 export interface TaskNode {
@@ -267,6 +268,13 @@ export class SqliteEventStore implements EventStore {
       this.db.prepare('DELETE FROM cron_jobs WHERE session_id = ?').run(id);
       this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
     })();
+    try {
+      deleteAttachments(id);
+    } catch (error) {
+      throw new Error(
+        `会话已删除，但附件清理失败: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   acquireLease(id: string, owner: string, ttlMs: number): void {
     if (!this.getSession(id)) throw new Error(`会话不存在: ${id}`);

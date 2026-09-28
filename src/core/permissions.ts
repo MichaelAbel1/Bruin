@@ -97,7 +97,16 @@ export function decisionFor(
     if (call.name === 'write_file') {
       if (managedPending && path.dirname(target) === root)
         return { decision: 'ask', reason: '首次写入将创建默认项目文件夹和文件' };
-      if (!fs.statSync(path.dirname(target)).isDirectory()) throw new Error('父目录不是目录');
+      let ancestor = path.dirname(target);
+      while (ancestor !== root && !fs.existsSync(ancestor)) {
+        ancestor = path.dirname(ancestor);
+      }
+      if (fs.existsSync(ancestor) && !fs.statSync(ancestor).isDirectory()) {
+        throw new Error('父目录不是目录');
+      }
+      if (fs.existsSync(target) && !fs.statSync(target).isFile()) {
+        throw new Error('目标不是文件');
+      }
       return { decision: 'ask', reason: '创建或覆盖工作区文件' };
     }
     if (!fs.statSync(target).isFile()) throw new Error('目标不是文件');

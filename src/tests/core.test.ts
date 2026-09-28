@@ -10,12 +10,13 @@ import { decisionFor } from '../core/permissions.js';
 import { AgentRunner, formatModelError } from '../core/agent.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
-import type { ModelProfile, SessionEvent, ToolResult } from '../core/types.js';
+import type { ModelProfile, SessionEvent, ToolCall, ToolResult } from '../core/types.js';
 import { ProcessExecutor } from '../executor/client.js';
 import { installLocal, listSkills, loadSkill } from '../skills/registry.js';
 import { getRuntimeApiKey, loadConfig, setRuntimeApiKey } from '../config.js';
 import { loadInstructions } from '../core/instructions.js';
 import { listWorkspaceEntries, readWorkspaceFile } from '../core/workspace-files.js';
+import { importAttachments } from '../core/attachments.js';
 
 const profile: ModelProfile = {
   alias: 'mock',
@@ -953,6 +954,121 @@ test('step limit is bounded and leaves uncompleted turn state to allow UI resume
     assert.equal(lastEvent?.type, 'tool_finished');
   } finally {
     delete process.env.BRUIN_MAX_STEPS;
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('write_file automatically creates nested parent directories and permissions allow it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-write-test-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-write-outside-'));
+  const executor = new ProcessExecutor();
+  try {
+    const call: ToolCall = {
+      id: 'w1',
+      name: 'write_file',
+      input: { path: 'nested/sub/folder/hello.txt', content: 'world' },
+    };
+    const decision = decisionFor(call, dir);
+    assert.equal(decision.decision, 'ask');
+
+    const result = await executor.execute({
+      requestId: 'req-1',
+      name: 'write_file',
+      input: call.input,
+      workspace: dir,
+      timeoutMs: 10_000,
+      maxOutputBytes: 10_000,
+    });
+    assert.equal(result.isError, false);
+    assert.equal(
+      fs.readFileSync(path.join(dir, 'nested', 'sub', 'folder', 'hello.txt'), 'utf8'),
+      'world',
+    );
+    fs.symlinkSync(outside, path.join(dir, 'linked'));
+    const escaped: ToolCall = {
+      id: 'w2',
+      name: 'write_file',
+      input: { path: 'linked/sub/escape.txt', content: 'bad' },
+    };
+    assert.equal(decisionFor(escaped, dir).decision, 'deny');
+    const denied = await executor.execute({
+      requestId: 'req-2',
+      name: 'write_file',
+      input: escaped.input,
+      workspace: dir,
+      timeoutMs: 10_000,
+      maxOutputBytes: 10_000,
+    });
+    assert.equal(denied.isError, true);
+    assert.equal(fs.existsSync(path.join(outside, 'sub')), false);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('deleteSession removes associated attachments directory from disk', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-store-attach-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  const store = new SqliteEventStore(path.join(dir, 'bruin.db'));
+  try {
+    const session = store.createSession(dir, profile);
+    const source = path.join(dir, 'sample.txt');
+    fs.writeFileSync(source, 'attachment data');
+    const [ref] = importAttachments(session.id, [source]);
+    const attachDir = path.join(process.env.BRUIN_HOME, 'attachments', session.id);
+    assert.equal(fs.existsSync(path.join(attachDir, ref.id)), true);
+    const unrelatedDir = path.join(dir, 'attachments', session.id);
+    fs.mkdirSync(unrelatedDir, { recursive: true });
+    fs.writeFileSync(path.join(unrelatedDir, 'keep.txt'), 'unrelated');
+
+    store.deleteSession(session.id);
+    assert.equal(fs.existsSync(attachDir), false);
+    assert.equal(fs.readFileSync(path.join(unrelatedDir, 'keep.txt'), 'utf8'), 'unrelated');
+  } finally {
+    store.close();
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('tool execution runtime exception is recorded as tool_unknown and halts runner', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-tool-unknown-'));
+  const store = new SqliteEventStore(path.join(dir, 'bruin.db'));
+  const session = store.createSession(dir, profile);
+  const gateway: ModelGateway = {
+    async complete(_profile, _prompt, _signal, _onDelta) {
+      return {
+        text: 'calling',
+        calls: [{ id: 'c1', name: 'read_file', input: { path: 'file.txt' } }],
+        providerMessages: [],
+      };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('connection reset / timeout during execution');
+    },
+    async close() {},
+  };
+  try {
+    fs.writeFileSync(path.join(dir, 'file.txt'), 'content');
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    });
+    await assert.rejects(runner.run(session, 'test'), /connection reset/);
+    const lastEvent = store.events(session.id).at(-1);
+    assert.equal(lastEvent?.type, 'tool_unknown');
+    assert.match(String(lastEvent?.payload.output), /connection reset/);
+  } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }

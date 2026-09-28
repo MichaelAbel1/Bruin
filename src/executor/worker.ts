@@ -267,7 +267,19 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
     case 'write_file': {
       const file = checkedPath(req.workspace, req.input.path, true);
       const parent = path.dirname(file);
-      if (!fs.existsSync(parent)) throw new Error('父目录不存在');
+      const root = fs.realpathSync(req.workspace);
+      let current = root;
+      for (const component of path.relative(root, parent).split(path.sep).filter(Boolean)) {
+        current = path.join(current, component);
+        try {
+          fs.mkdirSync(current, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        const stat = fs.lstatSync(current);
+        if (!stat.isDirectory() || stat.isSymbolicLink())
+          throw new Error('父路径不是工作区内的真实目录');
+      }
       checkedPath(req.workspace, parent);
       let mode = 0o600;
       try {
