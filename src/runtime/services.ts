@@ -64,6 +64,7 @@ export class RuntimeServices {
 
   async runHooks(event: HookConfig['event'], session: Session, signal: AbortSignal): Promise<void> {
     if (session.managedWorkspace && !fs.existsSync(session.workspace)) return;
+    if (!fs.existsSync(session.workspace)) throw new Error('工作区目录不存在');
     for (const hook of loadConfig().hooks.filter((item) => item.enabled && item.event === event)) {
       const result = await this.executor.execute(
         {
@@ -258,6 +259,9 @@ export class RuntimeServices {
         return { output: stdout, isError: false };
       }
       case 'create_worktree': {
+        if (!fs.existsSync(session.workspace)) {
+          return { output: '工作区目录不存在', isError: true };
+        }
         const name =
           typeof input.name === 'string' && input.name ? input.name : randomUUID().slice(0, 8);
         if (!/^[a-z][a-z0-9-]{0,39}$/.test(name))
@@ -282,16 +286,20 @@ export class RuntimeServices {
         return { output: destination, isError: false };
       }
       case 'remove_worktree': {
-        const parent = path.join(dataDir(), 'worktrees');
         let destination: string;
         try {
           destination = fs.realpathSync(String(input.path ?? ''));
         } catch {
           return { output: '工作树路径不存在', isError: true };
         }
+        const parent = path.join(dataDir(), 'worktrees');
+        if (!fs.existsSync(parent)) {
+          return { output: '只能移除 Bruin 管理的工作树', isError: true };
+        }
+        const parentReal = fs.realpathSync(parent);
         if (
-          !destination.startsWith(fs.realpathSync(parent) + path.sep) ||
-          path.dirname(destination) !== fs.realpathSync(parent)
+          !destination.startsWith(parentReal + path.sep) ||
+          path.dirname(destination) !== parentReal
         )
           return { output: '只能移除 Bruin 管理的工作树', isError: true };
         const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
@@ -321,8 +329,12 @@ export class RuntimeServices {
           return { output: '工作树路径不存在', isError: true };
         }
         if (input.worktree) {
-          const parent = fs.realpathSync(path.join(dataDir(), 'worktrees'));
-          if (!workspace.startsWith(parent + path.sep))
+          const parent = path.join(dataDir(), 'worktrees');
+          if (!fs.existsSync(parent)) {
+            return { output: '子 Agent 只能使用 Bruin 创建的工作树', isError: true };
+          }
+          const parentReal = fs.realpathSync(parent);
+          if (!workspace.startsWith(parentReal + path.sep))
             return { output: '子 Agent 只能使用 Bruin 创建的工作树', isError: true };
         }
         const child = this.store.createSession(workspace, session.profile);
@@ -387,6 +399,12 @@ export class RuntimeServices {
           return { output: '最多同时运行两个后台任务', isError: true };
         const command = String(input.command ?? '').trim();
         if (!command || command.length > 10_000) return { output: '后台命令无效', isError: true };
+        if (session.managedWorkspace && !fs.existsSync(session.workspace)) {
+          this.store.materializeWorkspace(session.id);
+        }
+        if (!fs.existsSync(session.workspace)) {
+          return { output: '工作区目录不存在', isError: true };
+        }
         const id = randomUUID();
         const controller = new AbortController();
         this.background.set(id, { sessionId: session.id, controller, status: 'running' });

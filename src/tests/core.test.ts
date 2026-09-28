@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { SqliteEventStore } from '../storage/event-store.js';
 import Database from 'better-sqlite3';
 import { buildPrompt } from '../core/history.js';
@@ -10,7 +11,13 @@ import { decisionFor } from '../core/permissions.js';
 import { AgentRunner, formatModelError } from '../core/agent.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
-import type { ModelProfile, SessionEvent, ToolCall, ToolResult } from '../core/types.js';
+import type {
+  ModelProfile,
+  SessionEvent,
+  ToolCall,
+  ToolRequest,
+  ToolResult,
+} from '../core/types.js';
 import { ProcessExecutor } from '../executor/client.js';
 import { installLocal, listSkills, loadSkill } from '../skills/registry.js';
 import {
@@ -24,7 +31,11 @@ import {
   withConfigLock,
 } from '../config.js';
 import { loadInstructions } from '../core/instructions.js';
-import { listWorkspaceEntries, readWorkspaceFile } from '../core/workspace-files.js';
+import {
+  listWorkspaceEntries,
+  readWorkspaceFile,
+  writeWorkspaceFile,
+} from '../core/workspace-files.js';
 import { importAttachments } from '../core/attachments.js';
 
 const profile: ModelProfile = {
@@ -128,6 +139,70 @@ test('workspace file browser bounds reads and refuses escapes', () => {
   assert.throws(() => readWorkspaceFile(dir, '../outside'));
   assert.throws(() => listWorkspaceEntries(dir, 'outside'));
   fs.rmSync(dir, { recursive: true, force: true });
+});
+test('writeWorkspaceFile atomically saves files within workspace and rejects escapes', () => {
+  const dir = temp();
+  try {
+    writeWorkspaceFile(dir, 'src/app/index.ts', 'console.log("hello");');
+    assert.equal(
+      fs.readFileSync(path.join(dir, 'src/app/index.ts'), 'utf8'),
+      'console.log("hello");',
+    );
+
+    writeWorkspaceFile(dir, 'src/app/index.ts', 'console.log("updated");');
+    assert.equal(
+      fs.readFileSync(path.join(dir, 'src/app/index.ts'), 'utf8'),
+      'console.log("updated");',
+    );
+
+    assert.throws(() => writeWorkspaceFile(dir, '../secret.txt', 'evil'));
+    assert.throws(() => writeWorkspaceFile(dir, '/etc/passwd', 'evil'));
+
+    fs.symlinkSync(os.tmpdir(), path.join(dir, 'escaped_dir'));
+    assert.throws(() => writeWorkspaceFile(dir, 'escaped_dir/leak.txt', 'fail'));
+
+    // Cannot overwrite an existing directory
+    fs.mkdirSync(path.join(dir, 'src/target_dir'));
+    assert.throws(() => writeWorkspaceFile(dir, 'src/target_dir', 'fail'), /目标路径是一个目录/);
+
+    // Cannot overwrite or follow an existing symlink target
+    const external = path.join(dir, 'external.txt');
+    fs.writeFileSync(external, 'safe external');
+    const symlinkTarget = path.join(dir, 'src/link_target.ts');
+    fs.symlinkSync(external, symlinkTarget);
+    assert.throws(
+      () => writeWorkspaceFile(dir, 'src/link_target.ts', 'evil content'),
+      /不允许.*符号链接/,
+    );
+    assert.equal(fs.readFileSync(external, 'utf8'), 'safe external');
+
+    // Verify no temporary files remain
+    const tmpFiles = fs.readdirSync(path.join(dir, 'src')).filter((f) => f.endsWith('.tmp'));
+    assert.equal(tmpFiles.length, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('readWorkspaceFile retrieves git baseline and tracks modification', () => {
+  const dir = temp();
+  try {
+    execSync(
+      'git init && git config user.name "test" && git config user.email "test@example.com"',
+      {
+        cwd: dir,
+        stdio: 'ignore',
+      },
+    );
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'line 1\nline 2\n');
+    execSync('git add sample.txt && git commit -m "initial"', { cwd: dir, stdio: 'ignore' });
+
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'line 1\nline 2 modified\nline 3\n');
+    const read = readWorkspaceFile(dir, 'sample.txt');
+    assert.equal(read.content, 'line 1\nline 2 modified\nline 3\n');
+    assert.equal(read.baselineContent, 'line 1\nline 2\n');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 test('SQLite event ordering and durable restart', () => {
   const dir = temp();
@@ -585,6 +660,7 @@ test('file tools replace content without losing permissions or changing files on
       });
     const write = await request('write', 'write_file', { content: 'updated text\n' });
     assert.equal(write.isError, false, write.output);
+    assert.equal(write.output, '已写入 script.sh');
     assert.equal(fs.readFileSync(file, 'utf8'), 'updated text\n');
     assert.equal(fs.statSync(file).mode & 0o777, 0o755);
     assert.equal(
@@ -594,6 +670,7 @@ test('file tools replace content without losing permissions or changing files on
     assert.equal(fs.readFileSync(file, 'utf8'), 'updated text\n');
     const edit = await request('edit', 'edit_file', { oldText: 'updated', newText: 'final' });
     assert.equal(edit.isError, false, edit.output);
+    assert.equal(edit.output, '已编辑 script.sh');
     assert.equal(fs.readFileSync(file, 'utf8'), 'final text\n');
     assert.equal(fs.statSync(file).mode & 0o777, 0o755);
     assert.deepEqual(fs.readdirSync(dir), ['script.sh']);
@@ -1445,6 +1522,117 @@ test('withConfigLock supports reentrancy, stale lock cleanup, and updateConfig a
   } finally {
     if (oldHome === undefined) delete process.env.BRUIN_HOME;
     else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('agent handles shell tool in unmaterialized managed workspace and gracefully reports deleted workspace', async () => {
+  const dir = fs.realpathSync(temp());
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const managedDir = path.join(dir, 'workspaces', '20260928-120000-11223344');
+    const session = store.createManagedSession(managedDir, profile);
+    assert.equal(fs.existsSync(managedDir), false);
+
+    let count = 0;
+    const gateway: ModelGateway = {
+      async complete() {
+        count++;
+        return count === 1
+          ? {
+              text: '',
+              calls: [{ id: 'call-shell', name: 'shell', input: { command: 'echo hi' } }],
+            }
+          : { text: 'done', calls: [] };
+      },
+    };
+    const executed: ToolRequest[] = [];
+    const executor: ToolExecutor = {
+      async execute(req: ToolRequest): Promise<ToolResult> {
+        executed.push(req);
+        return { output: 'hi\n', isError: false };
+      },
+      async close() {},
+    };
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    });
+
+    await runner.run(session, 'run command');
+    // Managed workspace should have been materialized before shell execution
+    assert.equal(fs.existsSync(managedDir), true);
+    assert.equal(executed.length, 1);
+    assert.equal(executed[0].name, 'shell');
+
+    // Case 2: Deleted unmanaged workspace returns clean error without crashing runner
+    const unmanagedDir = path.join(dir, 'deleted_unmanaged');
+    const unmanagedSession = store.createSession(unmanagedDir, profile);
+    count = 0;
+    const runner2 = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    });
+    await runner2.run(unmanagedSession, 'run command in missing workspace');
+    const events = store.events(unmanagedSession.id);
+    const finished = events.find((e) => e.type === 'tool_finished');
+    assert.ok(finished);
+    assert.equal(finished.payload.output, '工作区目录不存在');
+    assert.equal(finished.payload.isError, true);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('agent retries transient network errors such as ECONNRESET or fetch failed', async () => {
+  const dir = fs.realpathSync(temp());
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    let attempts = 0;
+    const gateway: ModelGateway = {
+      async complete() {
+        attempts++;
+        if (attempts === 1) {
+          const err = new Error('fetch failed');
+          (err as { code?: string }).code = 'UND_ERR_CONNECT_TIMEOUT';
+          throw err;
+        }
+        return { text: 'recovered', calls: [] };
+      },
+    };
+    const executor: ToolExecutor = {
+      async execute(): Promise<ToolResult> {
+        return { output: 'ok', isError: false };
+      },
+      async close() {},
+    };
+    const notices: string[] = [];
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice(msg) {
+        notices.push(msg);
+      },
+      async approve() {
+        return true;
+      },
+    });
+
+    await runner.run(session, 'say hello');
+    assert.equal(attempts, 2);
+    assert.ok(notices.some((n) => n.includes('模型服务暂忙 (UND_ERR_CONNECT_TIMEOUT)')));
+    const events = store.events(session.id);
+    const assistant = events.find((e) => e.type === 'assistant');
+    assert.equal(assistant?.payload.text, 'recovered');
+  } finally {
+    store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

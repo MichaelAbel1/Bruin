@@ -209,10 +209,26 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
         }),
         /运行/,
       );
+      await assert.rejects(
+        request('writeWorkspaceFile', {
+          sessionId: created.session.id,
+          path: 'leased.txt',
+          content: 'hello',
+        }),
+        /此会话正在另一个进程中运行/,
+      );
     } finally {
       externalStore.releaseLease(created.session.id, 'external-process');
       externalStore.close();
     }
+
+    const writeRes = await request('writeWorkspaceFile', {
+      sessionId: created.session.id,
+      path: 'written.txt',
+      content: 'hello written',
+    });
+    assert.equal(writeRes.path, 'written.txt');
+    assert.equal(fs.readFileSync(path.join(dir, 'written.txt'), 'utf8'), 'hello written');
 
     const afterRemoval = await request('removeProfile', { alias: 'local' });
     assert.deepEqual(afterRemoval.profiles, []);

@@ -35,7 +35,11 @@ import {
 } from './skills/registry.js';
 import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
-import { listWorkspaceEntries, readWorkspaceFile } from './core/workspace-files.js';
+import {
+  listWorkspaceEntries,
+  readWorkspaceFile,
+  writeWorkspaceFile,
+} from './core/workspace-files.js';
 import { importAttachments, loadAttachment, type AttachmentRef } from './core/attachments.js';
 import {
   approvePlan,
@@ -233,11 +237,31 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'listWorkspaceEntries': {
       const session = getSession(p.sessionId);
       const relative = String(p.path ?? '');
-      if (session.managedWorkspace && !fs.existsSync(session.workspace) && !relative) return [];
+      if (!fs.existsSync(session.workspace)) return [];
       return listWorkspaceEntries(session.workspace, relative);
     }
-    case 'readWorkspaceFile':
-      return readWorkspaceFile(getSession(p.sessionId).workspace, String(p.path ?? ''));
+    case 'readWorkspaceFile': {
+      const session = getSession(p.sessionId);
+      if (!fs.existsSync(session.workspace)) {
+        throw new Error('文件不存在');
+      }
+      return readWorkspaceFile(session.workspace, String(p.path ?? ''));
+    }
+    case 'writeWorkspaceFile': {
+      const session = getSession(p.sessionId);
+      if (active?.sessionId === session.id)
+        throw new Error('当前会话正在运行任务，请等待完成后再修改文件');
+      const leaseOwner = randomUUID();
+      store.acquireLease(session.id, leaseOwner, 10_000);
+      try {
+        if (session.managedWorkspace && !fs.existsSync(session.workspace)) {
+          store.materializeWorkspace(session.id);
+        }
+        return writeWorkspaceFile(session.workspace, String(p.path ?? ''), String(p.content ?? ''));
+      } finally {
+        store.releaseLease(session.id, leaseOwner);
+      }
+    }
     case 'importAttachments': {
       const session = getSession(p.sessionId);
       if (!Array.isArray(p.paths) || p.paths.some((item) => typeof item !== 'string'))
@@ -253,6 +277,10 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       return store.listTasks(getSession(p.sessionId).id);
     case 'syncTasks': {
       const session = getSession(p.sessionId);
+      if (session.managedWorkspace && !fs.existsSync(session.workspace)) {
+        store.materializeWorkspace(session.id);
+      }
+      if (!fs.existsSync(session.workspace)) return [];
       store.syncTasks(session.id);
       return store.listTasks(session.id);
     }
@@ -499,6 +527,13 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       });
       store.append(session.id, 'tool_started', { callId: call.id, name });
       try {
+        if (
+          ['create_task', 'update_task', 'start_background'].includes(name) &&
+          session.managedWorkspace &&
+          !fs.existsSync(session.workspace)
+        ) {
+          store.materializeWorkspace(session.id);
+        }
         const result = await services.execute(call, session, new AbortController().signal);
         store.append(session.id, 'tool_finished', { callId: call.id, name, ...result });
         return result;

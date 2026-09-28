@@ -299,11 +299,12 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
       replaceFile(file, Buffer.from(String(req.input.content ?? '')), mode);
-      return { output: `已写入 ${path.relative(req.workspace, file)}`, isError: false };
+      return { output: `已写入 ${path.relative(root, file)}`, isError: false };
     }
     case 'edit_file': {
+      const root = fs.realpathSync(req.workspace);
       const file = checkedPath(req.workspace, req.input.path);
-      if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
+      if (file === root) throw new Error('路径不能是工作区根目录');
       const old = String(req.input.oldText ?? '');
       const replacement = String(req.input.newText ?? '');
       if (!old) throw new Error('oldText 不能为空');
@@ -325,7 +326,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       } finally {
         fs.closeSync(fd);
       }
-      return { output: `已编辑 ${path.relative(req.workspace, file)}`, isError: false };
+      return { output: `已编辑 ${path.relative(root, file)}`, isError: false };
     }
     case 'search': {
       if (!hasBinary('rg')) return fallbackSearch(req);
@@ -380,7 +381,11 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         );
       if (process.platform === 'darwin') {
         const root = fs.realpathSync(req.workspace).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-        const profile = `(version 1) (allow default) (deny network*) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp"))`;
+        const tmpReal = fs
+          .realpathSync(os.tmpdir())
+          .replaceAll('\\', '\\\\')
+          .replaceAll('"', '\\"');
+        const profile = `(version 1) (allow default) (deny network*) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "${tmpReal}"))`;
         return command('/usr/bin/sandbox-exec', ['-p', profile, '/bin/sh', '-lc', shell], req);
       }
       throw new Error(

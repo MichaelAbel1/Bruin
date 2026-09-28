@@ -8,9 +8,11 @@ import {
   ChevronDown,
   CircleAlert,
   Code2,
+  FileCode,
   FileText,
   Folder,
   FolderOpen,
+  GitCompare,
   Layers,
   LoaderCircle,
   Menu,
@@ -18,6 +20,8 @@ import {
   Paperclip,
   Plus,
   Palette,
+  RotateCcw,
+  Save,
   Send,
   Settings2,
   ShieldCheck,
@@ -124,7 +128,168 @@ type HostEvent = {
   reason?: string;
 };
 type WorkspaceEntry = { name: string; path: string; kind: 'file' | 'directory' };
-type OpenFile = { path: string; content: string; truncated: boolean };
+type OpenFile = {
+  path: string;
+  content: string;
+  originalContent: string;
+  baselineContent?: string;
+  truncated: boolean;
+  mode?: 'edit' | 'diff';
+};
+
+type DiffLine = {
+  type: 'added' | 'deleted' | 'unchanged';
+  text: string;
+  oldLine?: number;
+  newLine?: number;
+};
+
+type DiffResult = {
+  diff: DiffLine[];
+  additions: number;
+  deletions: number;
+};
+
+function computeLineDiff(oldText: string, newText: string): DiffResult {
+  const oldLines = oldText ? oldText.split('\n') : [];
+  const newLines = newText ? newText.split('\n') : [];
+
+  let prefix = 0;
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  ) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+
+  const midOld = oldLines.slice(prefix, oldLines.length - suffix);
+  const midNew = newLines.slice(prefix, newLines.length - suffix);
+
+  const diff: DiffLine[] = [];
+  for (let i = 0; i < prefix; i++) {
+    diff.push({ type: 'unchanged', text: oldLines[i], oldLine: i + 1, newLine: i + 1 });
+  }
+
+  const m = midOld.length;
+  const n = midNew.length;
+
+  if (m * n > 1_500_000) {
+    for (let i = 0; i < m; i++) {
+      diff.push({ type: 'deleted', text: midOld[i], oldLine: prefix + i + 1 });
+    }
+    for (let j = 0; j < n; j++) {
+      diff.push({ type: 'added', text: midNew[j], newLine: prefix + j + 1 });
+    }
+  } else {
+    const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        if (midOld[i - 1] === midNew[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+        else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+    let i = m;
+    let j = n;
+    const midDiff: DiffLine[] = [];
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && midOld[i - 1] === midNew[j - 1]) {
+        midDiff.push({
+          type: 'unchanged',
+          text: midOld[i - 1],
+          oldLine: prefix + i,
+          newLine: prefix + j,
+        });
+        i--;
+        j--;
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        midDiff.push({ type: 'added', text: midNew[j - 1], newLine: prefix + j });
+        j--;
+      } else {
+        midDiff.push({ type: 'deleted', text: midOld[i - 1], oldLine: prefix + i });
+        i--;
+      }
+    }
+    midDiff.reverse();
+    diff.push(...midDiff);
+  }
+
+  const oldSuffixStart = oldLines.length - suffix;
+  const newSuffixStart = newLines.length - suffix;
+  for (let k = 0; k < suffix; k++) {
+    diff.push({
+      type: 'unchanged',
+      text: oldLines[oldSuffixStart + k],
+      oldLine: oldSuffixStart + k + 1,
+      newLine: newSuffixStart + k + 1,
+    });
+  }
+
+  let additions = 0;
+  let deletions = 0;
+  for (const line of diff) {
+    if (line.type === 'added') additions++;
+    else if (line.type === 'deleted') deletions++;
+  }
+
+  return { diff, additions, deletions };
+}
+
+type Token = {
+  type: 'keyword' | 'string' | 'comment' | 'number' | 'boolean' | 'type' | 'function' | 'text';
+  value: string;
+};
+
+const tokenRegex =
+  /(\/\/.*$|#[^!].*$|\/\*.*?\*\/)|("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|`[^`\\]*(?:\\.[^`\\]*)*`)|(\b(?:const|let|var|function|class|import|export|from|return|if|else|for|while|switch|case|break|continue|try|catch|finally|throw|new|async|await|type|interface|extends|implements|public|private|protected|static|readonly|default|as|is|in|of|typeof|instanceof|void|yield|def|fn|pub|struct|impl|trait|enum|match|package|func|select|defer|go|val|self|this)\b)|(\b(?:true|false|null|undefined|None|True|False)\b)|(\b\d+(?:\.\d+)?\b)|(\b[A-Z][a-zA-Z0-9_]*\b)|(\b[a-z_$][a-zA-Z0-9_$]*(?=\s*\())/g;
+
+function tokenizeLine(line: string): Token[] {
+  tokenRegex.lastIndex = 0;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  const parts: Token[] = [];
+  while ((match = tokenRegex.exec(line)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ type: 'text', value: line.slice(lastIndex, match.index) });
+    }
+    const [_, comment, string, keyword, boolNull, number, type, func] = match;
+    if (comment) parts.push({ type: 'comment', value: comment });
+    else if (string) parts.push({ type: 'string', value: string });
+    else if (keyword) parts.push({ type: 'keyword', value: keyword });
+    else if (boolNull) parts.push({ type: 'boolean', value: boolNull });
+    else if (number) parts.push({ type: 'number', value: number });
+    else if (type) parts.push({ type: 'type', value: type });
+    else if (func) parts.push({ type: 'function', value: func });
+    lastIndex = tokenRegex.lastIndex;
+  }
+  if (lastIndex < line.length) {
+    parts.push({ type: 'text', value: line.slice(lastIndex) });
+  }
+  return parts;
+}
+
+function HighlightedTokens({ text }: { text: string }) {
+  if (!text) return <span>&nbsp;</span>;
+  const tokens = tokenizeLine(text);
+  return (
+    <>
+      {tokens.map((token, idx) => (
+        <span key={idx} className={`token token-${token.type}`}>
+          {token.value}
+        </span>
+      ))}
+    </>
+  );
+}
+
 type AttachmentRef = {
   id: string;
   name: string;
@@ -175,6 +340,208 @@ function MarkdownMessage({ text }: { text: string }) {
     </div>
   );
 }
+function FileEditorViewer({
+  file,
+  onContentChange,
+  onSave,
+  onRevert,
+  onModeChange,
+  saving,
+}: {
+  file: OpenFile;
+  onContentChange: (content: string) => void;
+  onSave: () => void;
+  onRevert: () => void;
+  onModeChange: (mode: 'edit' | 'diff') => void;
+  saving: boolean;
+}) {
+  const isDirty = file.content !== file.originalContent;
+  const diffResult = computeLineDiff(file.baselineContent ?? file.originalContent, file.content);
+  const mode = file.mode ?? 'edit';
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const gutterRef = useRef<HTMLDivElement>(null);
+  const highlightRef = useRef<HTMLDivElement>(null);
+
+  const addedLines = new Set<number>();
+  for (const item of diffResult.diff) {
+    if (item.type === 'added' && item.newLine !== undefined) {
+      addedLines.add(item.newLine);
+    }
+  }
+
+  const lines = file.content.split('\n');
+
+  const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
+    const { scrollTop, scrollLeft } = e.currentTarget;
+    if (gutterRef.current) gutterRef.current.scrollTop = scrollTop;
+    if (highlightRef.current) {
+      highlightRef.current.scrollTop = scrollTop;
+      highlightRef.current.scrollLeft = scrollLeft;
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+      e.preventDefault();
+      if (isDirty) onSave();
+      return;
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const ta = e.currentTarget;
+      const start = ta.selectionStart;
+      const end = ta.selectionEnd;
+      const val = ta.value;
+      if (!e.shiftKey) {
+        const next = val.substring(0, start) + '  ' + val.substring(end);
+        onContentChange(next);
+        setTimeout(() => {
+          ta.selectionStart = ta.selectionEnd = start + 2;
+        }, 0);
+      }
+    }
+  };
+
+  return (
+    <div className="file-editor-container">
+      <div className="file-editor-header">
+        <div className="file-header-left">
+          <FileCode size={17} className="file-header-icon" />
+          <strong className="file-path-title" title={file.path}>
+            {file.path}
+          </strong>
+          {isDirty ? (
+            <span className="file-status-badge dirty" title="文件有未保存的修改">
+              ● 未保存
+            </span>
+          ) : (
+            <span className="file-status-badge clean">已保存</span>
+          )}
+          {(diffResult.additions > 0 || diffResult.deletions > 0) && (
+            <div
+              className="diff-badge-pill"
+              title={`${diffResult.additions} 行新增, ${diffResult.deletions} 行删除`}
+            >
+              {diffResult.additions > 0 && (
+                <span className="diff-add">+{diffResult.additions}</span>
+              )}
+              {diffResult.deletions > 0 && (
+                <span className="diff-del">-{diffResult.deletions}</span>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="file-header-actions">
+          <div className="editor-mode-toggle" role="group" aria-label="查看模式">
+            <button
+              className={mode === 'edit' ? 'active' : ''}
+              onClick={() => onModeChange('edit')}
+              title="代码编辑模式"
+            >
+              <Code2 size={13} /> 代码
+            </button>
+            <button
+              className={mode === 'diff' ? 'active' : ''}
+              onClick={() => onModeChange('diff')}
+              title="差异对比模式"
+            >
+              <GitCompare size={13} />
+              对比
+              {(diffResult.additions > 0 || diffResult.deletions > 0) && (
+                <span className="mode-diff-counts">
+                  <span className="diff-add">+{diffResult.additions}</span>
+                  <span className="diff-del">-{diffResult.deletions}</span>
+                </span>
+              )}
+            </button>
+          </div>
+          {isDirty && (
+            <button
+              className="file-action-btn revert"
+              onClick={onRevert}
+              title="放弃修改，还原到磁盘文件"
+            >
+              <RotateCcw size={13} /> 还原
+            </button>
+          )}
+          <button
+            className={`file-action-btn save ${isDirty ? 'primary' : ''}`}
+            disabled={!isDirty || saving}
+            onClick={onSave}
+            title="保存文件 (⌘S / Ctrl+S)"
+          >
+            <Save size={13} />
+            <span>{saving ? '保存中...' : '保存'}</span>
+          </button>
+        </div>
+      </div>
+      {file.truncated && (
+        <div className="file-warning-banner">文件过大，仅显示前 256 KB 内容。</div>
+      )}
+      {mode === 'edit' ? (
+        <div className="code-editor-layout">
+          <div className="code-gutter" ref={gutterRef}>
+            {lines.map((_, idx) => {
+              const lineNo = idx + 1;
+              const isAdded = addedLines.has(lineNo);
+              return (
+                <div key={idx} className={`gutter-row ${isAdded ? 'gutter-row-added' : ''}`}>
+                  <span className="gutter-marker">{isAdded ? '+' : ''}</span>
+                  <span className="gutter-num">{lineNo}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="code-surface">
+            <div className="code-highlight-layer" ref={highlightRef}>
+              {lines.map((lineText, idx) => {
+                const lineNo = idx + 1;
+                const isAdded = addedLines.has(lineNo);
+                return (
+                  <div key={idx} className={`code-row ${isAdded ? 'code-row-added' : ''}`}>
+                    <HighlightedTokens text={lineText} />
+                  </div>
+                );
+              })}
+            </div>
+            <textarea
+              ref={textareaRef}
+              className="code-editor-textarea"
+              value={file.content}
+              onChange={(e) => onContentChange(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onScroll={handleScroll}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoComplete="off"
+              autoCorrect="off"
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="diff-viewer-surface">
+          <table className="diff-table">
+            <tbody>
+              {diffResult.diff.map((item, idx) => (
+                <tr key={idx} className={`diff-tr diff-tr-${item.type}`}>
+                  <td className="diff-td-num old-num">{item.oldLine ?? ''}</td>
+                  <td className="diff-td-num new-num">{item.newLine ?? ''}</td>
+                  <td className="diff-td-sign">
+                    {item.type === 'added' ? '+' : item.type === 'deleted' ? '-' : ' '}
+                  </td>
+                  <td className="diff-td-code">
+                    <HighlightedTokens text={item.text} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function sessionTitle(session: Session, events?: SessionEvent[]) {
   const user = events?.find((e) => e.type === 'user');
   const label = typeof user?.payload.text === 'string' ? user.payload.text : '';
@@ -254,15 +621,74 @@ function App() {
       fail(err);
     }
   }
+  const [savingFile, setSavingFile] = useState(false);
   async function openFile(path: string) {
     if (!view) return;
     try {
-      const file = await api<OpenFile>('readWorkspaceFile', { sessionId: view.session.id, path });
-      setOpenFiles((current) => [...current.filter((item) => item.path !== path), file]);
+      const file = await api<{
+        path: string;
+        content: string;
+        truncated: boolean;
+        baselineContent?: string;
+      }>('readWorkspaceFile', { sessionId: view.session.id, path });
+      setOpenFiles((current) => {
+        const existing = current.find((item) => item.path === path);
+        const openItem: OpenFile = {
+          path: file.path,
+          content: existing ? existing.content : file.content,
+          originalContent: file.content,
+          baselineContent: file.baselineContent ?? file.content,
+          truncated: file.truncated,
+          mode: existing?.mode ?? 'edit',
+        };
+        return [...current.filter((item) => item.path !== path), openItem];
+      });
       setActiveFile(path);
     } catch (err) {
       fail(err);
     }
+  }
+
+  async function saveFile(file: OpenFile) {
+    if (!view || savingFile) return;
+    try {
+      setSavingFile(true);
+      await api('writeWorkspaceFile', {
+        sessionId: view.session.id,
+        path: file.path,
+        content: file.content,
+      });
+      setOpenFiles((current) =>
+        current.map((item) =>
+          item.path === file.path ? { ...item, originalContent: file.content } : item,
+        ),
+      );
+      setNotice(`已保存 ${short(file.path)}`);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setSavingFile(false);
+    }
+  }
+
+  function revertFile(file: OpenFile) {
+    setOpenFiles((current) =>
+      current.map((item) =>
+        item.path === file.path ? { ...item, content: item.originalContent } : item,
+      ),
+    );
+  }
+
+  function updateFileContent(path: string, content: string) {
+    setOpenFiles((current) =>
+      current.map((item) => (item.path === path ? { ...item, content } : item)),
+    );
+  }
+
+  function setFileMode(path: string, mode: 'edit' | 'diff') {
+    setOpenFiles((current) =>
+      current.map((item) => (item.path === path ? { ...item, mode } : item)),
+    );
   }
   async function changeWorkspace() {
     if (!view || busy) return;
@@ -473,13 +899,13 @@ function App() {
       fail(err);
     }
   }
-  async function switchModel(modelId: string) {
+  async function switchModel(modelId: string, alias?: string) {
     if (!view) return;
     try {
       setView(
         await api<SessionView>('setSessionModel', {
           sessionId: view.session.id,
-          alias: view.session.profile.alias,
+          alias: alias ?? view.session.profile.alias,
           modelId,
         }),
       );
@@ -648,56 +1074,15 @@ function App() {
           </div>
           <div className="header-actions">
             {view && (
-              <>
-                <button
-                  className="workspace-path workspace-switch"
-                  title="更换此会话的项目文件夹"
-                  disabled={busy}
-                  onClick={() => void changeWorkspace()}
-                >
-                  <FolderOpen size={14} />
-                  {view.session.workspace}
-                </button>
-                <select
-                  className="model-select model-id-select"
-                  aria-label="当前模型 ID"
-                  title={
-                    modelDiscoveryError ||
-                    (modelLoading ? '正在获取模型列表' : '选择当前 API 提供的模型')
-                  }
-                  value={view.session.profile.model}
-                  onChange={(e) => void switchModel(e.target.value)}
-                  disabled={busy || modelLoading}
-                >
-                  {[...new Set([view.session.profile.model, ...discoveredModels])].map((id) => (
-                    <option value={id} key={id}>
-                      {id}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className="icon-button model-refresh"
-                  aria-label="刷新可用模型"
-                  title={modelDiscoveryError || '刷新可用模型'}
-                  disabled={busy || modelLoading}
-                  onClick={() => setModelRefresh((value) => value + 1)}
-                >
-                  <LoaderCircle size={15} className={modelLoading ? 'spinning' : ''} />
-                </button>
-                {modelDiscoveryError &&
-                  (modelDiscoveryError.includes('缺少 API Key') ? (
-                    <button
-                      className="model-catalog-error model-key-action"
-                      onClick={() => setDialog('model')}
-                    >
-                      添加 API Key
-                    </button>
-                  ) : (
-                    <span className="model-catalog-error" title={modelDiscoveryError}>
-                      模型列表不可用
-                    </span>
-                  ))}
-              </>
+              <button
+                className="workspace-path workspace-switch"
+                title="更换此会话的项目文件夹"
+                disabled={busy}
+                onClick={() => void changeWorkspace()}
+              >
+                <FolderOpen size={14} />
+                {view.session.workspace}
+              </button>
             )}
             <div className="avatar">
               <img
@@ -712,25 +1097,44 @@ function App() {
             <button className={!activeFile ? 'active' : ''} onClick={() => setActiveFile(null)}>
               <MessageSquare size={14} /> 对话
             </button>
-            {openFiles.map((file) => (
-              <div
-                className={`editor-tab ${activeFile === file.path ? 'active' : ''}`}
-                key={file.path}
-              >
-                <button title={file.path} onClick={() => setActiveFile(file.path)}>
-                  <FileText size={14} /> {short(file.path)}
-                </button>
-                <button
-                  aria-label={`关闭 ${file.path}`}
-                  onClick={() => {
-                    setOpenFiles((current) => current.filter((item) => item.path !== file.path));
-                    if (activeFile === file.path) setActiveFile(null);
-                  }}
+            {openFiles.map((file) => {
+              const isDirty = file.content !== file.originalContent;
+              const stat = computeLineDiff(
+                file.baselineContent ?? file.originalContent,
+                file.content,
+              );
+              return (
+                <div
+                  className={`editor-tab ${activeFile === file.path ? 'active' : ''}`}
+                  key={file.path}
                 >
-                  <X size={13} />
-                </button>
-              </div>
-            ))}
+                  <button title={file.path} onClick={() => setActiveFile(file.path)}>
+                    <FileCode size={14} />
+                    <span className="tab-title">{short(file.path)}</span>
+                    {(stat.additions > 0 || stat.deletions > 0) && (
+                      <span className="tab-diff-stats">
+                        {stat.additions > 0 && <span className="diff-add">+{stat.additions}</span>}
+                        {stat.deletions > 0 && <span className="diff-del">-{stat.deletions}</span>}
+                      </span>
+                    )}
+                    {isDirty && (
+                      <span className="tab-dirty-dot" title="未保存">
+                        ●
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    aria-label={`关闭 ${file.path}`}
+                    onClick={() => {
+                      setOpenFiles((current) => current.filter((item) => item.path !== file.path));
+                      if (activeFile === file.path) setActiveFile(null);
+                    }}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
         {securityNotice && (
@@ -772,18 +1176,15 @@ function App() {
               </span>
             </div>
           </div>
-        ) : activeFile ? (
-          <div className="inline-file-viewer">
-            <div className="file-viewer-heading">
-              <FileText size={18} />
-              <strong>{activeFile}</strong>
-              <span>只读预览</span>
-            </div>
-            {openFiles.find((file) => file.path === activeFile)?.truncated && (
-              <p>文件过大，仅显示前 256 KB。</p>
-            )}
-            <pre>{openFiles.find((file) => file.path === activeFile)?.content ?? ''}</pre>
-          </div>
+        ) : activeFile && openFiles.find((file) => file.path === activeFile) ? (
+          <FileEditorViewer
+            file={openFiles.find((file) => file.path === activeFile)!}
+            onContentChange={(content) => updateFileContent(activeFile, content)}
+            onSave={() => saveFile(openFiles.find((file) => file.path === activeFile)!)}
+            onRevert={() => revertFile(openFiles.find((file) => file.path === activeFile)!)}
+            onModeChange={(mode) => setFileMode(activeFile, mode)}
+            saving={savingFile}
+          />
         ) : (
           <>
             <div className="conversation" key={view.session.id}>
@@ -807,58 +1208,64 @@ function App() {
                   <button onClick={() => void acknowledge()}>我已检查</button>
                 </div>
               )}
-              <div className="plan-panel">
-                <div className="plan-heading">
-                  <strong>规划模式</strong>
-                  <button
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() => void planAction('setPlanMode', { enabled: !view.plan.enabled })}
-                  >
-                    {view.plan.enabled ? '关闭' : '开启'}
-                  </button>
-                </div>
-                {view.plan.enabled && (
-                  <>
-                    {view.plan.steps.length ? (
-                      <ol>
-                        {view.plan.steps.map((step, index) => (
-                          <li key={`${index}-${step}`}>
-                            <span>{step}</span>
-                            {view.plan.approved && (
-                              <select
-                                value={view.plan.progress[index] ?? 'pending'}
-                                onChange={(e) =>
-                                  void planAction('setPlanProgress', {
-                                    index,
-                                    status: e.target.value,
-                                  })
-                                }
-                              >
-                                <option value="pending">待处理</option>
-                                <option value="in_progress">进行中</option>
-                                <option value="completed">已完成</option>
-                              </select>
-                            )}
-                          </li>
-                        ))}
-                      </ol>
-                    ) : (
-                      <p>请让 Bruin 先生成计划；批准前只能使用只读工具。</p>
-                    )}
-                    {view.plan.steps.length > 0 && !view.plan.approved && (
+              {(view.plan.enabled || view.plan.steps.length > 0) && (
+                <div className="plan-panel">
+                  <div className="plan-heading">
+                    <div className="plan-title-wrap">
+                      <strong>规划模式</strong>
+                      <span className={`plan-badge ${view.plan.approved ? 'approved' : 'pending'}`}>
+                        {view.plan.approved ? '已批准' : '待批准'}
+                      </span>
+                    </div>
+                    {view.plan.enabled && (
                       <button
-                        className="primary"
+                        className="secondary plan-close-btn"
                         disabled={busy}
-                        onClick={() => void planAction('approvePlan', {})}
+                        onClick={() => void planAction('setPlanMode', { enabled: false })}
+                        title="关闭规划模式"
                       >
-                        批准计划并允许执行
+                        关闭
                       </button>
                     )}
-                    {view.plan.approved && <small>计划已批准。修改仍遵循逐项工具审批。</small>}
-                  </>
-                )}
-              </div>
+                  </div>
+                  {view.plan.steps.length ? (
+                    <ol>
+                      {view.plan.steps.map((step, index) => (
+                        <li key={`${index}-${step}`}>
+                          <span>{step}</span>
+                          {view.plan.approved && (
+                            <select
+                              value={view.plan.progress[index] ?? 'pending'}
+                              onChange={(e) =>
+                                void planAction('setPlanProgress', {
+                                  index,
+                                  status: e.target.value,
+                                })
+                              }
+                            >
+                              <option value="pending">待处理</option>
+                              <option value="in_progress">进行中</option>
+                              <option value="completed">已完成</option>
+                            </select>
+                          )}
+                        </li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p>规划模式已开启。请在对话框发送任务，Bruin 将先制定详细计划供您审批。</p>
+                  )}
+                  {view.plan.steps.length > 0 && !view.plan.approved && (
+                    <button
+                      className="primary"
+                      disabled={busy}
+                      onClick={() => void planAction('approvePlan', {})}
+                    >
+                      批准计划并允许执行
+                    </button>
+                  )}
+                  {view.plan.approved && <small>计划已批准。修改仍遵循逐项工具审批。</small>}
+                </div>
+              )}
               {view.events
                 .filter((e) =>
                   [
@@ -962,9 +1369,10 @@ function App() {
                   disabled={view.needsReview}
                 />
                 <div className="composer-bottom">
-                  <span className="composer-tools">
+                  <div className="composer-left">
                     <button
                       type="button"
+                      className="composer-action-btn"
                       title="添加图片、文档或文件"
                       aria-label="添加文件"
                       disabled={busy}
@@ -974,6 +1382,7 @@ function App() {
                     </button>
                     <button
                       type="button"
+                      className="composer-action-btn"
                       title="添加文件夹"
                       aria-label="添加文件夹"
                       disabled={busy}
@@ -981,29 +1390,140 @@ function App() {
                     >
                       <FolderOpen size={16} />
                     </button>
-                    <Sparkles size={14} /> {view.session.profile.model}{' '}
-                    <span className="composer-hint">· ⌘/Ctrl + Enter 发送</span>
-                  </span>
-                  {busy ? (
-                    <button
-                      className="send-button stop"
-                      title="停止运行"
-                      onClick={() => void cancel()}
-                    >
-                      <Square size={16} fill="currentColor" />
-                    </button>
-                  ) : (
-                    <button
-                      className="send-button"
-                      title="发送"
-                      disabled={
-                        (!composer.trim() && !attachments.length && !quote) || view.needsReview
+                  </div>
+                  <div className="composer-right">
+                    <div
+                      className="composer-model-picker"
+                      title={
+                        modelDiscoveryError || (modelLoading ? '正在获取模型列表' : '切换当前模型')
                       }
-                      onClick={() => void send()}
                     >
-                      <Send size={17} />
+                      <Sparkles size={13} className="composer-model-icon" />
+                      <select
+                        className="composer-model-select"
+                        aria-label="切换模型"
+                        value={
+                          config.profiles.length > 1
+                            ? `${view.session.profile.alias}::${view.session.profile.model}`
+                            : view.session.profile.model
+                        }
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val.includes('::')) {
+                            const [alias, mId] = val.split('::');
+                            void switchModel(mId, alias);
+                          } else {
+                            void switchModel(val);
+                          }
+                        }}
+                        disabled={busy || modelLoading}
+                      >
+                        {config.profiles.length > 1
+                          ? config.profiles.map((p) => {
+                              const isCurrent = p.alias === view.session.profile.alias;
+                              const models = isCurrent
+                                ? [...new Set([view.session.profile.model, ...discoveredModels])]
+                                : [p.model];
+                              return (
+                                <optgroup label={`${p.alias} (${p.provider})`} key={p.alias}>
+                                  {models.map((m) => (
+                                    <option value={`${p.alias}::${m}`} key={`${p.alias}::${m}`}>
+                                      {m}
+                                    </option>
+                                  ))}
+                                </optgroup>
+                              );
+                            })
+                          : [...new Set([view.session.profile.model, ...discoveredModels])].map(
+                              (id) => (
+                                <option value={id} key={id}>
+                                  {id}
+                                </option>
+                              ),
+                            )}
+                      </select>
+                      <ChevronDown size={11} className="composer-model-chevron" />
+                    </div>
+
+                    <button
+                      type="button"
+                      className="composer-icon-btn model-refresh"
+                      aria-label="刷新可用模型"
+                      title={modelDiscoveryError || '刷新可用模型'}
+                      disabled={busy || modelLoading}
+                      onClick={() => setModelRefresh((value) => value + 1)}
+                    >
+                      <LoaderCircle size={14} className={modelLoading ? 'spinning' : ''} />
                     </button>
-                  )}
+
+                    {modelDiscoveryError &&
+                      (modelDiscoveryError.includes('缺少 API Key') ? (
+                        <button
+                          type="button"
+                          className="composer-key-btn"
+                          onClick={() => setDialog('model')}
+                          title="点击配置 API Key"
+                        >
+                          配置 Key
+                        </button>
+                      ) : (
+                        <span className="composer-model-error" title={modelDiscoveryError}>
+                          !
+                        </span>
+                      ))}
+
+                    <div
+                      role="switch"
+                      aria-checked={view.plan.enabled}
+                      tabIndex={0}
+                      className={`composer-plan-toggle ${view.plan.enabled ? 'active' : ''} ${busy ? 'disabled' : ''}`}
+                      title={
+                        view.plan.enabled
+                          ? '规划模式已开启：先制定计划并等待审批（点击关闭）'
+                          : '规划模式已关闭：点击开启后将先制定执行计划'
+                      }
+                      onClick={() =>
+                        !busy && void planAction('setPlanMode', { enabled: !view.plan.enabled })
+                      }
+                      onKeyDown={(e) => {
+                        if ((e.key === ' ' || e.key === 'Enter') && !busy) {
+                          e.preventDefault();
+                          void planAction('setPlanMode', { enabled: !view.plan.enabled });
+                        }
+                      }}
+                    >
+                      <Layers size={13} className="plan-toggle-icon" />
+                      <span className="plan-toggle-label">规划模式</span>
+                      <span className={`plan-switch-track ${view.plan.enabled ? 'on' : 'off'}`}>
+                        <span className="plan-switch-thumb" />
+                      </span>
+                    </div>
+
+                    <span className="composer-hint" title="快捷键发送">
+                      ⌘ ↵
+                    </span>
+
+                    {busy ? (
+                      <button
+                        className="send-button stop"
+                        title="停止运行"
+                        onClick={() => void cancel()}
+                      >
+                        <Square size={15} fill="currentColor" />
+                      </button>
+                    ) : (
+                      <button
+                        className="send-button"
+                        title="发送 (⌘/Ctrl + Enter)"
+                        disabled={
+                          (!composer.trim() && !attachments.length && !quote) || view.needsReview
+                        }
+                        onClick={() => void send()}
+                      >
+                        <Send size={15} />
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
               <div className="composer-disclaimer">Bruin 可能出错。应用修改前请检查结果。</div>

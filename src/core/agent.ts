@@ -222,13 +222,19 @@ export class AgentRunner {
           lastErr = err;
           if (signal.aborted) throw err;
           const status = (err as { statusCode?: number })?.statusCode;
-          if (
-            attempt < 2 &&
-            streamedChars === 0 &&
-            (status === 429 || status === 500 || status === 502 || status === 503 || status === 529)
-          ) {
+          const code = (err as { code?: string })?.code;
+          const message = err instanceof Error ? err.message : String(err);
+          const isTransient =
+            (status !== undefined && [429, 500, 502, 503, 529].includes(status)) ||
+            (code !== undefined &&
+              ['ECONNRESET', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED'].includes(
+                code,
+              )) ||
+            message.includes('fetch failed');
+          if (attempt < 2 && streamedChars === 0 && isTransient) {
             const backoff = (attempt + 1) * 1000;
-            this.io.notice(`模型服务暂忙 (HTTP ${status})，将在 ${backoff / 1000}s 后重试...`);
+            const detail = status ? `HTTP ${status}` : code || '网络连接异常';
+            this.io.notice(`模型服务暂忙 (${detail})，将在 ${backoff / 1000}s 后重试...`);
             await waitForRetry(backoff, signal);
             continue;
           }
@@ -323,7 +329,7 @@ export class AgentRunner {
         let toolFinished = false;
         try {
           if (
-            ['write_file', 'create_task', 'update_task'].includes(call.name) &&
+            ['write_file', 'shell', 'create_task', 'update_task'].includes(call.name) &&
             session.managedWorkspace &&
             !fs.existsSync(session.workspace)
           )
@@ -365,8 +371,8 @@ export class AgentRunner {
               ? await this.services.execute(call, session, signal)
               : { output: '此运行模式不支持该工具', isError: true };
           } else {
-            result =
-              session.managedWorkspace && !fs.existsSync(session.workspace)
+            if (!fs.existsSync(session.workspace)) {
+              result = session.managedWorkspace
                 ? {
                     output:
                       call.name === 'search'
@@ -374,17 +380,23 @@ export class AgentRunner {
                         : '默认工作区尚未创建，请先创建文件',
                     isError: call.name !== 'search',
                   }
-                : await this.executor.execute(
-                    {
-                      requestId: randomUUID(),
-                      name: call.name,
-                      input: call.input,
-                      workspace: fs.realpathSync(session.workspace),
-                      timeoutMs: call.name === 'shell' ? 120000 : 30000,
-                      maxOutputBytes: 100000,
-                    },
-                    signal,
-                  );
+                : {
+                    output: '工作区目录不存在',
+                    isError: true,
+                  };
+            } else {
+              result = await this.executor.execute(
+                {
+                  requestId: randomUUID(),
+                  name: call.name,
+                  input: call.input,
+                  workspace: fs.realpathSync(session.workspace),
+                  timeoutMs: call.name === 'shell' ? 120000 : 30000,
+                  maxOutputBytes: 100000,
+                },
+                signal,
+              );
+            }
           }
           this.store.append(session.id, 'tool_finished', {
             callId: call.id,

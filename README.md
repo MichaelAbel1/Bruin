@@ -1,6 +1,6 @@
 # Bruin
 
-Bruin 是一个本地运行的 TypeScript 编码 Agent，提供 Electron 桌面客户端与 CLI。桌面端使用 React；核心进程管理模型调用、SQLite 事件日志与权限；文件和 Shell 工具在独立进程执行。默认界面为纯白色，可切换黑色主题。消息支持 Markdown，包括代码块、表格、列表和链接。
+Bruin 是一个本地运行的 TypeScript 编码 Agent，提供 Electron 桌面客户端与 CLI。桌面端使用 React；核心进程管理模型调用、SQLite 事件日志与权限；文件和 Shell 工具在独立进程执行。默认界面为纯白色，可切换黑色主题。消息支持 Markdown，包括代码块、表格、列表和链接。新手入门与核心原理解析请参阅 [小白通俗介绍文档](docs/INTRODUCTION.md)。
 
 ## 快速开始
 

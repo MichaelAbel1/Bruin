@@ -375,6 +375,65 @@ test('services.execute returns isError for pre-execution validation and throws o
     assert.equal(spawnRes.isError, true);
     assert.match(spawnRes.output, /工作树路径不存在/);
 
+    // Deterministic pre-execution check: real path outside worktrees when dataDir/worktrees does not exist
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-outside-'));
+    try {
+      const remOutside = await services.execute(
+        {
+          id: 'w_rem2',
+          name: 'remove_worktree',
+          input: { path: outsideDir },
+        },
+        f.session,
+        new AbortController().signal,
+      );
+      assert.equal(remOutside.isError, true);
+      assert.match(remOutside.output, /只能移除 Bruin 管理的工作树/);
+
+      const spawnOutside = await services.execute(
+        {
+          id: 's_sub2',
+          name: 'spawn_subagent',
+          input: { prompt: 'research', worktree: outsideDir },
+        },
+        f.session,
+        new AbortController().signal,
+      );
+      assert.equal(spawnOutside.isError, true);
+      assert.match(spawnOutside.output, /子 Agent 只能使用 Bruin 创建的工作树/);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+
+    // Check create_worktree and start_background when workspace does not exist
+    const nonExistentSession = f.store.createSession('/tmp/nonexistent-workspace-dir-999', profile);
+    const badWorktree = await services.execute(
+      { id: 'w_bad', name: 'create_worktree', input: { name: 'validname' } },
+      nonExistentSession,
+      new AbortController().signal,
+    );
+    assert.equal(badWorktree.isError, true);
+    assert.match(badWorktree.output, /工作区目录不存在/);
+
+    const badBg = await services.execute(
+      { id: 'bg_bad', name: 'start_background', input: { command: 'echo hi' } },
+      nonExistentSession,
+      new AbortController().signal,
+    );
+    assert.equal(badBg.isError, true);
+    assert.match(badBg.output, /工作区目录不存在/);
+
+    // runHooks rejects on missing unmanaged workspace
+    await assert.rejects(
+      services.runHooks('turn_started', nonExistentSession, new AbortController().signal),
+      /工作区目录不存在/,
+    );
+
+    // runHooks gracefully ignores unmaterialized managed workspace
+    const managedDir = path.join(f.dir, 'workspaces', '20260928-120000-11223344');
+    const managedSession = f.store.createManagedSession(managedDir, profile);
+    await services.runHooks('turn_started', managedSession, new AbortController().signal);
+
     // Execution phase error: git worktree on non-git directory must throw so AgentRunner records tool_unknown
     await assert.rejects(
       services.execute(
