@@ -1,5 +1,6 @@
 import type { ModelMessage } from 'ai';
 import type { SessionEvent, ToolCall } from './types.js';
+import { loadAttachment, type AttachmentRef } from './attachments.js';
 
 /** Build a provider-neutral prompt from durable events, never from a provider's remote session. */
 export function buildPrompt(
@@ -40,9 +41,67 @@ export function buildPrompt(
     (seq, event) => (event.type === 'model_switched' ? Math.max(seq, event.seq) : seq),
     0,
   );
+  const latestUserSeq = events.reduce(
+    (seq, event) => (event.type === 'user' ? Math.max(seq, event.seq) : seq),
+    0,
+  );
+  let remainingOldAttachmentText = 20_000;
+  let remainingCurrentAttachmentText = 60_000;
   for (const event of events) {
-    if (event.type === 'user')
-      messages.push({ role: 'user', content: String(event.payload.text ?? '') });
+    if (event.type === 'workspace_changed')
+      messages.push({
+        role: 'user',
+        content: `The active workspace changed to ${String(event.payload.workspace ?? '')}. Earlier file references may belong to the previous workspace. Inspect the current workspace before editing.`,
+      });
+    if (event.type === 'user') {
+      const quote = event.payload.quote as { text?: string; seq?: number } | undefined;
+      const intro = `${quote?.text ? `引用本会话第 ${quote.seq} 条消息：\n${quote.text}\n\n` : ''}${String(event.payload.text ?? '')}`;
+      const refs = Array.isArray(event.payload.attachments)
+        ? (event.payload.attachments as AttachmentRef[])
+        : [];
+      if (!refs.length) messages.push({ role: 'user', content: intro });
+      else {
+        const parts: Array<
+          { type: 'text'; text: string } | { type: 'image'; image: URL; mediaType: string }
+        > = [{ type: 'text', text: intro || '请查看这些附件。' }];
+        for (const ref of refs.slice(0, 30)) {
+          try {
+            const item = loadAttachment(event.sessionId, ref.id);
+            parts.push({
+              type: 'text',
+              text: `\n附件：${item.ref.name}${item.ref.note ? `（${item.ref.note}）` : ''}`,
+            });
+            if (item.image) {
+              if (event.seq === latestUserSeq)
+                parts.push({
+                  type: 'image',
+                  image: new URL(
+                    `data:${item.image.mimeType};base64,${item.image.data.toString('base64')}`,
+                  ),
+                  mediaType: item.image.mimeType,
+                });
+              else
+                parts.push({
+                  type: 'text',
+                  text: '之前的图片内容未重复发送；如需再次分析，请重新附上。',
+                });
+            } else if (item.text) {
+              const current = event.seq === latestUserSeq;
+              const content = item.text.slice(
+                0,
+                current ? remainingCurrentAttachmentText : remainingOldAttachmentText,
+              );
+              parts.push({ type: 'text', text: content });
+              if (current) remainingCurrentAttachmentText -= content.length;
+              else remainingOldAttachmentText -= content.length;
+            }
+          } catch {
+            parts.push({ type: 'text', text: `附件 ${ref.name} 已不可读取` });
+          }
+        }
+        messages.push({ role: 'user', content: parts });
+      }
+    }
     if (event.type === 'summary')
       messages.push({
         role: 'user',

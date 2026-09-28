@@ -45,6 +45,9 @@ export interface UserPreference {
 /** Storage port: a PostgreSQL implementation must preserve append ordering and atomic append semantics. */
 export interface EventStore {
   createSession(workspace: string, profile: ModelProfile): Session;
+  createManagedSession(workspace: string, profile: ModelProfile): Session;
+  setWorkspace(id: string, workspace: string): void;
+  materializeWorkspace(id: string): void;
   getSession(id: string): Session | undefined;
   listSessions(): Session[];
   deleteSession(id: string): void;
@@ -95,9 +98,10 @@ export class SqliteEventStore implements EventStore {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     const schemaVersion = this.db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 7) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
+    if (schemaVersion > 8) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY, workspace TEXT NOT NULL, profile_json TEXT NOT NULL,
+      managed_workspace INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS events (
@@ -145,19 +149,48 @@ export class SqliteEventStore implements EventStore {
         this.db.pragma('user_version = 6');
       })();
     if (schemaVersion < 7) this.db.pragma('user_version = 7');
+    if (schemaVersion < 8)
+      this.db.transaction(() => {
+        const columns = this.db.pragma('table_info(sessions)') as Array<{ name: string }>;
+        if (!columns.some((column) => column.name === 'managed_workspace'))
+          this.db.exec(
+            'ALTER TABLE sessions ADD COLUMN managed_workspace INTEGER NOT NULL DEFAULT 0',
+          );
+        this.db.pragma('user_version = 8');
+      })();
   }
   createSession(workspace: string, profile: ModelProfile): Session {
+    return this.insertSession(workspace, profile, false);
+  }
+  createManagedSession(workspace: string, profile: ModelProfile): Session {
+    return this.insertSession(workspace, profile, true);
+  }
+  private insertSession(
+    workspace: string,
+    profile: ModelProfile,
+    managedWorkspace: boolean,
+  ): Session {
     const now = new Date().toISOString();
-    const session = { id: randomUUID(), workspace, profile, createdAt: now, updatedAt: now };
+    const session = {
+      id: randomUUID(),
+      workspace,
+      managedWorkspace,
+      profile,
+      createdAt: now,
+      updatedAt: now,
+    };
     this.db
-      .prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?)')
-      .run(session.id, workspace, JSON.stringify(profile), now, now);
+      .prepare(
+        'INSERT INTO sessions (id, workspace, profile_json, managed_workspace, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(session.id, workspace, JSON.stringify(profile), Number(managedWorkspace), now, now);
     return session;
   }
   private rowToSession(row: any): Session {
     return {
       id: row.id,
       workspace: row.workspace,
+      managedWorkspace: Boolean(row.managed_workspace),
       profile: JSON.parse(row.profile_json),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -166,6 +199,44 @@ export class SqliteEventStore implements EventStore {
   getSession(id: string): Session | undefined {
     const row = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
     return row ? this.rowToSession(row) : undefined;
+  }
+  setWorkspace(id: string, workspace: string): void {
+    const canonical = fs.realpathSync(workspace);
+    if (!fs.statSync(canonical).isDirectory()) throw new Error('工作区必须是目录');
+    this.db.transaction(() => {
+      const session = this.getSession(id);
+      if (!session) throw new Error('会话不存在');
+      if (this.isLeased(id)) throw new Error('运行中的会话不能更换工作区');
+      if (session.workspace === canonical && !session.managedWorkspace) return;
+      this.db
+        .prepare(
+          'UPDATE sessions SET workspace = ?, managed_workspace = 0, updated_at = ? WHERE id = ?',
+        )
+        .run(canonical, new Date().toISOString(), id);
+      this.append(id, 'workspace_changed', { previous: session.workspace, workspace: canonical });
+    })();
+  }
+  materializeWorkspace(id: string): void {
+    const session = this.getSession(id);
+    if (!session?.managedWorkspace) throw new Error('不是 Bruin 管理的工作区');
+    const parent = path.join(path.dirname(this.db.name), 'workspaces');
+    fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const root = fs.realpathSync(parent);
+    if (
+      path.dirname(session.workspace) !== root ||
+      !/^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/.test(path.basename(session.workspace))
+    )
+      throw new Error('无效的托管工作区路径');
+    try {
+      fs.mkdirSync(session.workspace, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    if (
+      !fs.lstatSync(session.workspace).isDirectory() ||
+      fs.realpathSync(session.workspace) !== session.workspace
+    )
+      throw new Error('托管工作区路径已被替换');
   }
   setProfile(id: string, profile: ModelProfile, leaseOwner?: string): void {
     this.db.transaction(() => {

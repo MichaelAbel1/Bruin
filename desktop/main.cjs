@@ -52,6 +52,16 @@ function updateStoredKey(alias, ciphertext, remove) {
 }
 async function restoreStoredKeys() {
   const keys = readEncryptedKeys();
+  const legacy = await requestHost('takeLegacyKeys');
+  if (Object.keys(legacy).length && secureStorageAvailable()) {
+    let changed = false;
+    for (const [alias, key] of Object.entries(legacy)) {
+      if (typeof key !== 'string' || keys[alias]) continue;
+      keys[alias] = safeStorage.encryptString(key).toString('base64');
+      changed = true;
+    }
+    if (changed) writeEncryptedKeys(keys);
+  }
   if (!Object.keys(keys).length) return;
   if (!secureStorageAvailable()) throw new Error('系统安全存储不可用，无法恢复 API Key');
   const restored = {};
@@ -167,42 +177,6 @@ function requestHost(method, params) {
   });
 }
 
-function escapeHtml(value) {
-  return String(value).replace(
-    /[&<>"']/g,
-    (char) =>
-      ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-      })[char],
-  );
-}
-async function openFileWindow(params) {
-  const file = await requestHost('readWorkspaceFile', params);
-  const preview = new BrowserWindow({
-    width: 920,
-    height: 720,
-    parent: window,
-    title: `${file.path} — Bruin`,
-    backgroundColor: uiTheme === 'light' ? '#ffffff' : '#111315',
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: true,
-      webSecurity: true,
-    },
-  });
-  preview.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  preview.webContents.on('will-navigate', (event) => event.preventDefault());
-  const dark = uiTheme === 'dark';
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>${escapeHtml(file.path)}</title><style>body{margin:0;background:${dark ? '#111315' : '#fff'};color:${dark ? '#e8e9e8' : '#202124'};font:13px -apple-system,BlinkMacSystemFont,sans-serif}header{position:sticky;top:0;padding:15px 20px;border-bottom:1px solid ${dark ? '#34393b' : '#e5e7eb'};background:inherit;font-weight:600}pre{margin:0;padding:22px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}.note{padding:8px 20px;color:#9a6c25}</style></head><body><header>${escapeHtml(file.path)}</header>${file.truncated ? '<div class="note">文件过大，仅显示前 256 KB</div>' : ''}<pre>${escapeHtml(file.content)}</pre></body></html>`;
-  await preview.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-  return { opened: true };
-}
-
 function createWindow() {
   window = new BrowserWindow({
     width: 1440,
@@ -246,14 +220,29 @@ app.whenReady().then(() => {
       return dialog
         .showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
         .then((result) => (result.canceled ? null : result.filePaths[0]));
-    if (method === 'getAppearance') return { iconBackground, uiTheme };
-    if (method === 'openFileWindow') {
+    if (method === 'chooseAttachments') {
+      const selection = await dialog.showOpenDialog(window, {
+        properties:
+          params?.kind === 'folder'
+            ? ['openDirectory', 'multiSelections']
+            : ['openFile', 'multiSelections'],
+      });
+      if (selection.canceled) return [];
       await hostReady;
-      return openFileWindow(params || {});
+      return requestHost('importAttachments', {
+        sessionId: params?.sessionId,
+        paths: selection.filePaths,
+      });
     }
+    if (method === 'getAppearance') return { iconBackground, uiTheme };
     if (method === 'setIconBackground') return saveAppearance({ iconBackground: params?.theme });
     if (method === 'setTheme') return saveAppearance({ uiTheme: params?.theme });
-    if (method === 'restoreApiKeys') throw new Error('不支持此界面操作');
+    if (
+      method === 'restoreApiKeys' ||
+      method === 'takeLegacyKeys' ||
+      method === 'importAttachments'
+    )
+      throw new Error('不支持此界面操作');
     await hostReady;
     if (method === 'saveProfile' && params?.apiKey && !secureStorageAvailable())
       throw new Error('系统安全存储不可用，无法持久保存 API Key');

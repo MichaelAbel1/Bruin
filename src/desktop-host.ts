@@ -35,6 +35,7 @@ import {
 import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
 import { listWorkspaceEntries, readWorkspaceFile } from './core/workspace-files.js';
+import { importAttachments, loadAttachment, type AttachmentRef } from './core/attachments.js';
 import {
   approvePlan,
   planBlocks,
@@ -73,6 +74,13 @@ if (legacyKeyExposure) {
     .filter((key): key is string => Boolean(key));
   store.scrubSecrets(knownKeys);
 }
+const legacyKeyCandidates = Object.fromEntries(
+  startupConfig.profiles.flatMap((profile) => {
+    const key = getRuntimeApiKey(profile.alias);
+    return key ? [[profile.alias, key]] : [];
+  }),
+);
+let legacyKeysTaken = false;
 
 const services = new RuntimeServices(store, executor, (session, prompt, signal) =>
   new AgentRunner(
@@ -151,7 +159,12 @@ function redactEvents(events: ReturnType<typeof store.events>, alias: string) {
     ) as Record<string, unknown>,
   }));
 }
-async function startRun(session: Session, prompt?: string): Promise<{ started: boolean }> {
+async function startRun(
+  session: Session,
+  prompt?: string,
+  attachments: AttachmentRef[] = [],
+  quote?: { text: string; seq: number },
+): Promise<{ started: boolean }> {
   if (active) throw new Error('已有任务正在运行');
   if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认继续');
   const owner = randomUUID();
@@ -163,7 +176,7 @@ async function startRun(session: Session, prompt?: string): Promise<{ started: b
   active = { sessionId: session.id, controller };
   event('runStarted', { sessionId: session.id });
   activeRun = runner
-    .run(session, prompt, controller.signal)
+    .run(session, prompt, controller.signal, attachments, quote)
     .then(() =>
       event('runFinished', { sessionId: session.id, events: viewSession(session).events }),
     )
@@ -186,6 +199,11 @@ async function startRun(session: Session, prompt?: string): Promise<{ started: b
 }
 async function dispatch(method: string, p: Record<string, unknown>) {
   switch (method) {
+    case 'takeLegacyKeys': {
+      if (legacyKeysTaken) return {};
+      legacyKeysTaken = true;
+      return legacyKeyCandidates;
+    }
     case 'restoreApiKeys': {
       const keys = p.keys;
       if (!keys || typeof keys !== 'object' || Array.isArray(keys))
@@ -205,10 +223,20 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       };
     case 'listSessions':
       return store.listSessions();
-    case 'listWorkspaceEntries':
-      return listWorkspaceEntries(getSession(p.sessionId).workspace, String(p.path ?? ''));
+    case 'listWorkspaceEntries': {
+      const session = getSession(p.sessionId);
+      const relative = String(p.path ?? '');
+      if (session.managedWorkspace && !fs.existsSync(session.workspace) && !relative) return [];
+      return listWorkspaceEntries(session.workspace, relative);
+    }
     case 'readWorkspaceFile':
       return readWorkspaceFile(getSession(p.sessionId).workspace, String(p.path ?? ''));
+    case 'importAttachments': {
+      const session = getSession(p.sessionId);
+      if (!Array.isArray(p.paths) || p.paths.some((item) => typeof item !== 'string'))
+        throw new Error('附件路径无效');
+      return importAttachments(session.id, p.paths as string[]);
+    }
     case 'listPreferences':
       return store.listPreferences();
     case 'deletePreference':
@@ -245,11 +273,29 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       return store.listSessions();
     }
     case 'createSession': {
-      const workspace = fs.realpathSync(String(p.workspace ?? ''));
-      if (!fs.statSync(workspace).isDirectory()) throw new Error('工作区必须是目录');
       const alias =
         typeof p.profileAlias === 'string' && p.profileAlias ? p.profileAlias : undefined;
-      return viewSession(store.createSession(workspace, findProfile(alias)));
+      const profile = findProfile(alias);
+      const selected = String(p.workspace ?? '').trim();
+      if (selected) {
+        const workspace = fs.realpathSync(selected);
+        if (!fs.statSync(workspace).isDirectory()) throw new Error('工作区必须是目录');
+        return viewSession(store.createSession(workspace, profile));
+      }
+      const date = new Date().toISOString();
+      const name = `${date.slice(0, 10).replaceAll('-', '')}-${date.slice(11, 19).replaceAll(':', '')}-${randomUUID().slice(0, 8)}`;
+      return viewSession(
+        store.createManagedSession(
+          path.join(fs.realpathSync(dataDir()), 'workspaces', name),
+          profile,
+        ),
+      );
+    }
+    case 'setWorkspace': {
+      if (active) throw new Error('请等待当前任务完成后再更换工作区');
+      const session = getSession(p.sessionId);
+      store.setWorkspace(session.id, String(p.workspace ?? ''));
+      return viewSession(getSession(session.id));
     }
     case 'openSession': {
       const session = getSession(p.sessionId);
@@ -267,8 +313,22 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     }
     case 'send': {
       const prompt = String(p.prompt ?? '').trim();
-      if (!prompt) throw new Error('消息不能为空');
-      return startRun(getSession(p.sessionId), prompt);
+      const session = getSession(p.sessionId);
+      const attachments = Array.isArray(p.attachments) ? p.attachments : [];
+      if (attachments.length > 30 || attachments.some((item) => typeof item !== 'string'))
+        throw new Error('附件列表无效');
+      const refs = attachments.map((id) => loadAttachment(session.id, String(id)).ref);
+      const quoteSeq = Number(p.quoteSeq);
+      const source = Number.isInteger(quoteSeq)
+        ? store
+            .events(session.id)
+            .find((item) => item.seq === quoteSeq && ['user', 'assistant'].includes(item.type))
+        : undefined;
+      const quote = source
+        ? { seq: source.seq, text: String(source.payload.text ?? '').slice(0, 4000) }
+        : undefined;
+      if (!prompt && !refs.length && !quote) throw new Error('消息不能为空');
+      return startRun(session, prompt, refs, quote);
     }
     case 'resume':
       return startRun(getSession(p.sessionId));

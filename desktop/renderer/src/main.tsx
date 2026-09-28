@@ -15,6 +15,7 @@ import {
   LoaderCircle,
   Menu,
   MessageSquare,
+  Paperclip,
   Plus,
   Palette,
   Send,
@@ -51,6 +52,7 @@ type Profile = {
 type Session = {
   id: string;
   workspace: string;
+  managedWorkspace?: boolean;
   profile: Profile;
   createdAt: string;
   updatedAt: string;
@@ -122,6 +124,13 @@ type HostEvent = {
   reason?: string;
 };
 type WorkspaceEntry = { name: string; path: string; kind: 'file' | 'directory' };
+type OpenFile = { path: string; content: string; truncated: boolean };
+type AttachmentRef = {
+  id: string;
+  name: string;
+  kind: 'image' | 'document' | 'file';
+  note?: string;
+};
 type UserPreference = { id: string; content: string; createdAt: string };
 
 declare global {
@@ -184,6 +193,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState('');
   const [composer, setComposer] = useState('');
+  const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const [quote, setQuote] = useState<{ seq: number; text: string } | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [dialog, setDialog] = useState<
     'model' | 'new' | 'skills' | 'appearance' | 'runtime' | 'preferences' | null
@@ -195,6 +206,8 @@ function App() {
   const [securityNotice, setSecurityNotice] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
+  const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
+  const [activeFile, setActiveFile] = useState<string | null>(null);
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [modelLoading, setModelLoading] = useState(false);
@@ -229,10 +242,43 @@ function App() {
       const result = await api<SessionView>('openSession', { sessionId: id });
       selected.current = id;
       setView(result);
+      setOpenFiles([]);
+      setActiveFile(null);
+      setAttachments([]);
+      setQuote(null);
       setStream('');
       setSidebarOpen(false);
       if (result.recoveredUnknown)
         setNotice(`已发现 ${result.recoveredUnknown} 个结果未知的工具调用，请检查工作区。`);
+    } catch (err) {
+      fail(err);
+    }
+  }
+  async function openFile(path: string) {
+    if (!view) return;
+    try {
+      const file = await api<OpenFile>('readWorkspaceFile', { sessionId: view.session.id, path });
+      setOpenFiles((current) => [...current.filter((item) => item.path !== path), file]);
+      setActiveFile(path);
+    } catch (err) {
+      fail(err);
+    }
+  }
+  async function changeWorkspace() {
+    if (!view || busy) return;
+    try {
+      const workspace = await api<string | null>('chooseWorkspace');
+      if (!workspace) return;
+      const next = await api<SessionView>('setWorkspace', {
+        sessionId: view.session.id,
+        workspace,
+      });
+      setView(next);
+      setOpenFiles([]);
+      setActiveFile(null);
+      setAttachments([]);
+      setQuote(null);
+      await refreshSessions();
     } catch (err) {
       fail(err);
     }
@@ -357,9 +403,14 @@ function App() {
   }, [view?.events.length, stream, notice, approval]);
 
   async function send() {
-    if (!view || !composer.trim() || busy || view.needsReview) return;
+    if (!view || (!composer.trim() && !attachments.length && !quote) || busy || view.needsReview)
+      return;
     const text = composer.trim();
+    const submittedAttachments = attachments;
+    const submittedQuote = quote;
     setComposer('');
+    setAttachments([]);
+    setQuote(null);
     setBusy(true);
     setView((previous) =>
       previous
@@ -367,17 +418,41 @@ function App() {
             ...previous,
             events: [
               ...previous.events,
-              { seq: -Date.now(), type: 'user', at: new Date().toISOString(), payload: { text } },
+              {
+                seq: -Date.now(),
+                type: 'user',
+                at: new Date().toISOString(),
+                payload: { text, attachments: submittedAttachments, quote: submittedQuote },
+              },
             ],
           }
         : previous,
     );
     try {
-      await api('send', { sessionId: view.session.id, prompt: text });
+      await api('send', {
+        sessionId: view.session.id,
+        prompt: text,
+        attachments: submittedAttachments.map((item) => item.id),
+        quoteSeq: submittedQuote?.seq,
+      });
     } catch (err) {
       setBusy(false);
-      setComposer(text);
       await openSession(view.session.id);
+      setComposer(text);
+      setAttachments(submittedAttachments);
+      setQuote(submittedQuote);
+      fail(err);
+    }
+  }
+  async function chooseAttachments(kind: 'file' | 'folder') {
+    if (!view) return;
+    try {
+      const selected = await api<AttachmentRef[]>('chooseAttachments', {
+        sessionId: view.session.id,
+        kind,
+      });
+      setAttachments((current) => [...current, ...selected].slice(0, 30));
+    } catch (err) {
       fail(err);
     }
   }
@@ -506,7 +581,7 @@ function App() {
               </button>
             </div>
           ))}
-          {!sessions.length && <div className="empty-sidebar">从一个项目文件夹开始。</div>}
+          {!sessions.length && <div className="empty-sidebar">新建会话，开始协作。</div>}
         </div>
         {view && (
           <div className="workspace-explorer">
@@ -515,8 +590,14 @@ function App() {
               项目文件 · {short(view.session.workspace)}
             </button>
             {filesOpen && (
-              <div className="explorer-list" key={view.session.id}>
-                <WorkspaceFolder sessionId={view.session.id} path="" fail={fail} />
+              <div className="explorer-list" key={`${view.session.id}:${view.session.workspace}`}>
+                <WorkspaceFolder
+                  sessionId={view.session.id}
+                  path=""
+                  refresh={view.events.length}
+                  fail={fail}
+                  openFile={openFile}
+                />
               </div>
             )}
           </div>
@@ -544,13 +625,22 @@ function App() {
           <button
             className="mobile-menu icon-button"
             onClick={() => {
+              if (activeFile) {
+                setActiveFile(null);
+                return;
+              }
               setSidebarOpen((open) => !open);
               setFilesOpen(true);
             }}
-            aria-label="菜单"
+            aria-label={activeFile ? '返回对话' : '菜单'}
           >
             <Menu size={20} />
           </button>
+          {activeFile && (
+            <button className="chat-return" onClick={() => setActiveFile(null)}>
+              <MessageSquare size={17} /> 返回对话
+            </button>
+          )}
           <div className="breadcrumb">
             <span>工作区</span>
             <span className="slash">/</span>
@@ -559,10 +649,15 @@ function App() {
           <div className="header-actions">
             {view && (
               <>
-                <span className="workspace-path" title={view.session.workspace}>
+                <button
+                  className="workspace-path workspace-switch"
+                  title="更换此会话的项目文件夹"
+                  disabled={busy}
+                  onClick={() => void changeWorkspace()}
+                >
                   <FolderOpen size={14} />
                   {view.session.workspace}
-                </span>
+                </button>
                 <select
                   className="model-select model-id-select"
                   aria-label="当前模型 ID"
@@ -589,11 +684,19 @@ function App() {
                 >
                   <LoaderCircle size={15} className={modelLoading ? 'spinning' : ''} />
                 </button>
-                {modelDiscoveryError && (
-                  <span className="model-catalog-error" title={modelDiscoveryError}>
-                    模型列表不可用
-                  </span>
-                )}
+                {modelDiscoveryError &&
+                  (modelDiscoveryError.includes('缺少 API Key') ? (
+                    <button
+                      className="model-catalog-error model-key-action"
+                      onClick={() => setDialog('model')}
+                    >
+                      添加 API Key
+                    </button>
+                  ) : (
+                    <span className="model-catalog-error" title={modelDiscoveryError}>
+                      模型列表不可用
+                    </span>
+                  ))}
               </>
             )}
             <div className="avatar">
@@ -604,6 +707,32 @@ function App() {
             </div>
           </div>
         </header>
+        {view && openFiles.length > 0 && (
+          <div className="editor-tabs" role="tablist" aria-label="会话与文件">
+            <button className={!activeFile ? 'active' : ''} onClick={() => setActiveFile(null)}>
+              <MessageSquare size={14} /> 对话
+            </button>
+            {openFiles.map((file) => (
+              <div
+                className={`editor-tab ${activeFile === file.path ? 'active' : ''}`}
+                key={file.path}
+              >
+                <button title={file.path} onClick={() => setActiveFile(file.path)}>
+                  <FileText size={14} /> {short(file.path)}
+                </button>
+                <button
+                  aria-label={`关闭 ${file.path}`}
+                  onClick={() => {
+                    setOpenFiles((current) => current.filter((item) => item.path !== file.path));
+                    if (activeFile === file.path) setActiveFile(null);
+                  }}
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         {securityNotice && (
           <div className="security-banner" role="alert">
             <ShieldCheck size={16} />
@@ -621,7 +750,7 @@ function App() {
             <span className="eyebrow">YOUR LOCAL CODING AGENT</span>
             <h1>让想法，在代码中发生。</h1>
             <p>
-              连接你熟悉的模型，选择一个项目，然后开始协作。Bruin
+              连接你熟悉的模型，新建会话后即可开始协作。Bruin
               会记录会话、展示工具操作，并在修改文件前征求许可。
             </p>
             <button
@@ -629,7 +758,7 @@ function App() {
               onClick={() => setDialog(config.profiles.length ? 'new' : 'model')}
             >
               <Plus size={17} />
-              {config.profiles.length ? '打开项目，开始对话' : '先配置一个模型'}
+              {config.profiles.length ? '新建会话' : '先配置一个模型'}
             </button>
             <div className="welcome-features">
               <span>
@@ -642,6 +771,18 @@ function App() {
                 <Terminal size={16} /> 本地执行
               </span>
             </div>
+          </div>
+        ) : activeFile ? (
+          <div className="inline-file-viewer">
+            <div className="file-viewer-heading">
+              <FileText size={18} />
+              <strong>{activeFile}</strong>
+              <span>只读预览</span>
+            </div>
+            {openFiles.find((file) => file.path === activeFile)?.truncated && (
+              <p>文件过大，仅显示前 256 KB。</p>
+            )}
+            <pre>{openFiles.find((file) => file.path === activeFile)?.content ?? ''}</pre>
           </div>
         ) : (
           <>
@@ -730,7 +871,16 @@ function App() {
                   ].includes(e.type),
                 )
                 .map((e) => (
-                  <EventCard key={e.seq} event={e} />
+                  <EventCard
+                    key={e.seq}
+                    event={e}
+                    onQuote={(selected) =>
+                      setQuote({
+                        seq: selected.seq,
+                        text: String(selected.payload.text ?? '').slice(0, 4000),
+                      })
+                    }
+                  />
                 ))}
               {stream && (
                 <div className="message assistant">
@@ -768,6 +918,35 @@ function App() {
             </div>
             <div className="composer-wrap">
               <div className="composer">
+                {(quote || attachments.length > 0) && (
+                  <div className="composer-context">
+                    {quote && (
+                      <span className="composer-chip">
+                        <MessageSquare size={13} /> 引用：{quote.text.slice(0, 60) || '消息'}
+                        <button aria-label="移除引用" onClick={() => setQuote(null)}>
+                          <X size={13} />
+                        </button>
+                      </span>
+                    )}
+                    {attachments.map((item) => (
+                      <span className="composer-chip" key={item.id} title={item.note}>
+                        <Paperclip size={13} />
+                        {item.name}
+                        {item.note ? ' · 无法提取内容' : ''}
+                        <button
+                          aria-label={`移除 ${item.name}`}
+                          onClick={() =>
+                            setAttachments((current) =>
+                              current.filter((file) => file.id !== item.id),
+                            )
+                          }
+                        >
+                          <X size={13} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   value={composer}
                   onChange={(e) => setComposer(e.target.value)}
@@ -783,7 +962,25 @@ function App() {
                   disabled={view.needsReview}
                 />
                 <div className="composer-bottom">
-                  <span>
+                  <span className="composer-tools">
+                    <button
+                      type="button"
+                      title="添加图片、文档或文件"
+                      aria-label="添加文件"
+                      disabled={busy}
+                      onClick={() => void chooseAttachments('file')}
+                    >
+                      <Paperclip size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      title="添加文件夹"
+                      aria-label="添加文件夹"
+                      disabled={busy}
+                      onClick={() => void chooseAttachments('folder')}
+                    >
+                      <FolderOpen size={16} />
+                    </button>
                     <Sparkles size={14} /> {view.session.profile.model}{' '}
                     <span className="composer-hint">· ⌘/Ctrl + Enter 发送</span>
                   </span>
@@ -799,7 +996,9 @@ function App() {
                     <button
                       className="send-button"
                       title="发送"
-                      disabled={!composer.trim() || view.needsReview}
+                      disabled={
+                        (!composer.trim() && !attachments.length && !quote) || view.needsReview
+                      }
                       onClick={() => void send()}
                     >
                       <Send size={17} />
@@ -860,6 +1059,8 @@ function App() {
             setSessions((previous) => [result.session, ...previous]);
             selected.current = result.session.id;
             setView(result);
+            setOpenFiles([]);
+            setActiveFile(null);
           }}
           fail={fail}
           openModels={() => setDialog('model')}
@@ -868,6 +1069,9 @@ function App() {
       {dialog === 'model' && (
         <ModelDialog
           config={config}
+          focusAlias={
+            modelDiscoveryError.includes('缺少 API Key') ? view?.session.profile.alias : undefined
+          }
           busy={busy}
           close={() => setDialog(null)}
           changed={(next) => {
@@ -920,11 +1124,15 @@ function App() {
 function WorkspaceFolder({
   sessionId,
   path,
+  refresh,
   fail,
+  openFile,
 }: {
   sessionId: string;
   path: string;
+  refresh: number;
   fail: (error: unknown) => void;
+  openFile: (path: string) => Promise<void>;
 }) {
   const [entries, setEntries] = useState<WorkspaceEntry[]>([]);
   const [expanded, setExpanded] = useState<string[]>([]);
@@ -943,7 +1151,7 @@ function WorkspaceFolder({
     return () => {
       cancelled = true;
     };
-  }, [sessionId, path]);
+  }, [sessionId, path, refresh]);
   return (
     <div className="explorer-children">
       {loading && <small>正在读取…</small>}
@@ -961,7 +1169,7 @@ function WorkspaceFolder({
                     ? current.filter((item) => item !== entry.path)
                     : [...current, entry.path],
                 );
-              else void api('openFileWindow', { sessionId, path: entry.path }).catch(fail);
+              else void openFile(entry.path);
             }}
           >
             {entry.kind === 'directory' ? (
@@ -976,7 +1184,13 @@ function WorkspaceFolder({
             <span>{entry.name}</span>
           </button>
           {entry.kind === 'directory' && expanded.includes(entry.path) && (
-            <WorkspaceFolder sessionId={sessionId} path={entry.path} fail={fail} />
+            <WorkspaceFolder
+              sessionId={sessionId}
+              path={entry.path}
+              refresh={refresh}
+              fail={fail}
+              openFile={openFile}
+            />
           )}
         </React.Fragment>
       ))}
@@ -1019,7 +1233,13 @@ function PreferencesDialog({ close, fail }: { close: () => void; fail: (error: u
   );
 }
 
-function EventCard({ event }: { event: SessionEvent }) {
+function EventCard({
+  event,
+  onQuote,
+}: {
+  event: SessionEvent;
+  onQuote: (event: SessionEvent) => void;
+}) {
   if (event.type === 'user')
     return (
       <div className="message user">
@@ -1029,6 +1249,26 @@ function EventCard({ event }: { event: SessionEvent }) {
             你 <time>{date(event.at)}</time>
           </div>
           <MarkdownMessage text={String(event.payload.text ?? '')} />
+          {Boolean(event.payload.quote) && (
+            <div className="message-quote">
+              引用：{String((event.payload.quote as { text?: string }).text ?? '').slice(0, 160)}
+            </div>
+          )}
+          {Array.isArray(event.payload.attachments) && (
+            <div className="message-attachments">
+              {(event.payload.attachments as AttachmentRef[]).map((item) => (
+                <span key={item.id}>
+                  <Paperclip size={13} />
+                  {item.name}
+                </span>
+              ))}
+            </div>
+          )}
+          {event.seq > 0 && (
+            <button className="quote-action" onClick={() => onQuote(event)}>
+              引用
+            </button>
+          )}
         </div>
       </div>
     );
@@ -1048,6 +1288,11 @@ function EventCard({ event }: { event: SessionEvent }) {
             Bruin <time>{date(event.at)}</time>
           </div>
           {text && <MarkdownMessage text={text} />}
+          {text && event.seq > 0 && (
+            <button className="quote-action" onClick={() => onQuote(event)}>
+              引用
+            </button>
+          )}
           {calls.length > 0 && (
             <div className="tool-chips">
               {calls.map((call, index) => (
@@ -1678,12 +1923,12 @@ function NewSessionDialog({
   return (
     <Modal title="新建会话" eyebrow="START A PROJECT" close={close}>
       <div className="form-stack">
-        <label>项目文件夹</label>
+        <label>项目文件夹（可选）</label>
         <div className="field-with-button">
           <input
             value={workspace}
             onChange={(e) => setWorkspace(e.target.value)}
-            placeholder="选择本地项目文件夹"
+            placeholder="留空则在首次创建文件时生成默认文件夹"
           />
           <button onClick={() => void pick()}>
             <FolderOpen size={17} />
@@ -1704,17 +1949,13 @@ function NewSessionDialog({
           </button>
         )}
         <p className="form-help">
-          Bruin 会在此目录读取文件、执行搜索；修改文件和运行命令时会请求批准。
+          留空会分配一个带时间和随机名的默认工作区，首次写入文件时才创建目录。也可选择现有项目。
         </p>
         <div className="modal-actions">
           <button className="secondary" onClick={close}>
             取消
           </button>
-          <button
-            className="primary"
-            disabled={!workspace || !alias || saving}
-            onClick={() => void create()}
-          >
+          <button className="primary" disabled={!alias || saving} onClick={() => void create()}>
             {saving ? '创建中…' : '创建会话'}
           </button>
         </div>
@@ -1802,12 +2043,14 @@ function AppearanceDialog({
 }
 function ModelDialog({
   config,
+  focusAlias,
   busy,
   close,
   changed,
   fail,
 }: {
   config: Config;
+  focusAlias?: string;
   busy: boolean;
   close: () => void;
   changed: (c: Config) => void;
@@ -1845,6 +2088,10 @@ function ModelDialog({
     setClearApiKey(false);
     formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
+  useEffect(() => {
+    const profile = config.profiles.find((item) => item.alias === focusAlias);
+    if (profile) edit(profile);
+  }, [focusAlias]);
   async function save() {
     if (apiKeyEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
       fail(new Error('环境变量名只能包含字母、数字和下划线；密钥值请填入 API Key 输入框'));

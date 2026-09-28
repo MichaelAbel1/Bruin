@@ -63,6 +63,7 @@ export class RuntimeServices {
   }
 
   async runHooks(event: HookConfig['event'], session: Session, signal: AbortSignal): Promise<void> {
+    if (session.managedWorkspace && !fs.existsSync(session.workspace)) return;
     for (const hook of loadConfig().hooks.filter((item) => item.enabled && item.event === event)) {
       const result = await this.executor.execute(
         {

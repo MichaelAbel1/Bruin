@@ -12,6 +12,7 @@ import { planBlocks, planState } from '../runtime/plan.js';
 import type { RuntimeServices } from '../runtime/services.js';
 import { loadConfig } from '../config.js';
 import { loadInstructions } from './instructions.js';
+import type { AttachmentRef } from './attachments.js';
 
 function explicitPreferences(message: string): string[] {
   return message
@@ -94,10 +95,16 @@ export class AgentRunner {
     session: Session,
     input?: string,
     signal = new AbortController().signal,
+    attachments: AttachmentRef[] = [],
+    quote?: { text: string; seq: number },
   ): Promise<void> {
-    if (input) {
-      this.store.append(session.id, 'user', { text: input });
-      for (const preference of this.readOnly ? [] : explicitPreferences(input)) {
+    if (input || attachments.length || quote) {
+      this.store.append(session.id, 'user', {
+        text: input ?? '',
+        attachments,
+        ...(quote ? { quote } : {}),
+      });
+      for (const preference of this.readOnly ? [] : explicitPreferences(input ?? '')) {
         try {
           this.store.savePreference(session.id, preference);
         } catch {
@@ -232,7 +239,11 @@ export class AgentRunner {
             ? { decision: 'deny' as const, reason: '子 Agent 只能使用只读工具' }
             : planBlocks(call, planState(this.store.events(session.id)))
               ? { decision: 'deny' as const, reason: '规划模式等待用户批准计划' }
-              : decisionFor(call, session.workspace);
+              : decisionFor(
+                  call,
+                  session.workspace,
+                  Boolean(session.managedWorkspace && !fs.existsSync(session.workspace)),
+                );
         if (
           policy.decision === 'deny' ||
           (policy.decision === 'ask' && !(await this.io.approve(call, policy.reason)))
@@ -255,6 +266,12 @@ export class AgentRunner {
         let result: ToolResult;
         try {
           if (
+            ['write_file', 'create_task', 'update_task'].includes(call.name) &&
+            session.managedWorkspace &&
+            !fs.existsSync(session.workspace)
+          )
+            this.store.materializeWorkspace(session.id);
+          if (
             this.services &&
             (!planState(this.store.events(session.id)).enabled ||
               planState(this.store.events(session.id)).approved)
@@ -276,17 +293,26 @@ export class AgentRunner {
               ? await this.services.execute(call, session, signal)
               : { output: '此运行模式不支持该工具', isError: true };
           } else {
-            result = await this.executor.execute(
-              {
-                requestId: randomUUID(),
-                name: call.name,
-                input: call.input,
-                workspace: fs.realpathSync(session.workspace),
-                timeoutMs: call.name === 'shell' ? 120000 : 30000,
-                maxOutputBytes: 100000,
-              },
-              signal,
-            );
+            result =
+              session.managedWorkspace && !fs.existsSync(session.workspace)
+                ? {
+                    output:
+                      call.name === 'search'
+                        ? '默认工作区尚未创建，没有可搜索的文件'
+                        : '默认工作区尚未创建，请先创建文件',
+                    isError: call.name !== 'search',
+                  }
+                : await this.executor.execute(
+                    {
+                      requestId: randomUUID(),
+                      name: call.name,
+                      input: call.input,
+                      workspace: fs.realpathSync(session.workspace),
+                      timeoutMs: call.name === 'shell' ? 120000 : 30000,
+                      maxOutputBytes: 100000,
+                    },
+                    signal,
+                  );
           }
           if (
             this.services &&

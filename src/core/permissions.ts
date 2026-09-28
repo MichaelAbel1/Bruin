@@ -7,6 +7,7 @@ export type Decision = 'allow' | 'ask' | 'deny';
 export function decisionFor(
   call: ToolCall,
   workspace: string,
+  managedPending = false,
 ): { decision: Decision; reason: string } {
   if (
     ![
@@ -77,7 +78,7 @@ export function decisionFor(
   if (call.name === 'load_skill') return { decision: 'allow', reason: '读取已安装 Skill' };
   if (call.name === 'search') return { decision: 'allow', reason: '只读工作区搜索' };
   try {
-    const root = fs.realpathSync(workspace);
+    const root = managedPending ? path.resolve(workspace) : fs.realpathSync(workspace);
     if (typeof call.input.path !== 'string' || !call.input.path) throw new Error('无效路径');
     const p = call.input.path;
     const target = path.resolve(root, p);
@@ -94,6 +95,8 @@ export function decisionFor(
       }
     }
     if (call.name === 'write_file') {
+      if (managedPending && path.dirname(target) === root)
+        return { decision: 'ask', reason: '首次写入将创建默认项目文件夹和文件' };
       if (!fs.statSync(path.dirname(target)).isDirectory()) throw new Error('父目录不是目录');
       return { decision: 'ask', reason: '创建或覆盖工作区文件' };
     }

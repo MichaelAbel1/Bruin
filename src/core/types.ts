@@ -53,6 +53,7 @@ export type EventType =
   | 'summary'
   | 'skill_loaded'
   | 'model_switched'
+  | 'workspace_changed'
   | 'plan_mode'
   | 'plan_updated'
   | 'plan_approved'
@@ -73,6 +74,7 @@ export interface SessionEvent {
 export interface Session {
   id: string;
   workspace: string;
+  managedWorkspace?: boolean;
   profile: ModelProfile;
   createdAt: string;
   updatedAt: string;

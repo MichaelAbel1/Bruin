@@ -347,6 +347,92 @@ pre {
 .workspace-path svg {
   flex: none;
 }
+.workspace-switch {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.workspace-switch:hover {
+  color: #b7e679;
+}
+.chat-return {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+}
+.editor-tabs {
+  display: flex;
+  flex: none;
+  gap: 2px;
+  overflow-x: auto;
+  border-bottom: 1px solid #343c38;
+  padding: 0 12px;
+}
+.editor-tabs button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: #8f9993;
+  padding: 9px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.editor-tabs .active {
+  color: #d8e4d2;
+  background: #242b25;
+}
+.editor-tab {
+  display: flex;
+  align-items: center;
+}
+.editor-tab button:last-child {
+  padding-left: 3px;
+  padding-right: 8px;
+}
+.inline-file-viewer {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.file-viewer-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 22px;
+  border-bottom: 1px solid #343c38;
+  font-size: 13px;
+}
+.file-viewer-heading span {
+  margin-left: auto;
+  color: #8f9993;
+  font-size: 11px;
+}
+.inline-file-viewer p {
+  padding: 0 22px;
+  color: #aa8251;
+}
+.inline-file-viewer pre {
+  margin: 0;
+  padding: 22px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    12px/1.6 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.model-key-action {
+  border: 0;
+  background: transparent;
+  text-decoration: underline;
+}
 .model-select {
   max-width: 215px;
   background: #1c2120;
@@ -876,6 +962,64 @@ pre {
 }
 .composer:focus-within {
   border-color: #70935c;
+}
+.composer-context,
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px 0;
+}
+.composer-chip,
+.message-attachments span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  border: 1px solid #52614f;
+  border-radius: 7px;
+  padding: 4px 7px;
+  color: #c7d5c5;
+  font-size: 11px;
+}
+.composer-chip button,
+.composer-tools button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+.composer-tools button {
+  padding: 4px;
+  margin-right: 4px;
+}
+.composer-tools button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.message-attachments {
+  padding: 6px 0;
+}
+.message-quote {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid #7fa667;
+  color: #9dac9b;
+  font-size: 12px;
+}
+.quote-action {
+  border: 0;
+  background: transparent;
+  color: #8ea981;
+  cursor: pointer;
+  font-size: 11px;
+  margin-top: 5px;
+  padding: 3px 0;
+}
+.quote-action:hover {
+  text-decoration: underline;
 }
 .composer textarea {
   width: 100%;
@@ -1473,6 +1617,14 @@ pre {
 }
 :root[data-theme='light'] .workspace-explorer {
   border-color: #e5e7eb;
+}
+:root[data-theme='light'] .editor-tabs,
+:root[data-theme='light'] .file-viewer-heading {
+  border-color: #e5e7eb;
+}
+:root[data-theme='light'] .editor-tabs .active {
+  background: #f1f2f3;
+  color: #202124;
 }
 :root[data-theme='light'] .explorer-entry:hover,
 :root[data-theme='light'] .explorer-toggle:hover {
