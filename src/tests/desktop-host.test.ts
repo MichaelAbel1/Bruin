@@ -197,6 +197,23 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     assert.equal(fs.readFileSync(path.join(dir, 'result.txt'), 'utf8'), 'created');
     assert.ok(events.some((event) => event.type === 'tool_approved'));
     assert.equal(events.at(-1).type, 'turn_completed');
+
+    const externalStore = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
+    try {
+      externalStore.acquireLease(created.session.id, 'external-process', 30_000);
+      await assert.rejects(
+        request('runtimeTool', {
+          sessionId: created.session.id,
+          name: 'list_memory',
+          input: {},
+        }),
+        /运行/,
+      );
+    } finally {
+      externalStore.releaseLease(created.session.id, 'external-process');
+      externalStore.close();
+    }
+
     const afterRemoval = await request('removeProfile', { alias: 'local' });
     assert.deepEqual(afterRemoval.profiles, []);
     assert.equal(afterRemoval.defaultProfile, undefined);
@@ -271,6 +288,82 @@ test('desktop startup repairs a legacy session profile containing a key', async 
     } finally {
       reopened.close();
     }
+  } finally {
+    child.stdin.end();
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null) resolve();
+      else child.once('exit', () => resolve());
+    });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('desktop reviewUnknown precisely acknowledges specific sequence and requires review for new unknown events', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-desktop-review-'));
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home);
+  const store = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
+  const session = store.createSession(dir, {
+    alias: 'test',
+    provider: 'openai-compatible',
+    model: 'test',
+    baseUrl: 'http://localhost:1234/v1',
+  });
+  store.append(session.id, 'assistant', {
+    text: '',
+    calls: [{ id: 'c1', name: 'shell', input: {} }],
+  });
+  store.append(session.id, 'tool_unknown', {
+    callId: 'c1',
+    name: 'shell',
+    output: 'interrupted 1',
+  });
+  store.close();
+
+  const script = fileURLToPath(new URL('../desktop-host.js', import.meta.url));
+  const child = spawn(process.execPath, [script], {
+    env: { ...process.env, BRUIN_HOME: home },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const pending = new Map<string, { resolve(value: any): void; reject(error: Error): void }>();
+  readline.createInterface({ input: child.stdout }).on('line', (line) => {
+    const message = JSON.parse(line);
+    if (!message.id) return;
+    const entry = pending.get(message.id);
+    if (!entry) return;
+    pending.delete(message.id);
+    if (message.error) entry.reject(new Error(message.error));
+    else entry.resolve(message.result);
+  });
+  function request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    const id = String(Math.random());
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+    });
+  }
+  try {
+    const open1 = await request('openSession', { sessionId: session.id });
+    assert.equal(open1.needsReview, true);
+
+    const reviewed = await request('reviewUnknown', { sessionId: session.id });
+    assert.equal(reviewed.needsReview, false);
+
+    // Simulate another process or action producing a newer tool_unknown
+    const store2 = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
+    store2.append(session.id, 'assistant', {
+      text: '',
+      calls: [{ id: 'c2', name: 'shell', input: {} }],
+    });
+    store2.append(session.id, 'tool_unknown', {
+      callId: 'c2',
+      name: 'shell',
+      output: 'interrupted 2',
+    });
+    store2.close();
+
+    const open2 = await request('openSession', { sessionId: session.id });
+    assert.equal(open2.needsReview, true);
   } finally {
     child.stdin.end();
     await new Promise<void>((resolve) => {

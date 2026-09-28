@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { ModelProfile } from './core/types.js';
 
@@ -80,9 +81,18 @@ export function configPath(): string {
 export function loadConfig(): AppConfig {
   if (!fs.existsSync(configPath()))
     return { profiles: [], marketplaces: [], mcpServers: [], hooks: [] };
-  const raw = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as {
+  let raw: {
     profiles?: Array<{ alias?: string; apiKeyEnv?: string }>;
   };
+  try {
+    raw = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as {
+      profiles?: Array<{ alias?: string; apiKeyEnv?: string }>;
+    };
+  } catch (error) {
+    throw new Error(
+      `配置文件解析失败 (${configPath()}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   let migrated = false;
   for (const profile of raw.profiles ?? []) {
     const value = profile.apiKeyEnv;
@@ -94,15 +104,120 @@ export function loadConfig(): AppConfig {
     migrated = true;
     migratedLegacyKey = true;
   }
-  const config = configSchema.parse(raw);
+  let config: AppConfig;
+  try {
+    config = configSchema.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `配置文件格式无效 (${configPath()}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   if (migrated) saveConfig(config);
   return config;
 }
-export function saveConfig(config: AppConfig): void {
+export function configLockPath(): string {
+  return path.join(dataDir(), 'config.lock');
+}
+
+let configLockDepth = 0;
+
+export function withConfigLock<T>(fn: () => T): T {
+  if (configLockDepth > 0) {
+    configLockDepth++;
+    try {
+      return fn();
+    } finally {
+      configLockDepth--;
+    }
+  }
+
   fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
-  const temp = `${configPath()}.${process.pid}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(configSchema.parse(config), null, 2), { mode: 0o600 });
-  fs.renameSync(temp, configPath());
+  const lockFile = configLockPath();
+  const start = Date.now();
+  const timeoutMs = 5000;
+  let fd: number | null = null;
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      fd = fs.openSync(
+        lockFile,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR,
+        0o600,
+      );
+      fs.writeSync(fd, `${process.pid}\n${Date.now()}`);
+      break;
+    } catch (err: unknown) {
+      const code = (err as { code?: string })?.code;
+      if (code === 'EEXIST') {
+        try {
+          const content = fs.readFileSync(lockFile, 'utf8');
+          const [pidStr, timestampStr] = content.split('\n');
+          const pid = parseInt(pidStr, 10);
+          const timestamp = parseInt(timestampStr, 10);
+          let isAlive = false;
+          if (Number.isFinite(pid) && pid > 0) {
+            try {
+              process.kill(pid, 0);
+              isAlive = true;
+            } catch (e: unknown) {
+              if ((e as { code?: string })?.code === 'ESRCH') {
+                isAlive = false;
+              } else {
+                isAlive = true;
+              }
+            }
+          }
+          const isExpired = Number.isFinite(timestamp) && Date.now() - timestamp > 10000;
+          if (!isAlive || isExpired) {
+            fs.unlinkSync(lockFile);
+            continue;
+          }
+        } catch {
+          // File might have been removed or reading failed; retry
+          continue;
+        }
+        const wait = 20 + Math.floor(Math.random() * 30);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  if (fd === null) {
+    throw new Error('获取配置文件锁超时，可能存在并发写入冲突');
+  }
+
+  configLockDepth++;
+  try {
+    return fn();
+  } finally {
+    configLockDepth--;
+    try {
+      fs.closeSync(fd);
+    } catch {}
+    try {
+      fs.unlinkSync(lockFile);
+    } catch {}
+  }
+}
+
+export function saveConfig(config: AppConfig): void {
+  withConfigLock(() => {
+    fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
+    const temp = `${configPath()}.${process.pid}.${randomUUID()}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(configSchema.parse(config), null, 2), { mode: 0o600 });
+    fs.renameSync(temp, configPath());
+  });
+}
+
+export function updateConfig(updater: (config: AppConfig) => AppConfig): AppConfig {
+  return withConfigLock(() => {
+    const current = loadConfig();
+    const next = updater(current);
+    saveConfig(next);
+    return next;
+  });
 }
 export function findProfile(alias?: string): ModelProfile {
   const config = loadConfig();

@@ -154,10 +154,13 @@ export function buildPrompt(
     }
     if (event.type === 'summary') {
       flushPendingCalls();
-      messages.push({
-        role: 'user',
-        content: `Earlier conversation summary:\n${String(event.payload.text ?? '')}`,
-      });
+      const text = String(event.payload.text ?? '').trim();
+      if (text) {
+        messages.push({
+          role: 'user',
+          content: `Earlier conversation summary:\n${text}`,
+        });
+      }
     }
     if (event.type === 'assistant') {
       flushPendingCalls();

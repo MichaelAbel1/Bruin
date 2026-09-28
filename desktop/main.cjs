@@ -40,7 +40,7 @@ function readEncryptedKeys() {
 function writeEncryptedKeys(keys) {
   const file = secretsPath();
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.tmp`;
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(keys), { mode: 0o600 });
   fs.renameSync(temp, file);
 }
@@ -110,7 +110,7 @@ function saveAppearance(next) {
   }
   const file = appearancePath();
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.tmp`;
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(
     temp,
     JSON.stringify({ iconBackground: nextIconBackground, uiTheme: nextUiTheme }),

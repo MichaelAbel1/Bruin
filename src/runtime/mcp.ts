@@ -151,7 +151,7 @@ export class McpManager {
   async disconnect(name: string): Promise<void> {
     const existing = this.clients.get(name);
     this.clients.delete(name);
-    if (existing) await existing.client.close();
+    if (existing) await existing.client.close().catch(() => {});
   }
   async close(): Promise<void> {
     await Promise.allSettled([...this.clients.keys()].map((name) => this.disconnect(name)));

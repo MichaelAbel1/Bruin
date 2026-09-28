@@ -13,7 +13,16 @@ import type { ToolExecutor } from '../executor/client.js';
 import type { ModelProfile, SessionEvent, ToolCall, ToolResult } from '../core/types.js';
 import { ProcessExecutor } from '../executor/client.js';
 import { installLocal, listSkills, loadSkill } from '../skills/registry.js';
-import { getRuntimeApiKey, loadConfig, setRuntimeApiKey } from '../config.js';
+import {
+  configLockPath,
+  configPath,
+  getRuntimeApiKey,
+  loadConfig,
+  saveConfig,
+  setRuntimeApiKey,
+  updateConfig,
+  withConfigLock,
+} from '../config.js';
 import { loadInstructions } from '../core/instructions.js';
 import { listWorkspaceEntries, readWorkspaceFile } from '../core/workspace-files.js';
 import { importAttachments } from '../core/attachments.js';
@@ -440,6 +449,14 @@ test('model error includes structured API detail without dumping arbitrary body'
       responseBody: JSON.stringify({ error: { message: 'This model does not support tools' } }),
     }),
     'HTTP 400: This model does not support tools',
+  );
+  assert.equal(
+    formatModelError({
+      statusCode: 422,
+      message: 'Unprocessable Entity',
+      responseBody: { error: { message: 'Invalid parameter value' } },
+    }),
+    'HTTP 422: Invalid parameter value',
   );
   assert.equal(
     formatModelError({ statusCode: 400, message: 'Bad Request', responseBody: '<private prompt>' }),
@@ -1166,6 +1183,262 @@ test('storage failure during load_skill is not masked as a skill error', async (
     );
   } finally {
     store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deleteSession preserves workspace files on disk and removes session records', () => {
+  const dir = fs.realpathSync(temp());
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const managedDir = path.join(dir, 'workspaces', '20260928-120000-11223344');
+    const session = store.createManagedSession(managedDir, profile);
+    store.materializeWorkspace(session.id);
+    fs.writeFileSync(path.join(managedDir, 'user-code.ts'), 'console.log("user code");');
+    assert.ok(fs.existsSync(managedDir));
+
+    store.deleteSession(session.id);
+    // User files and workspace must NOT be deleted
+    assert.equal(fs.existsSync(managedDir), true);
+    assert.equal(fs.existsSync(path.join(managedDir, 'user-code.ts')), true);
+    assert.equal(store.getSession(session.id), undefined);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('takeDueCronJobs handles invalid cron expression gracefully without blocking other jobs', () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    // Insert a job with a normal expression, and one with corrupted/invalid expression
+    const validJob = store.createCronJob(session.id, '* * * * *', 'Valid job');
+    // Corrupt expression directly in database to test recovery
+    const badId = 'bad-job-id';
+    (store as any).db
+      .prepare('INSERT INTO cron_jobs VALUES (?, ?, ?, ?, ?, NULL)')
+      .run(badId, session.id, 'not-a-cron-expr', 'Broken job', validJob.nextRunAt - 100);
+
+    // takeDueCronJobs should skip the bad job and return the valid job directly
+    const due = store.takeDueCronJobs(validJob.nextRunAt);
+    assert.equal(due.length, 1);
+    assert.equal(due[0].id, validJob.id);
+
+    // Bad job should now be marked invalid_expression and pushed into the future
+    const badJobRow = (store as any).db
+      .prepare('SELECT last_status, next_run_at FROM cron_jobs WHERE id = ?')
+      .get(badId) as { last_status: string; next_run_at: number };
+    assert.equal(badJobRow.last_status, 'invalid_expression');
+    assert.ok(badJobRow.next_run_at > validJob.nextRunAt);
+
+    // Next takeDueCronJobs should return empty
+    const nextDue = store.takeDueCronJobs(validJob.nextRunAt);
+    assert.equal(nextDue.length, 0);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('edit_file replaces literal dollar patterns without special regex substitution', async () => {
+  const dir = temp();
+  const file = path.join(dir, 'prices.js');
+  fs.writeFileSync(file, 'const price = 0;\nconst ref = "orig";\n');
+  const executor = new ProcessExecutor();
+  try {
+    const edit = await executor.execute({
+      requestId: 'e1',
+      name: 'edit_file',
+      input: {
+        path: 'prices.js',
+        oldText: 'const price = 0;',
+        newText: 'const price = "$100" + "$$" + "$&";',
+      },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 1000,
+    });
+    assert.equal(edit.isError, false, edit.output);
+    const content = fs.readFileSync(file, 'utf8');
+    assert.equal(content, 'const price = "$100" + "$$" + "$&";\nconst ref = "orig";\n');
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('file tools reject operating on workspace root directory as a file', async () => {
+  const dir = temp();
+  const executor = new ProcessExecutor();
+  try {
+    const read = await executor.execute({
+      requestId: 'r0',
+      name: 'read_file',
+      input: { path: '.' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 1000,
+    });
+    assert.equal(read.isError, true);
+    assert.match(read.output, /工作区根目录/);
+
+    const write = await executor.execute({
+      requestId: 'w0',
+      name: 'write_file',
+      input: { path: '.', content: 'test' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 1000,
+    });
+    assert.equal(write.isError, true);
+    assert.match(write.output, /工作区根目录/);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ProcessExecutor auto-respawns worker child if it unexpectedly terminates', async () => {
+  const dir = temp();
+  fs.writeFileSync(path.join(dir, 'test.txt'), 'content');
+  const executor = new ProcessExecutor();
+  try {
+    const first = await executor.execute({
+      requestId: 'f1',
+      name: 'read_file',
+      input: { path: 'test.txt' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 100,
+    });
+    assert.equal(first.output, 'content');
+
+    // Forcibly kill worker process and dispatch next request immediately (no delay)
+    const child = (executor as any).child;
+    child.kill('SIGKILL');
+
+    // Next request should automatically spawn a fresh worker and succeed without race condition
+    const second = await executor.execute({
+      requestId: 'f2',
+      name: 'read_file',
+      input: { path: 'test.txt' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 100,
+    });
+    assert.equal(second.output, 'content');
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('edit_file accurately differentiates between missing text and multiple occurrences', async () => {
+  const dir = temp();
+  fs.writeFileSync(path.join(dir, 'test.txt'), 'hello world hello');
+  const executor = new ProcessExecutor();
+  try {
+    const missing = await executor.execute({
+      requestId: 'm1',
+      name: 'edit_file',
+      input: { path: 'test.txt', oldText: 'nonexistent', newText: 'replacement' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 100,
+    });
+    assert.equal(missing.isError, true);
+    assert.match(missing.output, /未找到要替换的文本/);
+
+    const multiple = await executor.execute({
+      requestId: 'm2',
+      name: 'edit_file',
+      input: { path: 'test.txt', oldText: 'hello', newText: 'hi' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 100,
+    });
+    assert.equal(multiple.isError, true);
+    assert.match(multiple.output, /出现了 2 次，必须唯一/);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadConfig reports descriptive error on corrupted config file and saveConfig works', () => {
+  const dir = temp();
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  try {
+    fs.mkdirSync(process.env.BRUIN_HOME, { recursive: true });
+    fs.writeFileSync(configPath(), '{ invalid json');
+    assert.throws(() => loadConfig(), /配置文件解析失败/);
+
+    fs.writeFileSync(configPath(), JSON.stringify({ profiles: 'not-an-array' }));
+    assert.throws(() => loadConfig(), /配置文件格式无效/);
+
+    saveConfig({ profiles: [], marketplaces: [], mcpServers: [], hooks: [] });
+    const loaded = loadConfig();
+    assert.deepEqual(loaded.profiles, []);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('withConfigLock supports reentrancy, stale lock cleanup, and updateConfig atomic mutation', () => {
+  const dir = temp();
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  try {
+    // 1. Reentrancy
+    let reached = false;
+    withConfigLock(() => {
+      withConfigLock(() => {
+        reached = true;
+      });
+    });
+    assert.equal(reached, true);
+
+    // 2. updateConfig serializes mutations correctly
+    updateConfig((cfg) => {
+      cfg.defaultProfile = 'profile-a';
+      return cfg;
+    });
+    assert.equal(loadConfig().defaultProfile, 'profile-a');
+
+    updateConfig((cfg) => {
+      cfg.mcpServers.push({
+        name: 'srv1',
+        transport: 'stdio',
+        command: 'node',
+        args: [],
+        envNames: [],
+      });
+      return cfg;
+    });
+    const loaded = loadConfig();
+    assert.equal(loaded.defaultProfile, 'profile-a');
+    assert.equal(loaded.mcpServers.length, 1);
+    assert.equal(loaded.mcpServers[0].name, 'srv1');
+
+    // 3. Stale lock recovery: write an old expired lock file
+    const lockFile = configLockPath();
+    fs.mkdirSync(process.env.BRUIN_HOME, { recursive: true });
+    // Write fake dead pid and expired timestamp
+    fs.writeFileSync(lockFile, `99999999\n${Date.now() - 20000}`);
+    assert.equal(fs.existsSync(lockFile), true);
+
+    // withConfigLock should detect stale lock, clean it, and acquire successfully
+    const res = withConfigLock(() => 'recovered');
+    assert.equal(res, 'recovered');
+    assert.equal(fs.existsSync(lockFile), false);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

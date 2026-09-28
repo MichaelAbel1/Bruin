@@ -267,10 +267,14 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
   if (Buffer.byteLength(JSON.stringify(req.input)) > 1_000_000) throw new Error('工具输入过大');
   if (!fs.statSync(req.workspace).isDirectory()) throw new Error('工作区不是目录');
   switch (req.name) {
-    case 'read_file':
-      return readBounded(checkedPath(req.workspace, req.input.path), req.maxOutputBytes);
+    case 'read_file': {
+      const file = checkedPath(req.workspace, req.input.path);
+      if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
+      return readBounded(file, req.maxOutputBytes);
+    }
     case 'write_file': {
       const file = checkedPath(req.workspace, req.input.path, true);
+      if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
       const parent = path.dirname(file);
       const root = fs.realpathSync(req.workspace);
       let current = root;
@@ -299,6 +303,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
     }
     case 'edit_file': {
       const file = checkedPath(req.workspace, req.input.path);
+      if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
       const old = String(req.input.oldText ?? '');
       const replacement = String(req.input.newText ?? '');
       if (!old) throw new Error('oldText 不能为空');
@@ -311,8 +316,11 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         if (!stat.isFile()) throw new Error('只能编辑普通文件');
         if (stat.size > 5_000_000) throw new Error('文件过大，无法使用 edit_file 编辑');
         const source = fs.readFileSync(fd, 'utf8');
-        if (source.split(old).length !== 2) throw new Error('oldText 必须恰好出现一次');
-        const updated = Buffer.from(source.replace(old, replacement));
+        const parts = source.split(old);
+        if (parts.length === 1) throw new Error('未找到要替换的文本 (oldText)');
+        if (parts.length > 2)
+          throw new Error(`要替换的文本 (oldText) 在文件中出现了 ${parts.length - 1} 次，必须唯一`);
+        const updated = Buffer.from(parts[0] + replacement + parts[1]);
         replaceFile(file, updated, stat.mode & 0o777);
       } finally {
         fs.closeSync(fd);

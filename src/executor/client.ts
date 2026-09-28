@@ -6,15 +6,27 @@ export interface ToolExecutor {
   execute(request: ToolRequest, signal?: AbortSignal): Promise<ToolResult>;
   close(): Promise<void>;
 }
+interface WorkerInstance {
+  child: ChildProcess;
+  pending: Map<string, { resolve: (value: ToolResult) => void; reject: (reason: Error) => void }>;
+}
+
 export class ProcessExecutor implements ToolExecutor {
-  private child: ChildProcess;
-  private pending = new Map<
-    string,
-    { resolve: (value: ToolResult) => void; reject: (reason: Error) => void }
-  >();
+  private currentWorker!: WorkerInstance;
+  private workers = new Set<WorkerInstance>();
+  private closing = false;
+
+  get child(): ChildProcess {
+    return this.currentWorker.child;
+  }
+
   constructor() {
+    this.spawnWorker();
+  }
+
+  private spawnWorker(): WorkerInstance {
     const worker = fileURLToPath(new URL('./worker.js', import.meta.url));
-    this.child = fork(worker, [], {
+    const child = fork(worker, [], {
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       env: {
         PATH: process.env.PATH,
@@ -27,25 +39,52 @@ export class ProcessExecutor implements ToolExecutor {
         DOCKER_HOST: process.env.DOCKER_HOST,
       },
     });
-    this.child.on('message', (raw: ToolResponse) => {
-      const p = this.pending.get(raw.requestId);
+
+    const pending = new Map<
+      string,
+      { resolve: (value: ToolResult) => void; reject: (reason: Error) => void }
+    >();
+    const instance: WorkerInstance = { child, pending };
+    this.workers.add(instance);
+    this.currentWorker = instance;
+
+    child.on('message', (raw: ToolResponse) => {
+      const p = pending.get(raw.requestId);
       if (p) {
-        this.pending.delete(raw.requestId);
+        pending.delete(raw.requestId);
         p.resolve(raw.result);
       }
     });
-    this.child.on('exit', () => {
-      for (const p of this.pending.values()) p.reject(new Error('工具执行进程退出，结果未知'));
-      this.pending.clear();
+
+    child.on('error', (err) => {
+      for (const p of pending.values()) p.reject(err);
+      pending.clear();
     });
+
+    child.on('exit', () => {
+      this.workers.delete(instance);
+      for (const p of pending.values()) p.reject(new Error('工具执行进程退出，结果未知'));
+      pending.clear();
+    });
+
+    return instance;
   }
+
+  private isAlive(child: ChildProcess): boolean {
+    return child.connected && !child.killed && child.exitCode === null && child.signalCode === null;
+  }
+
   execute(request: ToolRequest, signal?: AbortSignal): Promise<ToolResult> {
-    if (!this.child.connected) return Promise.reject(new Error('工具执行进程未连接'));
+    if (this.closing) return Promise.reject(new Error('工具执行器已关闭'));
+    if (!this.isAlive(this.currentWorker.child)) this.spawnWorker();
+    const worker = this.currentWorker;
+    if (!this.isAlive(worker.child)) return Promise.reject(new Error('工具执行进程未连接'));
+
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error('已取消'));
-      const abort = () => this.child.send({ type: 'cancel', requestId: request.requestId });
+      const abort = () => worker.child.send({ type: 'cancel', requestId: request.requestId });
       signal?.addEventListener('abort', abort, { once: true });
-      this.pending.set(request.requestId, {
+      worker.pending.set(request.requestId, {
         resolve: (value) => {
           signal?.removeEventListener('abort', abort);
           resolve(value);
@@ -55,23 +94,27 @@ export class ProcessExecutor implements ToolExecutor {
           reject(err);
         },
       });
-      this.child.send(request, (err) => {
+      worker.child.send(request, (err) => {
         if (err) {
-          this.pending.delete(request.requestId);
+          worker.pending.delete(request.requestId);
+          signal?.removeEventListener('abort', abort);
           reject(err);
         }
       });
     });
   }
+
   async close(): Promise<void> {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const exited = new Promise<void>((resolve) => this.child.once('exit', () => resolve()));
-    if (this.child.connected) this.child.disconnect();
-    const timer = setTimeout(() => this.child.kill('SIGKILL'), 2000);
-    try {
-      await exited;
-    } finally {
-      clearTimeout(timer);
+    this.closing = true;
+    const exitPromises: Promise<void>[] = [];
+    for (const worker of this.workers) {
+      if (worker.child.exitCode !== null || worker.child.signalCode !== null) continue;
+      const exited = new Promise<void>((resolve) => worker.child.once('exit', () => resolve()));
+      if (worker.child.connected) worker.child.disconnect();
+      const timer = setTimeout(() => worker.child.kill('SIGKILL'), 2000);
+      timer.unref();
+      exitPromises.push(exited.finally(() => clearTimeout(timer)));
     }
+    await Promise.all(exitPromises);
   }
 }

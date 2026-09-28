@@ -11,6 +11,7 @@ import {
   loadConfig,
   looksLikeApiKey,
   saveConfig,
+  updateConfig,
   setRuntimeApiKey,
   validApiKeyEnv,
 } from './config.js';
@@ -87,18 +88,22 @@ async function main(): Promise<void> {
         ...(baseUrl ? { baseUrl } : {}),
         ...(apiKeyEnv ? { apiKeyEnv } : {}),
       };
-      cfg.profiles = cfg.profiles.filter((x) => x.alias !== alias);
-      cfg.profiles.push(profile);
-      cfg.defaultProfile ??= alias;
-      saveConfig(cfg);
+      updateConfig((current) => {
+        current.profiles = current.profiles.filter((x) => x.alias !== alias);
+        current.profiles.push(profile);
+        current.defaultProfile ??= alias;
+        return current;
+      });
       console.log(`已保存 ${alias}`);
       return;
     }
     if (action === 'default') {
       const alias = args[0];
-      if (!cfg.profiles.some((x) => x.alias === alias)) throw new Error('模型配置不存在');
-      cfg.defaultProfile = alias;
-      saveConfig(cfg);
+      updateConfig((current) => {
+        if (!current.profiles.some((x) => x.alias === alias)) throw new Error('模型配置不存在');
+        current.defaultProfile = alias;
+        return current;
+      });
       console.log(`默认模型: ${alias}`);
       return;
     }

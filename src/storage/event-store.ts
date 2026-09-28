@@ -675,20 +675,30 @@ export class SqliteEventStore implements EventStore {
   }
   takeDueCronJobs(now: number): CronJob[] {
     return this.db.transaction(() => {
-      const due = (
-        this.db
+      while (true) {
+        const row = this.db
           .prepare('SELECT * FROM cron_jobs WHERE next_run_at <= ? ORDER BY next_run_at LIMIT 1')
-          .all(now) as any[]
-      ).map((row) => this.rowToCronJob(row));
-      for (const job of due) {
-        const next = CronExpressionParser.parse(job.expression, { currentDate: new Date(now) })
-          .next()
-          .getTime();
-        this.db
-          .prepare(`UPDATE cron_jobs SET next_run_at = ?, last_status = 'dispatched' WHERE id = ?`)
-          .run(next, job.id);
+          .get(now) as any;
+        if (!row) return [];
+        const job = this.rowToCronJob(row);
+        try {
+          const next = CronExpressionParser.parse(job.expression, { currentDate: new Date(now) })
+            .next()
+            .getTime();
+          this.db
+            .prepare(
+              `UPDATE cron_jobs SET next_run_at = ?, last_status = 'dispatched' WHERE id = ?`,
+            )
+            .run(next, job.id);
+          return [job];
+        } catch {
+          this.db
+            .prepare(
+              `UPDATE cron_jobs SET next_run_at = ?, last_status = 'invalid_expression' WHERE id = ?`,
+            )
+            .run(now + 86_400_000, job.id);
+        }
       }
-      return due;
     })();
   }
   markCronJob(id: string, status: string): void {

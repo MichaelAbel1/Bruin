@@ -97,16 +97,33 @@ export class RuntimeServices {
           const preference = this.store.savePreference(session.id, String(input.content ?? ''));
           return { output: JSON.stringify(preference), isError: false };
         } catch (error) {
-          return { output: error instanceof Error ? error.message : String(error), isError: true };
+          const message = error instanceof Error ? error.message : String(error);
+          if (
+            message === '偏好必须是本轮用户明确表达的原文，且不能包含密钥' ||
+            message === '用户偏好已达到 50 项上限'
+          ) {
+            return { output: message, isError: true };
+          }
+          throw error;
         }
       }
-      case 'save_memory':
-        this.store.saveMemory(
-          session.workspace,
-          String(input.key ?? ''),
-          String(input.content ?? ''),
-        );
-        return { output: '工作区记忆已保存', isError: false };
+      case 'save_memory': {
+        const key = String(input.key ?? '');
+        const content = String(input.content ?? '');
+        if (!/^[a-zA-Z0-9._-]{1,80}$/.test(key) || !content.trim() || content.length > 8000) {
+          return { output: '记忆名称或内容无效', isError: true };
+        }
+        try {
+          this.store.saveMemory(session.workspace, key, content);
+          return { output: '工作区记忆已保存', isError: false };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message === '工作区记忆已达到 50 项上限') {
+            return { output: message, isError: true };
+          }
+          throw error;
+        }
+      }
       case 'create_task': {
         try {
           const task = this.store.createTask(
@@ -117,7 +134,15 @@ export class RuntimeServices {
           );
           return { output: JSON.stringify(task), isError: false };
         } catch (error) {
-          return { output: error instanceof Error ? error.message : String(error), isError: true };
+          const message = error instanceof Error ? error.message : String(error);
+          if (
+            message === '无效任务' ||
+            message === '工作区任务已达到 200 项上限' ||
+            message === '依赖任务不存在或不属于当前工作区'
+          ) {
+            return { output: message, isError: true };
+          }
+          throw error;
         }
       }
       case 'list_tasks':
@@ -138,7 +163,20 @@ export class RuntimeServices {
           });
           return { output: JSON.stringify(task), isError: false };
         } catch (error) {
-          return { output: error instanceof Error ? error.message : String(error), isError: true };
+          const message = error instanceof Error ? error.message : String(error);
+          if (
+            message === '任务不存在或不属于当前工作区' ||
+            message === '没有任务修改内容' ||
+            message === '无效任务内容' ||
+            message === '无效依赖任务' ||
+            message === '任务依赖已达到 30 项上限' ||
+            message === '只能修改待执行任务的依赖' ||
+            message === '依赖任务不存在或不属于当前工作区' ||
+            message === '任务依赖会形成环'
+          ) {
+            return { output: message, isError: true };
+          }
+          throw error;
         }
       }
       case 'claim_task': {
@@ -146,15 +184,20 @@ export class RuntimeServices {
         return { output: JSON.stringify(task ?? null), isError: false };
       }
       case 'finish_task': {
+        const id = String(input.id ?? '');
+        if (!this.store.listTasks(session.id).some((task) => task.id === id)) {
+          return { output: '任务不属于当前工作区', isError: true };
+        }
         try {
-          const id = String(input.id ?? '');
-          if (!this.store.listTasks(session.id).some((task) => task.id === id))
-            throw new Error('任务不属于当前工作区');
           this.store.finishTask(id, this.taskOwner, input.success === true);
           this.claimedTasks.delete(id);
           return { output: '任务状态已保存', isError: false };
         } catch (error) {
-          return { output: error instanceof Error ? error.message : String(error), isError: true };
+          const message = error instanceof Error ? error.message : String(error);
+          if (message === '任务租约已失效或不属于当前进程') {
+            return { output: message, isError: true };
+          }
+          throw error;
         }
       }
       case 'mcp_list_tools': {
@@ -240,7 +283,12 @@ export class RuntimeServices {
       }
       case 'remove_worktree': {
         const parent = path.join(dataDir(), 'worktrees');
-        const destination = fs.realpathSync(String(input.path ?? ''));
+        let destination: string;
+        try {
+          destination = fs.realpathSync(String(input.path ?? ''));
+        } catch {
+          return { output: '工作树路径不存在', isError: true };
+        }
         if (
           !destination.startsWith(fs.realpathSync(parent) + path.sep) ||
           path.dirname(destination) !== fs.realpathSync(parent)
@@ -266,9 +314,12 @@ export class RuntimeServices {
         const prompt = String(input.prompt ?? '').trim();
         if (!prompt || prompt.length > 10_000)
           return { output: '子 Agent 任务无效', isError: true };
-        const workspace = input.worktree
-          ? fs.realpathSync(String(input.worktree))
-          : session.workspace;
+        let workspace: string;
+        try {
+          workspace = input.worktree ? fs.realpathSync(String(input.worktree)) : session.workspace;
+        } catch {
+          return { output: '工作树路径不存在', isError: true };
+        }
         if (input.worktree) {
           const parent = fs.realpathSync(path.join(dataDir(), 'worktrees'));
           if (!workspace.startsWith(parent + path.sep))
@@ -410,6 +461,14 @@ export class RuntimeServices {
   }
   async close(): Promise<void> {
     clearInterval(this.taskHeartbeat);
+    for (const id of this.claimedTasks) {
+      try {
+        this.store.releaseTask(id, this.taskOwner);
+      } catch {
+        /* Task may have already been finished or released. */
+      }
+    }
+    this.claimedTasks.clear();
     for (const task of this.background.values())
       if (task.status === 'running') task.controller.abort();
     for (const task of this.subagents.values())

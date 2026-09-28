@@ -349,6 +349,32 @@ test('services.execute returns isError for pre-execution validation and throws o
     assert.equal(badNameRes.isError, true);
     assert.match(badNameRes.output, /工作树名称必须以字母开头/);
 
+    // Deterministic pre-execution check: non-existent worktree path in remove_worktree
+    const removeRes = await services.execute(
+      {
+        id: 'w_rem',
+        name: 'remove_worktree',
+        input: { path: '/tmp/nonexistent-worktree-path-12345' },
+      },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(removeRes.isError, true);
+    assert.match(removeRes.output, /工作树路径不存在/);
+
+    // Deterministic pre-execution check: non-existent worktree path in spawn_subagent
+    const spawnRes = await services.execute(
+      {
+        id: 's_sub',
+        name: 'spawn_subagent',
+        input: { prompt: 'research', worktree: '/tmp/nonexistent-worktree-path-12345' },
+      },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(spawnRes.isError, true);
+    assert.match(spawnRes.output, /工作树路径不存在/);
+
     // Execution phase error: git worktree on non-git directory must throw so AgentRunner records tool_unknown
     await assert.rejects(
       services.execute(
@@ -361,5 +387,101 @@ test('services.execute returns isError for pre-execution validation and throws o
   } finally {
     await services.close();
     f.close();
+  }
+});
+
+test('services.close() releases claimed tasks back to pending state', async () => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'done', isError: false };
+    },
+    async close() {},
+  };
+  const task = f.store.createTask(f.session.id, 'Task to claim and release', []);
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  try {
+    const claimed = services.claimReadyTask(f.session);
+    assert.ok(claimed);
+    assert.equal(claimed.id, task.id);
+    assert.equal(f.store.getTask(f.session.id, task.id)?.status, 'running');
+
+    await services.close();
+    assert.equal(f.store.getTask(f.session.id, task.id)?.status, 'pending');
+    assert.equal(f.store.getTask(f.session.id, task.id)?.owner, undefined);
+  } finally {
+    f.close();
+  }
+});
+
+test('save_memory handles validation errors as isError in services.execute', async () => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'done', isError: false };
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  try {
+    const invalidKeyRes = await services.execute(
+      {
+        id: 'sm1',
+        name: 'save_memory',
+        input: { key: 'invalid key with spaces!', content: 'test' },
+      },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(invalidKeyRes.isError, true);
+    assert.match(invalidKeyRes.output, /记忆名称或内容无效/);
+
+    const emptyContentRes = await services.execute(
+      { id: 'sm2', name: 'save_memory', input: { key: 'valid_key', content: '   ' } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(emptyContentRes.isError, true);
+    assert.match(emptyContentRes.output, /记忆名称或内容无效/);
+
+    const validRes = await services.execute(
+      { id: 'sm3', name: 'save_memory', input: { key: 'valid_key', content: 'good content' } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(validRes.isError, false);
+    assert.equal(validRes.output, '工作区记忆已保存');
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
+
+test('save_memory rethrows unexpected store/database errors instead of returning isError', async () => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'done', isError: false };
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  try {
+    f.store.close();
+    await assert.rejects(
+      () =>
+        services.execute(
+          {
+            id: 'sm4',
+            name: 'save_memory',
+            input: { key: 'valid_key', content: 'test content' },
+          },
+          f.session,
+          new AbortController().signal,
+        ),
+      /database.*not open|SqliteError/i,
+    );
+  } finally {
+    await services.close();
   }
 });

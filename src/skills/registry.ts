@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-import { dataDir, loadConfig, saveConfig } from '../config.js';
+import { dataDir, loadConfig, saveConfig, updateConfig } from '../config.js';
 
 export interface SkillInfo {
   name: string;
@@ -37,7 +37,7 @@ function builtinSettings(): Record<string, boolean> {
 function setBuiltinEnabled(name: string, enabled: boolean): void {
   const settings = { ...builtinSettings(), [name]: enabled };
   fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
-  const temp = `${builtinSettingsPath()}.${process.pid}.tmp`;
+  const temp = `${builtinSettingsPath()}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(settings, null, 2), { mode: 0o600 });
   fs.renameSync(temp, builtinSettingsPath());
 }
@@ -251,10 +251,11 @@ export async function updateSkill(name: string): Promise<SkillInfo> {
 }
 export function addMarket(name: string, repo: string): void {
   sourceUrl(repo);
-  const cfg = loadConfig();
-  cfg.marketplaces = cfg.marketplaces.filter((x) => x.name !== name);
-  cfg.marketplaces.push({ name, source: repo });
-  saveConfig(cfg);
+  updateConfig((cfg) => {
+    cfg.marketplaces = cfg.marketplaces.filter((x) => x.name !== name);
+    cfg.marketplaces.push({ name, source: repo });
+    return cfg;
+  });
 }
 export interface MarketEntry {
   name: string;

@@ -34,16 +34,27 @@ export function formatModelError(err: unknown): string {
   const error = err as { message?: unknown; statusCode?: unknown; responseBody?: unknown } | null;
   const status = typeof error?.statusCode === 'number' ? `HTTP ${error.statusCode}: ` : '';
   let detail = '';
-  if (typeof error?.responseBody === 'string') {
-    try {
-      const body = JSON.parse(error.responseBody) as Record<string, unknown>;
+  if (error && typeof error === 'object') {
+    let body: Record<string, unknown> | null = null;
+    if (typeof error.responseBody === 'string') {
+      try {
+        body = JSON.parse(error.responseBody) as Record<string, unknown>;
+      } catch {
+        // Never expose an arbitrary response body, which might contain request data.
+      }
+    } else if (
+      error.responseBody &&
+      typeof error.responseBody === 'object' &&
+      !Array.isArray(error.responseBody)
+    ) {
+      body = error.responseBody as Record<string, unknown>;
+    }
+    if (body) {
       const nested = body.error;
       const source =
         nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : body;
       if (typeof source.message === 'string') detail = source.message;
       else if (typeof source.detail === 'string') detail = source.detail;
-    } catch {
-      // Never expose an arbitrary response body, which might contain request data.
     }
   }
   const fallback = typeof error?.message === 'string' ? error.message : String(err);
@@ -309,6 +320,7 @@ export class AgentRunner {
         });
         this.store.append(session.id, 'tool_started', { callId: call.id, name: call.name });
         let result: ToolResult;
+        let toolFinished = false;
         try {
           if (
             ['write_file', 'create_task', 'update_task'].includes(call.name) &&
@@ -374,6 +386,16 @@ export class AgentRunner {
                     signal,
                   );
           }
+          this.store.append(session.id, 'tool_finished', {
+            callId: call.id,
+            name: call.name,
+            output: result.output,
+            isError: result.isError,
+            exitCode: result.exitCode,
+            truncated: result.truncated,
+          });
+          toolFinished = true;
+          this.io.notice(`${call.name}: ${result.isError ? '失败' : '完成'}\n${result.output}`);
           if (
             this.services &&
             (!planState(this.store.events(session.id)).enabled ||
@@ -382,22 +404,15 @@ export class AgentRunner {
             await this.services.runHooks('after_tool', session, signal);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          this.store.append(session.id, 'tool_unknown', {
-            callId: call.id,
-            name: call.name,
-            output: message,
-          });
+          if (!toolFinished) {
+            this.store.append(session.id, 'tool_unknown', {
+              callId: call.id,
+              name: call.name,
+              output: message,
+            });
+          }
           throw err;
         }
-        this.store.append(session.id, 'tool_finished', {
-          callId: call.id,
-          name: call.name,
-          output: result.output,
-          isError: result.isError,
-          exitCode: result.exitCode,
-          truncated: result.truncated,
-        });
-        this.io.notice(`${call.name}: ${result.isError ? '失败' : '完成'}\n${result.output}`);
       }
       if (
         planState(this.store.events(session.id)).enabled &&

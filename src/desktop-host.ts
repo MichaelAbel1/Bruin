@@ -10,6 +10,7 @@ import {
   looksLikeApiKey,
   legacyKeyWasMigrated,
   saveConfig,
+  updateConfig,
   setRuntimeApiKey,
   validApiKeyEnv,
   mcpServerSchema,
@@ -52,7 +53,7 @@ const executor = new ProcessExecutor();
 let active: { sessionId: string; controller: AbortController } | undefined;
 let activeRun: Promise<unknown> | undefined;
 const approvals = new Map<string, (approved: boolean) => void>();
-const reviewed = new Set<string>();
+const reviewedUnknownSeq = new Map<string, number>();
 
 // Remove secrets accidentally persisted by older desktop versions from session profiles.
 const startupConfig = loadConfig();
@@ -120,10 +121,15 @@ function getSession(id: unknown): Session {
   return session;
 }
 function needsReview(id: string): boolean {
-  if (reviewed.has(id)) return false;
   const events = store.events(id);
   const lastCompleted = [...events].reverse().find((e) => e.type === 'turn_completed')?.seq ?? 0;
-  return events.some((e) => e.seq > lastCompleted && e.type === 'tool_unknown');
+  const uncompletedUnknowns = events.filter(
+    (e) => e.seq > lastCompleted && e.type === 'tool_unknown',
+  );
+  if (!uncompletedUnknowns.length) return false;
+  const lastUnknownSeq = uncompletedUnknowns.at(-1)!.seq;
+  const reviewedSeq = reviewedUnknownSeq.get(id) ?? -1;
+  return lastUnknownSeq > reviewedSeq;
 }
 function viewSession(session: Session) {
   const events = store.events(session.id);
@@ -173,6 +179,7 @@ async function startRun(
   const heartbeat = setInterval(() => {
     if (!store.renewLease(session.id, owner, 30_000)) controller.abort();
   }, 10_000);
+  heartbeat.unref();
   active = { sessionId: session.id, controller };
   event('runStarted', { sessionId: session.id });
   activeRun = runner
@@ -274,7 +281,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const session = getSession(p.sessionId);
       if (active?.sessionId === session.id) throw new Error('运行中的会话不能删除');
       store.deleteSession(session.id);
-      reviewed.delete(session.id);
+      reviewedUnknownSeq.delete(session.id);
       return store.listSessions();
     }
     case 'createSession': {
@@ -313,7 +320,13 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     }
     case 'reviewUnknown': {
       const session = getSession(p.sessionId);
-      reviewed.add(session.id);
+      const events = store.events(session.id);
+      const lastCompleted =
+        [...events].reverse().find((e) => e.type === 'turn_completed')?.seq ?? 0;
+      const lastUnknown = events
+        .filter((e) => e.seq > lastCompleted && e.type === 'tool_unknown')
+        .at(-1);
+      if (lastUnknown) reviewedUnknownSeq.set(session.id, lastUnknown.seq);
       return viewSession(session);
     }
     case 'send': {
@@ -393,20 +406,22 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'saveMcpServer': {
       if (active) throw new Error('请等待当前任务完成后再修改 MCP 服务器');
       const server = mcpServerSchema.parse(p);
-      const config = loadConfig();
       await services.mcp.disconnect(server.name);
-      config.mcpServers = config.mcpServers.filter((item) => item.name !== server.name);
-      config.mcpServers.push(server);
-      saveConfig(config);
+      const config = updateConfig((current) => {
+        current.mcpServers = current.mcpServers.filter((item) => item.name !== server.name);
+        current.mcpServers.push(server);
+        return current;
+      });
       return config.mcpServers;
     }
     case 'removeMcpServer': {
       if (active) throw new Error('请等待当前任务完成后再修改 MCP 服务器');
       const name = String(p.name ?? '');
       await services.mcp.disconnect(name);
-      const config = loadConfig();
-      config.mcpServers = config.mcpServers.filter((item) => item.name !== name);
-      saveConfig(config);
+      const config = updateConfig((current) => {
+        current.mcpServers = current.mcpServers.filter((item) => item.name !== name);
+        return current;
+      });
       return config.mcpServers;
     }
     case 'testMcpServer': {
@@ -419,21 +434,26 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'saveHook': {
       if (active) throw new Error('请等待当前任务完成后再修改 Hook');
       const hook = hookSchema.parse(p);
-      const config = loadConfig();
-      config.hooks = config.hooks.filter((item) => item.name !== hook.name);
-      config.hooks.push(hook);
-      saveConfig(config);
+      const config = updateConfig((current) => {
+        current.hooks = current.hooks.filter((item) => item.name !== hook.name);
+        current.hooks.push(hook);
+        return current;
+      });
       return config.hooks;
     }
     case 'removeHook': {
       if (active) throw new Error('请等待当前任务完成后再修改 Hook');
-      const config = loadConfig();
-      config.hooks = config.hooks.filter((item) => item.name !== p.name);
-      saveConfig(config);
+      const config = updateConfig((current) => {
+        current.hooks = current.hooks.filter((item) => item.name !== p.name);
+        return current;
+      });
       return config.hooks;
     }
     case 'runtimeTool': {
       const session = getSession(p.sessionId);
+      if (active?.sessionId === session.id)
+        throw new Error('当前会话正在运行任务，请等待完成后再执行操作');
+      if (store.isLeased(session.id)) throw new Error('此会话正在运行，请等待完成后再执行操作');
       const name = String(p.name ?? '') as ToolCall['name'];
       if (
         ![
@@ -518,18 +538,20 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         ...(baseUrl ? { baseUrl } : {}),
         ...(apiKeyEnv ? { apiKeyEnv } : {}),
       };
-      const config = loadConfig();
-      const previous = config.profiles.find((x) => x.alias === alias);
       if (
         store
           .listSessions()
           .some((session) => session.profile.alias === alias && store.isLeased(session.id))
       )
         throw new Error('该模型关联的会话正在另一个进程中运行');
-      config.profiles = config.profiles.filter((x) => x.alias !== alias);
-      config.profiles.push(profile);
-      config.defaultProfile ??= alias;
-      saveConfig(config);
+      let previous: ModelProfile | undefined;
+      const config = updateConfig((current) => {
+        previous = current.profiles.find((x) => x.alias === alias);
+        current.profiles = current.profiles.filter((x) => x.alias !== alias);
+        current.profiles.push(profile);
+        current.defaultProfile ??= alias;
+        return current;
+      });
       if (p.clearApiKey === true || (previous && previous.provider !== provider && !p.apiKey))
         setRuntimeApiKey(alias, undefined);
       else if (typeof p.apiKey === 'string' && p.apiKey) setRuntimeApiKey(alias, p.apiKey);
@@ -548,15 +570,15 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         if (JSON.stringify(session.profile) !== JSON.stringify(nextProfile))
           store.setProfile(session.id, nextProfile);
       }
-      return loadConfig();
+      return config;
     }
     case 'setDefaultModel': {
-      const config = loadConfig();
       const alias = String(p.alias ?? '');
-      if (!config.profiles.some((x) => x.alias === alias)) throw new Error('模型配置不存在');
-      config.defaultProfile = alias;
-      saveConfig(config);
-      return loadConfig();
+      return updateConfig((config) => {
+        if (!config.profiles.some((x) => x.alias === alias)) throw new Error('模型配置不存在');
+        config.defaultProfile = alias;
+        return config;
+      });
     }
     case 'removeProfile': {
       if (active) throw new Error('请等待当前任务完成后再删除模型配置');
@@ -567,14 +589,15 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           .some((session) => session.profile.alias === alias && store.isLeased(session.id))
       )
         throw new Error('该模型关联的会话正在另一个进程中运行');
-      const config = loadConfig();
-      if (!config.profiles.some((profile) => profile.alias === alias))
-        throw new Error('模型配置不存在');
-      config.profiles = config.profiles.filter((profile) => profile.alias !== alias);
-      if (config.defaultProfile === alias) config.defaultProfile = config.profiles[0]?.alias;
-      saveConfig(config);
+      const config = updateConfig((current) => {
+        if (!current.profiles.some((profile) => profile.alias === alias))
+          throw new Error('模型配置不存在');
+        current.profiles = current.profiles.filter((profile) => profile.alias !== alias);
+        if (current.defaultProfile === alias) current.defaultProfile = current.profiles[0]?.alias;
+        return current;
+      });
       setRuntimeApiKey(alias, undefined);
-      return loadConfig();
+      return config;
     }
     case 'listSkills':
       return listSkills();
@@ -616,7 +639,10 @@ async function scheduleTick() {
     const job = store.takeDueCronJobs(Date.now())[0];
     if (job) {
       const session = store.getSession(job.sessionId);
-      if (!session) return;
+      if (!session) {
+        store.markCronJob(job.id, 'session_missing');
+        return;
+      }
       try {
         await startRun(session, job.prompt);
         await activeRun;
@@ -664,12 +690,14 @@ async function scheduleTick() {
 const scheduler = setInterval(() => {
   void scheduleTick();
 }, 15_000);
+scheduler.unref();
 
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on('line', (line) => {
   let request: Request;
   try {
     request = JSON.parse(line) as Request;
+    if (!request || typeof request !== 'object' || typeof request.method !== 'string') return;
   } catch {
     return;
   }
@@ -689,6 +717,27 @@ async function shutdown() {
   await executor.close();
   store.close();
 }
+let shuttingDown = false;
+async function safeShutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await shutdown();
+  } catch (err) {
+    process.stderr.write(`Shutdown error: ${err instanceof Error ? err.message : String(err)}\n`);
+  } finally {
+    process.exit(code);
+  }
+}
+process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') void safeShutdown(0);
+});
 lines.on('close', () => {
-  void shutdown().then(() => process.exit(0));
+  void safeShutdown(0);
+});
+process.on('SIGINT', () => {
+  void safeShutdown(0);
+});
+process.on('SIGTERM', () => {
+  void safeShutdown(0);
 });

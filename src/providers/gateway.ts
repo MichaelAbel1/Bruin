@@ -163,14 +163,15 @@ export function resolveApiKey(profile: ModelProfile): string | undefined {
       } as const
     )[profile.provider];
   const key = getRuntimeApiKey(profile.alias) ?? process.env[keyName];
-  if (
-    !key &&
-    !(
-      profile.provider === 'openai-compatible' && profile.baseUrl?.startsWith('http://localhost:')
-    ) &&
-    !(profile.provider === 'openai-compatible' && profile.baseUrl?.startsWith('http://127.0.0.1:'))
-  )
-    throw new Error(`缺少 API Key 环境变量: ${keyName}`);
+  const isLocalCompatible =
+    profile.provider === 'openai-compatible' &&
+    (profile.baseUrl?.startsWith('http://localhost:') ||
+      profile.baseUrl?.startsWith('http://127.0.0.1:') ||
+      profile.baseUrl === 'http://localhost' ||
+      profile.baseUrl === 'http://127.0.0.1' ||
+      profile.baseUrl?.startsWith('http://[::1]:') ||
+      profile.baseUrl === 'http://[::1]');
+  if (!key && !isLocalCompatible) throw new Error(`缺少 API Key 环境变量: ${keyName}`);
   return key;
 }
 export function modelProtocol(profile: ModelProfile): string {
