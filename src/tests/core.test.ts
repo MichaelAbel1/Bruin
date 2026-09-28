@@ -1379,6 +1379,12 @@ test('loadConfig reports descriptive error on corrupted config file and saveConf
     fs.writeFileSync(configPath(), JSON.stringify({ profiles: 'not-an-array' }));
     assert.throws(() => loadConfig(), /配置文件格式无效/);
 
+    fs.writeFileSync(configPath(), 'null');
+    assert.throws(() => loadConfig(), /配置文件格式无效/);
+
+    fs.writeFileSync(configPath(), JSON.stringify({ profiles: [null] }));
+    assert.throws(() => loadConfig(), /配置文件格式无效/);
+
     saveConfig({ profiles: [], marketplaces: [], mcpServers: [], hooks: [] });
     const loaded = loadConfig();
     assert.deepEqual(loaded.profiles, []);

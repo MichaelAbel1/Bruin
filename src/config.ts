@@ -93,8 +93,12 @@ export function loadConfig(): AppConfig {
       `配置文件解析失败 (${configPath()}): ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`配置文件格式无效 (${configPath()}): 根节点必须是对象`);
+  }
   let migrated = false;
-  for (const profile of raw.profiles ?? []) {
+  for (const profile of Array.isArray(raw.profiles) ? raw.profiles : []) {
+    if (profile === null || typeof profile !== 'object') continue;
     const value = profile.apiKeyEnv;
     if (typeof value !== 'string' || validApiKeyEnv(value)) continue;
     // Older desktop versions allowed a key to be entered as an environment variable name.
