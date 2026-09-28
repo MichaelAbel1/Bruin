@@ -318,6 +318,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const profile = findProfile(alias);
       const selected = String(p.workspace ?? '').trim();
       if (selected) {
+        if (!fs.existsSync(selected)) throw new Error('工作区目录不存在');
         const workspace = fs.realpathSync(selected);
         if (!fs.statSync(workspace).isDirectory()) throw new Error('工作区必须是目录');
         return viewSession(store.createSession(workspace, profile));
@@ -561,6 +562,14 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       )
         throw new Error('模型配置不完整');
       if (provider === 'openai-compatible' && !baseUrl) throw new Error('兼容接口需要 Base URL');
+      if (baseUrl) {
+        try {
+          const u = new URL(baseUrl);
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error();
+        } catch {
+          throw new Error('Base URL 必须是以 http:// 或 https:// 开头的有效网址');
+        }
+      }
       const apiKeyEnv = String(p.apiKeyEnv ?? '').trim() || undefined;
       const existingProfile = loadConfig().profiles.find((item) => item.alias === alias);
       const contextWindowTokens = Number(

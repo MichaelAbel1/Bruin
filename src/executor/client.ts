@@ -84,7 +84,12 @@ export class ProcessExecutor implements ToolExecutor {
 
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error('已取消'));
-      const abort = () => worker.child.send({ type: 'cancel', requestId: request.requestId });
+      const abort = () => {
+        try {
+          if (worker.child.connected)
+            worker.child.send({ type: 'cancel', requestId: request.requestId });
+        } catch {}
+      };
       signal?.addEventListener('abort', abort, { once: true });
       const pending: { resolve: (value: ToolResult) => void; reject: (reason: Error) => void } = {
         resolve: (value) => {

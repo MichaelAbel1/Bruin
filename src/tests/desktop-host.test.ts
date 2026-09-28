@@ -111,6 +111,19 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     const created = await request('createSession', { workspace: dir });
     assert.equal(created.session.workspace, fs.realpathSync(dir));
     assert.equal(created.session.profile.alias, 'local');
+    await assert.rejects(
+      request('createSession', { workspace: path.join(dir, 'non_existent_subdir') }),
+      /工作区目录不存在/,
+    );
+    await assert.rejects(
+      request('saveProfile', {
+        alias: 'bad-url',
+        provider: 'openai-compatible',
+        model: 'test',
+        baseUrl: 'not-a-valid-url',
+      }),
+      /Base URL 必须是以 http:\/\/ 或 https:\/\/ 开头的有效网址/,
+    );
     fs.writeFileSync(path.join(dir, 'preview.txt'), 'preview content');
     assert.ok(
       (await request('listWorkspaceEntries', { sessionId: created.session.id })).some(

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { AiSdkGateway, modelProtocol } from '../providers/gateway.js';
+import { AiSdkGateway, modelProtocol, resolveApiKey } from '../providers/gateway.js';
 import { setRuntimeApiKey } from '../config.js';
 
 test('custom OpenAI base URL uses chat completions', async () => {
@@ -206,4 +206,35 @@ test('OpenAI-compatible streamed tool call is normalized', async () => {
   } finally {
     server.close();
   }
+});
+
+test('modelProtocol safely handles malformed baseUrl without crashing', () => {
+  assert.equal(
+    modelProtocol({
+      alias: 'custom',
+      provider: 'openai',
+      model: 'gpt-4o',
+      baseUrl: 'not-a-valid-url',
+    }),
+    'openai-chat',
+  );
+  assert.equal(
+    modelProtocol({
+      alias: 'standard',
+      provider: 'openai',
+      model: 'gpt-4o',
+      baseUrl: 'https://api.openai.com/v1',
+    }),
+    'openai-responses',
+  );
+});
+
+test('resolveApiKey allows local 0.0.0.0 endpoints without API key', () => {
+  const profile = {
+    alias: 'local-docker',
+    provider: 'openai-compatible' as const,
+    model: 'llama3',
+    baseUrl: 'http://0.0.0.0:11434/v1',
+  };
+  assert.equal(resolveApiKey(profile), undefined);
 });

@@ -1978,3 +1978,17 @@ test('agent retries transient network errors such as ECONNRESET or fetch failed'
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('workspace file operations reject root directory and oversized content', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-root-check-'));
+  try {
+    assert.throws(() => readWorkspaceFile(dir, '.'), /路径不能是工作区根目录/);
+    assert.throws(() => writeWorkspaceFile(dir, '.', 'content'), /路径不能是工作区根目录/);
+    assert.throws(
+      () => writeWorkspaceFile(dir, 'huge.txt', 'x'.repeat(10_000_001)),
+      /单次写入文件大小不能超过 10MB/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

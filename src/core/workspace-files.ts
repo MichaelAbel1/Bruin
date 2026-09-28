@@ -52,7 +52,9 @@ export function readWorkspaceFile(
   relative: string,
 ): { path: string; content: string; truncated: boolean; baselineContent?: string } {
   if (!relative) throw new Error('请选择文件');
+  const root = fs.realpathSync(workspace);
   const target = checkedWorkspacePath(workspace, relative);
+  if (target === root) throw new Error('路径不能是工作区根目录');
   const fd = fs.openSync(
     target,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
@@ -67,7 +69,6 @@ export function readWorkspaceFile(
     const content = bytes.toString('utf8');
     let baselineContent: string | undefined;
     try {
-      const root = fs.realpathSync(workspace);
       const normRelative = path.relative(root, target).split(path.sep).join('/');
       const gitShow = execFileSync('git', ['show', `HEAD:${normRelative}`], {
         cwd: root,
@@ -91,9 +92,11 @@ export function writeWorkspaceFile(
   content: string,
 ): { path: string; size: number } {
   if (!relative) throw new Error('请选择文件');
-  const target = checkedWorkspacePath(workspace, relative, true);
-  const parent = path.dirname(target);
+  if (Buffer.byteLength(content) > 10_000_000) throw new Error('单次写入文件大小不能超过 10MB');
   const root = fs.realpathSync(workspace);
+  const target = checkedWorkspacePath(workspace, relative, true);
+  if (target === root) throw new Error('路径不能是工作区根目录');
+  const parent = path.dirname(target);
   let current = root;
   for (const component of path.relative(root, parent).split(path.sep).filter(Boolean)) {
     current = path.join(current, component);

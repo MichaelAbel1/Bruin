@@ -169,6 +169,8 @@ export function resolveApiKey(profile: ModelProfile): string | undefined {
       profile.baseUrl?.startsWith('http://127.0.0.1:') ||
       profile.baseUrl === 'http://localhost' ||
       profile.baseUrl === 'http://127.0.0.1' ||
+      profile.baseUrl?.startsWith('http://0.0.0.0:') ||
+      profile.baseUrl === 'http://0.0.0.0' ||
       profile.baseUrl?.startsWith('http://[::1]:') ||
       profile.baseUrl === 'http://[::1]');
   if (!key && !isLocalCompatible) throw new Error(`缺少 API Key 环境变量: ${keyName}`);
@@ -176,8 +178,12 @@ export function resolveApiKey(profile: ModelProfile): string | undefined {
 }
 export function modelProtocol(profile: ModelProfile): string {
   if (profile.provider === 'openai') {
-    if (!profile.baseUrl || new URL(profile.baseUrl).origin === 'https://api.openai.com')
-      return 'openai-responses';
+    if (!profile.baseUrl) return 'openai-responses';
+    try {
+      if (new URL(profile.baseUrl).origin === 'https://api.openai.com') return 'openai-responses';
+    } catch {
+      return 'openai-chat';
+    }
     return 'openai-chat';
   }
   return profile.provider === 'openai-compatible' ? 'openai-chat' : profile.provider;
