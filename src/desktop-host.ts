@@ -254,6 +254,11 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       store.retryTask(session.id, String(p.id ?? ''));
       return store.listTasks(session.id);
     }
+    case 'deleteTask': {
+      const session = getSession(p.sessionId);
+      store.deleteTask(session.id, String(p.id ?? ''));
+      return store.listTasks(session.id);
+    }
     case 'listCronJobs':
       return store.listCronJobs(getSession(p.sessionId).id);
     case 'createCronJob': {

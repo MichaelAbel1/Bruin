@@ -71,6 +71,7 @@ export interface EventStore {
   finishTask(id: string, owner: string, success: boolean): void;
   releaseTask(id: string, owner: string): void;
   retryTask(sessionId: string, id: string): void;
+  deleteTask(sessionId: string, id: string): void;
   createCronJob(sessionId: string, expression: string, prompt: string): CronJob;
   listCronJobs(sessionId: string): CronJob[];
   deleteCronJob(sessionId: string, id: string): void;
@@ -342,8 +343,21 @@ export class SqliteEventStore implements EventStore {
   }
   private syncTaskFiles(workspace: string): void {
     const tasks = this.taskRows(workspace);
-    if (!tasks.length) return;
     const directory = this.ensureTaskDirectory(workspace);
+    const validTaskFiles = new Set(tasks.map((t) => `${t.id}.json`));
+    try {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (
+          entry.isFile() &&
+          entry.name.endsWith('.json') &&
+          !entry.name.startsWith('.') &&
+          !validTaskFiles.has(entry.name)
+        ) {
+          fs.unlinkSync(path.join(directory, entry.name));
+        }
+      }
+    } catch {}
+    if (!tasks.length) return;
     for (const task of tasks) {
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(task.id)) throw new Error('任务 ID 无法用作快照文件名');
       if (fs.realpathSync(directory) !== directory) throw new Error('.tasks 目录已被替换');
@@ -577,6 +591,33 @@ export class SqliteEventStore implements EventStore {
       )
       .run(new Date().toISOString(), id, workspace);
     if (!result.changes) throw new Error('只有失败或结果未知的任务可以重试');
+    this.repairTaskFiles(workspace);
+  }
+  deleteTask(sessionId: string, id: string): void {
+    const workspace = this.taskWorkspace(sessionId);
+    const directory = path.join(fs.realpathSync(workspace), '.tasks');
+    const filename = path.join(directory, `${id}.json`);
+    this.db.transaction(() => {
+      const task = this.db
+        .prepare('SELECT status, owner FROM workspace_tasks WHERE id = ? AND workspace = ?')
+        .get(id, workspace) as { status: string; owner: string | null } | undefined;
+      if (!task) throw new Error('任务不存在或不属于当前工作区');
+      if (task.status === 'running') throw new Error('正在执行中的任务不能删除');
+      const dependent = this.taskRows(workspace).find((t) => t.dependencies.includes(id));
+      if (dependent) throw new Error(`无法删除被任务 "${dependent.title}" 依赖的任务`);
+      this.db
+        .prepare('DELETE FROM workspace_tasks WHERE id = ? AND workspace = ?')
+        .run(id, workspace);
+    })();
+    if (fs.existsSync(filename)) {
+      try {
+        fs.unlinkSync(filename);
+      } catch (error) {
+        throw new Error(
+          `删除任务快照文件失败: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
     this.repairTaskFiles(workspace);
   }
   private rowToCronJob(row: any): CronJob {

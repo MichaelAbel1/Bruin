@@ -4,15 +4,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { SqliteEventStore } from '../storage/event-store.js';
+import Database from 'better-sqlite3';
 import { buildPrompt } from '../core/history.js';
 import { decisionFor } from '../core/permissions.js';
 import { AgentRunner, formatModelError } from '../core/agent.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
-import type { ModelProfile, ToolResult } from '../core/types.js';
+import type { ModelProfile, SessionEvent, ToolResult } from '../core/types.js';
 import { ProcessExecutor } from '../executor/client.js';
 import { installLocal, listSkills, loadSkill } from '../skills/registry.js';
 import { getRuntimeApiKey, loadConfig, setRuntimeApiKey } from '../config.js';
+import { loadInstructions } from '../core/instructions.js';
+import { listWorkspaceEntries, readWorkspaceFile } from '../core/workspace-files.js';
 
 const profile: ModelProfile = {
   alias: 'mock',
@@ -23,6 +26,99 @@ const profile: ModelProfile = {
 function temp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-test-'));
 }
+test('global and project instructions load without following symlinks', () => {
+  const dir = temp();
+  const workspace = path.join(dir, 'project');
+  fs.mkdirSync(workspace);
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  try {
+    fs.mkdirSync(process.env.BRUIN_HOME);
+    fs.writeFileSync(path.join(process.env.BRUIN_HOME, 'AGENTS.md'), 'Global rule');
+    fs.writeFileSync(path.join(workspace, 'AGENTS.md'), 'Project rule');
+    const instructions = loadInstructions(workspace);
+    assert.match(instructions, /Global rule/);
+    assert.match(instructions, /Project rule/);
+    fs.unlinkSync(path.join(workspace, 'AGENTS.md'));
+    fs.symlinkSync(
+      path.join(process.env.BRUIN_HOME, 'AGENTS.md'),
+      path.join(workspace, 'AGENTS.md'),
+    );
+    assert.throws(() => loadInstructions(workspace));
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('user preferences are durable, exact quotes and removable', () => {
+  const dir = temp();
+  const filename = path.join(dir, 'db.sqlite');
+  let store = new SqliteEventStore(filename);
+  const session = store.createSession(dir, profile);
+  store.append(session.id, 'user', { text: '以后请用中文回答。' });
+  const preference = store.savePreference(session.id, '以后请用中文回答');
+  assert.throws(() => store.savePreference(session.id, '推测的偏好'));
+  store.close();
+  store = new SqliteEventStore(filename);
+  assert.equal(store.listPreferences()[0].content, '以后请用中文回答');
+  store.deletePreference(preference.id);
+  assert.equal(store.listPreferences().length, 0);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+test('agent automatically captures explicit preference and loads it on next turn', async () => {
+  const dir = temp();
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  const prompts: string[] = [];
+  const gateway: ModelGateway = {
+    async complete(_profile, messages) {
+      prompts.push(JSON.stringify(messages));
+      return { text: 'OK', calls: [] };
+    },
+  };
+  const executor = {
+    async execute(): Promise<ToolResult> {
+      throw new Error('unexpected');
+    },
+    async close() {},
+  } as ToolExecutor;
+  const runner = new AgentRunner(store, gateway, executor, {
+    text() {},
+    notice() {},
+    async approve() {
+      return false;
+    },
+  });
+  try {
+    await runner.run(session, '以后请用中文回答。');
+    assert.equal(store.listPreferences()[0].content, '以后请用中文回答');
+    await runner.run(session, '继续');
+    assert.match(prompts[1], /User preferences saved locally/);
+  } finally {
+    store.close();
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('workspace file browser bounds reads and refuses escapes', () => {
+  const dir = temp();
+  fs.mkdirSync(path.join(dir, 'src'));
+  fs.writeFileSync(path.join(dir, 'src', 'main.ts'), 'hello');
+  fs.symlinkSync(os.homedir(), path.join(dir, 'outside'));
+  assert.deepEqual(
+    listWorkspaceEntries(dir).map((entry) => entry.name),
+    ['src'],
+  );
+  assert.equal(readWorkspaceFile(dir, 'src/main.ts').content, 'hello');
+  assert.throws(() => readWorkspaceFile(dir, '../outside'));
+  assert.throws(() => listWorkspaceEntries(dir, 'outside'));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 test('SQLite event ordering and durable restart', () => {
   const dir = temp();
   const db = path.join(dir, 'events.sqlite');
@@ -98,6 +194,188 @@ test('model switch discards old provider-specific message format', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('session leases prevent a second process from running or deleting the same session', () => {
+  const dir = temp();
+  const filename = path.join(dir, 'db.sqlite');
+  const first = new SqliteEventStore(filename);
+  const second = new SqliteEventStore(filename);
+  try {
+    const session = first.createSession(dir, profile);
+    first.acquireLease(session.id, 'first', 30_000);
+    assert.throws(() => second.acquireLease(session.id, 'second', 30_000), /另一个进程/);
+    assert.throws(() => second.deleteSession(session.id), /运行中/);
+    assert.equal(first.renewLease(session.id, 'first', 30_000), true);
+    first.releaseLease(session.id, 'first');
+    second.acquireLease(session.id, 'second', 30_000);
+    second.releaseLease(session.id, 'second');
+    second.deleteSession(session.id);
+    assert.equal(first.getSession(session.id), undefined);
+  } finally {
+    first.close();
+    second.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('task graph claims are atomic across stores and depend on completed parents', () => {
+  const dir = temp();
+  const filename = path.join(dir, 'db.sqlite');
+  const first = new SqliteEventStore(filename);
+  const second = new SqliteEventStore(filename);
+  try {
+    const session = first.createSession(dir, profile);
+    const parent = first.createTask(session.id, 'Investigate', []);
+    const child = first.createTask(session.id, 'Implement', [parent.id]);
+    assert.throws(
+      () => first.updateTask(session.id, parent.id, { addBlockedBy: [child.id] }),
+      /形成环/,
+    );
+    assert.equal(
+      first.updateTask(session.id, child.id, { description: 'Implementation details' }).description,
+      'Implementation details',
+    );
+    const parentFile = JSON.parse(
+      fs.readFileSync(path.join(dir, '.tasks', `${parent.id}.json`), 'utf8'),
+    );
+    assert.deepEqual(parentFile.blocks, [child.id]);
+    assert.deepEqual(parentFile.blockedBy, []);
+    assert.throws(() => first.createTask(session.id, 'Bad', ['missing']), /依赖任务不存在/);
+    assert.equal(second.claimTask(session.id, 'second', 5000)?.id, parent.id);
+    assert.equal(first.claimTask(session.id, 'first', 5000), undefined);
+    assert.throws(() => first.finishTask(parent.id, 'first', true), /租约/);
+    second.finishTask(parent.id, 'second', true);
+    assert.equal(first.claimTask(session.id, 'first', 5000)?.id, child.id);
+    first.finishTask(child.id, 'first', true);
+    assert.deepEqual(
+      second.listTasks(session.id).map((task) => task.status),
+      ['completed', 'completed'],
+    );
+  } finally {
+    first.close();
+    second.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('workspace task files survive sessions and expose full task details', () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const first = store.createSession(dir, profile);
+    const second = store.createSession(dir, profile);
+    const task = store.createTask(first.id, 'Schema', [], 'Create database tables');
+    assert.equal(store.getTask(second.id, task.id)?.description, 'Create database tables');
+    assert.equal(store.claimTask(second.id, 'second', 5000)?.id, task.id);
+    store.finishTask(task.id, 'second', true);
+    store.deleteSession(first.id);
+    assert.equal(store.listTasks(second.id)[0].status, 'completed');
+    const snapshot = JSON.parse(
+      fs.readFileSync(path.join(dir, '.tasks', `${task.id}.json`), 'utf8'),
+    );
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.description, 'Create database tables');
+    fs.unlinkSync(path.join(dir, '.tasks', `${task.id}.json`));
+    store.listTasks(second.id);
+    assert.equal(fs.existsSync(path.join(dir, '.tasks', `${task.id}.json`)), false);
+    store.syncTasks(second.id);
+    assert.equal(fs.existsSync(path.join(dir, '.tasks', `${task.id}.json`)), true);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('task snapshots reject a symlinked .tasks directory', () => {
+  const dir = temp();
+  const outside = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    fs.symlinkSync(outside, path.join(dir, '.tasks'));
+    assert.throws(() => store.createTask(session.id, 'Blocked', []), /真实目录/);
+    assert.deepEqual(store.listTasks(session.id), []);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+test('version 5 task nodes migrate to workspace tasks without deleting task data', () => {
+  const dir = temp();
+  const filename = path.join(dir, 'db.sqlite');
+  const raw = new Database(filename);
+  try {
+    raw.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, profile_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE task_nodes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT NOT NULL, dependencies_json TEXT NOT NULL, status TEXT NOT NULL, owner TEXT, expires_at INTEGER, created_at TEXT NOT NULL);
+      PRAGMA user_version = 5;`);
+    raw
+      .prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?)')
+      .run('session', dir, JSON.stringify(profile), '2026-01-01', '2026-01-01');
+    raw
+      .prepare('INSERT INTO task_nodes VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('legacy', 'session', 'Old task', '[]', 'pending', null, null, '2026-01-01');
+  } finally {
+    raw.close();
+  }
+  const store = new SqliteEventStore(filename);
+  try {
+    assert.equal(store.listTasks('session')[0]?.title, 'Old task');
+    store.syncTasks('session');
+    assert.ok(fs.existsSync(path.join(dir, '.tasks', 'legacy.json')));
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('workspace memory and cron schedule survive reopen', () => {
+  const dir = temp();
+  const filename = path.join(dir, 'db.sqlite');
+  let store = new SqliteEventStore(filename);
+  try {
+    const session = store.createSession(dir, profile);
+    store.saveMemory(dir, 'conventions', 'Use npm test');
+    const job = store.createCronJob(session.id, '* * * * *', 'Check status');
+    store.close();
+    store = new SqliteEventStore(filename);
+    assert.equal(store.listMemory(dir)[0]?.content, 'Use npm test');
+    assert.equal(store.listCronJobs(session.id)[0]?.id, job.id);
+    assert.equal(store.takeDueCronJobs(job.nextRunAt)[0]?.id, job.id);
+    assert.equal(store.takeDueCronJobs(job.nextRunAt).length, 0);
+    assert.ok(store.listCronJobs(session.id)[0].nextRunAt > job.nextRunAt);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('expired task requires explicit retry before another process can claim it', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    const task = store.createTask(session.id, 'Potentially side effecting', []);
+    assert.equal(store.claimTask(session.id, 'first', 1000)?.id, task.id);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal(store.claimTask(session.id, 'second', 1000), undefined);
+    assert.equal(store.listTasks(session.id)[0].status, 'unknown');
+    store.retryTask(session.id, task.id);
+    assert.equal(store.claimTask(session.id, 'second', 1000)?.id, task.id);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('legacy key values are redacted from persisted session events', () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const secret = 'sk-test-legacy-exposed-value';
+    const session = store.createSession(dir, { ...profile, apiKeyEnv: secret });
+    store.append(session.id, 'model_error', { message: `Provider rejected ${secret}` });
+    assert.equal(store.scrubSecrets([secret]), 2);
+    assert.doesNotMatch(JSON.stringify(store.getSession(session.id)), /sk-test-legacy/);
+    assert.doesNotMatch(JSON.stringify(store.events(session.id)), /sk-test-legacy/);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('history reconstructs messages when provider protocol changes', () => {
   const events = [
     {
@@ -121,6 +399,37 @@ test('history reconstructs messages when provider protocol changes', () => {
     role: 'assistant',
     content: 'raw Responses message',
   });
+});
+test('history bounds older turns and oversized tool output', () => {
+  const events = [] as Array<ReturnType<SqliteEventStore['append']>>;
+  for (let i = 0; i < 10; i++) {
+    events.push({
+      sessionId: 's',
+      seq: i * 2 + 1,
+      type: 'user',
+      at: '',
+      payload: { text: `turn ${i}` },
+    });
+    events.push({
+      sessionId: 's',
+      seq: i * 2 + 2,
+      type: 'assistant',
+      at: '',
+      payload: { text: 'x'.repeat(20000) },
+    });
+  }
+  events.push({
+    sessionId: 's',
+    seq: 21,
+    type: 'tool_finished',
+    at: '',
+    payload: { callId: 'call', name: 'shell', output: 'z'.repeat(50000) },
+  });
+  const prompt = buildPrompt(events, 'system');
+  assert.ok(JSON.stringify(prompt).length < 130000);
+  assert.match(JSON.stringify(prompt), /Earlier conversation summary/);
+  assert.ok(JSON.stringify(prompt).includes('z'.repeat(1000)));
+  assert.ok(!JSON.stringify(prompt).includes('z'.repeat(13000)));
 });
 test('model error includes structured API detail without dumping arbitrary body', () => {
   assert.equal(
@@ -326,6 +635,43 @@ test('agent persists request, approval and result before continuing', async () =
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+test('agent rejects malformed tool input before approval or execution', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  let calls = 0;
+  let approvals = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      calls++;
+      return calls === 1
+        ? { text: '', calls: [{ id: 'bad', name: 'write_file', input: { path: 5, content: 'x' } }] }
+        : { text: 'done', calls: [] };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('must not execute');
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        approvals++;
+        return true;
+      },
+    });
+    await runner.run(session, 'write it');
+    assert.equal(approvals, 0);
+    assert.ok(store.events(session.id).some((event) => event.type === 'tool_denied'));
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('model errors redact the active API key before persistence and display', async () => {
   const dir = temp();
   const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
@@ -358,6 +704,162 @@ test('model errors redact the active API key before persistence and display', as
     assert.doesNotMatch(JSON.stringify(store.events(session.id)), /test-only-provider-secret/);
   } finally {
     setRuntimeApiKey(profile.alias, undefined);
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('buildPrompt heals dangling tool calls and preserves tool actions in summary', () => {
+  const events: SessionEvent[] = [
+    {
+      sessionId: 's',
+      seq: 1,
+      type: 'user',
+      at: '',
+      payload: { text: 'read it' },
+    },
+    {
+      sessionId: 's',
+      seq: 2,
+      type: 'assistant',
+      at: '',
+      payload: {
+        text: 'calling two tools',
+        calls: [
+          { id: 'c1', name: 'read_file', input: { path: 'a.txt' } },
+          { id: 'c2', name: 'read_file', input: { path: 'b.txt' } },
+        ],
+      },
+    },
+    {
+      sessionId: 's',
+      seq: 3,
+      type: 'tool_finished',
+      at: '',
+      payload: { callId: 'c1', name: 'read_file', output: 'content of a' },
+    },
+    // Note: c2 is dangling (interrupted or process died before it finished)
+  ];
+  const prompt = buildPrompt(events, 'system instructions');
+  // Both c1 and c2 should have tool results so the LLM API never rejects with 400
+  const toolResults = prompt.filter((m) => m.role === 'tool');
+  assert.equal(toolResults.length, 2);
+  assert.match(JSON.stringify(toolResults[0]), /content of a/);
+  assert.match(JSON.stringify(toolResults[1]), /ERROR: Action interrupted/);
+
+  // Test providerMessages path also registers pending tool calls and heals dangling ones
+  const providerEvents: SessionEvent[] = [
+    {
+      sessionId: 's',
+      seq: 1,
+      type: 'user',
+      at: '',
+      payload: { text: 'run tools' },
+    },
+    {
+      sessionId: 's',
+      seq: 2,
+      type: 'assistant',
+      at: '',
+      payload: {
+        profileAlias: 'mock',
+        protocol: 'mock-protocol',
+        providerMessages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'using tools' },
+              {
+                type: 'tool-call',
+                toolCallId: 'pm-1',
+                toolName: 'read_file',
+                input: { path: 'a.txt' },
+              },
+            ],
+          },
+        ],
+        calls: [{ id: 'pm-1', name: 'read_file', input: { path: 'a.txt' } }],
+      },
+    },
+    // pm-1 dangling (no tool result event follows)
+  ];
+  const pmPrompt = buildPrompt(providerEvents, 'sys', 'mock', 'mock-protocol');
+  const pmToolResults = pmPrompt.filter((m) => m.role === 'tool');
+  assert.equal(pmToolResults.length, 1);
+  assert.match(JSON.stringify(pmToolResults[0]), /ERROR: Action interrupted/);
+});
+test('tasks can be deleted safely, clean up snapshots and prune orphans without breaking dependents', () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  try {
+    const parent = store.createTask(session.id, 'Parent Task', [], 'Parent desc');
+    const child = store.createTask(session.id, 'Child Task', [parent.id], 'Child desc');
+    assert.equal(store.listTasks(session.id).length, 2);
+    assert.ok(fs.existsSync(path.join(dir, '.tasks', `${parent.id}.json`)));
+
+    // Trying to delete parent should fail because child depends on it
+    assert.throws(() => store.deleteTask(session.id, parent.id), /无法删除被任务/);
+
+    // Deleting child should succeed and remove its snapshot
+    store.deleteTask(session.id, child.id);
+    assert.equal(store.listTasks(session.id).length, 1);
+    assert.ok(!fs.existsSync(path.join(dir, '.tasks', `${child.id}.json`)));
+
+    // Manually create an orphaned task file
+    const orphanFile = path.join(dir, '.tasks', 'orphan-task.json');
+    fs.writeFileSync(orphanFile, '{}');
+    assert.ok(fs.existsSync(orphanFile));
+    store.syncTasks(session.id);
+    // syncTasks should prune orphaned snapshot files
+    assert.ok(!fs.existsSync(orphanFile));
+
+    // Now deleting parent should succeed
+    store.deleteTask(session.id, parent.id);
+    assert.equal(store.listTasks(session.id).length, 0);
+    assert.ok(!fs.existsSync(path.join(dir, '.tasks', `${parent.id}.json`)));
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('step limit is bounded and leaves uncompleted turn state to allow UI resume', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  let stepCalls = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      stepCalls++;
+      return {
+        text: '',
+        calls: [{ id: `call-${stepCalls}`, name: 'read_file', input: { path: 'a.txt' } }],
+      };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'content', isError: false };
+    },
+    async close() {},
+  };
+  process.env.BRUIN_MAX_STEPS = '2';
+  try {
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'content');
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    });
+    await assert.rejects(runner.run(session, 'start loop'), /达到每轮最多 2 次模型调用的限制/);
+    assert.equal(stepCalls, 2);
+    const lastEvent = store.events(session.id).at(-1);
+    // Crucial: last event must NOT be turn_completed so desktop UI shows "继续未完成的运行"
+    assert.notEqual(lastEvent?.type, 'turn_completed');
+    assert.equal(lastEvent?.type, 'tool_finished');
+  } finally {
+    delete process.env.BRUIN_MAX_STEPS;
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }

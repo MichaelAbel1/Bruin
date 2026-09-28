@@ -109,6 +109,28 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     const created = await request('createSession', { workspace: dir });
     assert.equal(created.session.workspace, fs.realpathSync(dir));
     assert.equal(created.session.profile.alias, 'local');
+    fs.writeFileSync(path.join(dir, 'preview.txt'), 'preview content');
+    assert.ok(
+      (await request('listWorkspaceEntries', { sessionId: created.session.id })).some(
+        (entry: { name: string }) => entry.name === 'preview.txt',
+      ),
+    );
+    assert.equal(
+      (
+        await request('readWorkspaceFile', {
+          sessionId: created.session.id,
+          path: 'preview.txt',
+        })
+      ).content,
+      'preview content',
+    );
+    await assert.rejects(
+      request('readWorkspaceFile', {
+        sessionId: created.session.id,
+        path: '../outside',
+      }),
+      /路径超出工作区/,
+    );
     const opened = await request('openSession', { sessionId: created.session.id });
     assert.deepEqual(opened.events, []);
     assert.deepEqual(await request('discoverModels', { alias: 'local' }), ['other', 'test']);
@@ -175,6 +197,11 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     assert.equal(fs.readFileSync(path.join(dir, 'result.txt'), 'utf8'), 'created');
     assert.ok(events.some((event) => event.type === 'tool_approved'));
     assert.equal(events.at(-1).type, 'turn_completed');
+    const afterRemoval = await request('removeProfile', { alias: 'local' });
+    assert.deepEqual(afterRemoval.profiles, []);
+    assert.equal(afterRemoval.defaultProfile, undefined);
+    assert.deepEqual(await request('deleteSession', { sessionId: created.session.id }), []);
+    await assert.rejects(request('openSession', { sessionId: created.session.id }), /会话不存在/);
   } finally {
     child.stdin.end();
     await new Promise<void>((resolve) => {

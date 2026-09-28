@@ -104,6 +104,63 @@ test('planning mode persists approval and blocks mutations before approval', asy
     f.close();
   }
 });
+test('agent task creation requires approval and writes a workspace snapshot', async () => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('unused');
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  let turns = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      turns++;
+      return turns === 1
+        ? {
+            text: '',
+            calls: [
+              {
+                id: 'task',
+                name: 'create_task',
+                input: { title: 'Build API', description: 'Implement endpoints', dependencies: [] },
+              },
+            ],
+          }
+        : { text: 'done', calls: [] };
+    },
+  };
+  try {
+    const runner = new AgentRunner(
+      f.store,
+      gateway,
+      executor,
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return true;
+        },
+      },
+      services,
+    );
+    await runner.run(f.session, 'create task');
+    const task = f.store.listTasks(f.session.id)[0];
+    assert.equal(task.description, 'Implement endpoints');
+    assert.ok(fs.existsSync(path.join(f.dir, '.tasks', `${task.id}.json`)));
+    const cycle = await services.execute(
+      { id: 'bad', name: 'update_task', input: { id: task.id, addBlockedBy: [task.id] } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(cycle.isError, true);
+    assert.match(cycle.output, /形成环/);
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
 
 test('worktree, hooks, background task and read-only subagent use durable events', async () => {
   const f = fixture();
@@ -215,9 +272,25 @@ test('MCP stdio client lists and invokes a configured tool without inheriting se
       args: [script],
       envNames: [],
     };
-    const tools = await manager.listTools(server);
+    const sandboxWorks = (() => {
+      try {
+        execFileSync(
+          '/usr/bin/sandbox-exec',
+          ['-p', '(version 1) (allow default)', '/usr/bin/true'],
+          { stdio: 'ignore' },
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    if (!sandboxWorks) {
+      await assert.rejects(manager.listTools(server, dir), /沙箱不可用/);
+      return;
+    }
+    const tools = await manager.listTools(server, dir);
     assert.equal(tools[0].name, 'echo');
-    const result = await manager.callTool(server, 'echo', { text: 'hello' });
+    const result = await manager.callTool(server, 'echo', { text: 'hello' }, dir);
     assert.match(result.output, /hello/);
     assert.match(result.output, /inheritedSecret\\\":null/);
   } finally {

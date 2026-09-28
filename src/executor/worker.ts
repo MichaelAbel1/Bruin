@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import readline from 'node:readline';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
 
 function checkedPath(workspace: string, input: unknown, creating = false): string {
@@ -122,6 +123,120 @@ async function command(program: string, args: string[], req: ToolRequest): Promi
     });
   });
 }
+function hasBinary(binary: string): boolean {
+  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
+    try {
+      fs.accessSync(path.join(dir, binary), fs.constants.X_OK);
+      return true;
+    } catch {}
+  }
+  return false;
+}
+function matchGlob(filename: string, glob: string): boolean {
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return (
+    new RegExp(`^${escaped}$`, 'i').test(filename) ||
+    new RegExp(`^${escaped}$`, 'i').test(path.basename(filename))
+  );
+}
+async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
+  const root = fs.realpathSync(req.workspace);
+  const pattern = String(req.input.pattern ?? '');
+  const glob = typeof req.input.glob === 'string' && req.input.glob ? req.input.glob : undefined;
+  if (!pattern) return { output: '', isError: false, exitCode: 0 };
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let truncated = false;
+  let matchesCount = 0;
+  const appendMatch = (line: string): boolean => {
+    const buf = Buffer.from(line);
+    const remaining = Math.max(0, req.maxOutputBytes - size);
+    if (remaining) {
+      const part = buf.subarray(0, remaining);
+      chunks.push(part);
+      size += part.length;
+    }
+    if (buf.length > remaining) {
+      truncated = true;
+      return false;
+    }
+    matchesCount++;
+    return matchesCount < 100;
+  };
+  async function searchFile(fullPath: string, relPath: string): Promise<boolean> {
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.size > 5_000_000) return true;
+      const fd = fs.openSync(fullPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const header = Buffer.alloc(Math.min(512, stat.size));
+        const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
+        for (let j = 0; j < bytesRead; j++) {
+          if (header[j] === 0) return true;
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+      const rl = readline.createInterface({
+        input: fs.createReadStream(fullPath, { encoding: 'utf8' }),
+        crlfDelay: Infinity,
+      });
+      let lineNum = 0;
+      for await (const line of rl) {
+        lineNum++;
+        if (line.includes(pattern)) {
+          const formatted = `${relPath}:${lineNum}:${line}\n`;
+          if (!appendMatch(formatted)) {
+            rl.close();
+            return false;
+          }
+        }
+      }
+    } catch {}
+    return true;
+  }
+  async function walk(currentDir: string): Promise<boolean> {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      return true;
+    }
+    for (const entry of entries) {
+      if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.bruin')
+        continue;
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        try {
+          if (fs.lstatSync(fullPath).isSymbolicLink()) continue;
+        } catch {
+          continue;
+        }
+        if (!(await walk(fullPath))) return false;
+      } else if (entry.isFile()) {
+        try {
+          if (fs.lstatSync(fullPath).isSymbolicLink()) continue;
+        } catch {
+          continue;
+        }
+        const relPath = path.relative(root, fullPath);
+        if (glob && !matchGlob(relPath, glob)) continue;
+        if (!(await searchFile(fullPath, relPath))) return false;
+      }
+    }
+    return true;
+  }
+  await walk(root);
+  return {
+    output: Buffer.concat(chunks).toString('utf8') + (truncated ? '\n[输出已截断]' : ''),
+    truncated,
+    exitCode: matchesCount > 0 ? 0 : 1,
+    isError: false,
+  };
+}
 async function handle(req: ToolRequest): Promise<ToolResult> {
   if (Buffer.byteLength(JSON.stringify(req.input)) > 1_000_000) throw new Error('工具输入过大');
   if (!fs.statSync(req.workspace).isDirectory()) throw new Error('工作区不是目录');
@@ -171,6 +286,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       return { output: `已编辑 ${path.relative(req.workspace, file)}`, isError: false };
     }
     case 'search': {
+      if (!hasBinary('rg')) return fallbackSearch(req);
       const args = ['-n', '--max-count', '100'];
       if (typeof req.input.glob === 'string' && req.input.glob) args.push('--glob', req.input.glob);
       args.push('--', String(req.input.pattern ?? ''));

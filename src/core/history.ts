@@ -22,8 +22,37 @@ export function buildPrompt(
     const cut = userIndexes[firstTurn];
     const old = events
       .slice(0, cut)
-      .filter((e) => e.type === 'user' || e.type === 'assistant')
-      .map((e) => `${e.type}: ${String(e.payload.text ?? '').slice(0, 300)}`)
+      .filter((e) =>
+        [
+          'user',
+          'assistant',
+          'tool_finished',
+          'tool_denied',
+          'tool_unknown',
+          'plan_updated',
+        ].includes(e.type),
+      )
+      .map((e) => {
+        if (e.type === 'user' || e.type === 'assistant') {
+          return `${e.type}: ${String(e.payload.text ?? '').slice(0, 300)}`;
+        }
+        if (e.type === 'tool_finished') {
+          const name = String(e.payload.name ?? 'tool');
+          const status = e.payload.isError ? 'failed' : 'success';
+          const out = String(e.payload.output ?? '')
+            .slice(0, 150)
+            .replace(/[\r\n\t]+/g, ' ');
+          return `tool ${name} (${status}): ${out}`;
+        }
+        if (e.type === 'tool_denied') {
+          return `tool ${String(e.payload.name ?? '')} (denied): ${String(e.payload.output ?? '')}`;
+        }
+        if (e.type === 'tool_unknown') {
+          return `tool ${String(e.payload.name ?? '')} (interrupted)`;
+        }
+        return '';
+      })
+      .filter(Boolean)
       .join('\n');
     events = [
       {
@@ -47,6 +76,26 @@ export function buildPrompt(
   );
   let remainingOldAttachmentText = 20_000;
   let remainingCurrentAttachmentText = 60_000;
+  const pendingCalls = new Map<string, ToolCall>();
+  const flushPendingCalls = () => {
+    for (const [id, call] of pendingCalls.entries()) {
+      messages.push({
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: id,
+            toolName: call.name,
+            output: {
+              type: 'text',
+              value: 'ERROR: Action interrupted or canceled before completion.',
+            },
+          },
+        ],
+      });
+    }
+    pendingCalls.clear();
+  };
   for (const event of events) {
     if (event.type === 'workspace_changed')
       messages.push({
@@ -54,6 +103,7 @@ export function buildPrompt(
         content: `The active workspace changed to ${String(event.payload.workspace ?? '')}. Earlier file references may belong to the previous workspace. Inspect the current workspace before editing.`,
       });
     if (event.type === 'user') {
+      flushPendingCalls();
       const quote = event.payload.quote as { text?: string; seq?: number } | undefined;
       const intro = `${quote?.text ? `引用本会话第 ${quote.seq} 条消息：\n${quote.text}\n\n` : ''}${String(event.payload.text ?? '')}`;
       const refs = Array.isArray(event.payload.attachments)
@@ -102,12 +152,16 @@ export function buildPrompt(
         messages.push({ role: 'user', content: parts });
       }
     }
-    if (event.type === 'summary')
+    if (event.type === 'summary') {
+      flushPendingCalls();
       messages.push({
         role: 'user',
         content: `Earlier conversation summary:\n${String(event.payload.text ?? '')}`,
       });
+    }
     if (event.type === 'assistant') {
+      flushPendingCalls();
+      const calls = (event.payload.calls ?? []) as ToolCall[];
       const raw = event.payload.providerMessages;
       if (
         event.seq > lastModelSwitchSeq &&
@@ -119,12 +173,35 @@ export function buildPrompt(
         raw.length &&
         JSON.stringify(raw).length < 30_000
       ) {
+        if (calls.length) {
+          for (const call of calls) pendingCalls.set(call.id, call);
+        } else {
+          for (const msg of raw as ModelMessage[]) {
+            if (Array.isArray(msg.content)) {
+              for (const part of msg.content) {
+                if (
+                  part &&
+                  typeof part === 'object' &&
+                  'type' in part &&
+                  (part as { type: string }).type === 'tool-call'
+                ) {
+                  const p = part as { toolCallId: string; toolName: string; input?: unknown };
+                  pendingCalls.set(p.toolCallId, {
+                    id: p.toolCallId,
+                    name: p.toolName as any,
+                    input: (p.input as Record<string, unknown>) ?? {},
+                  });
+                }
+              }
+            }
+          }
+        }
         messages.push(...(raw as ModelMessage[]));
         continue;
       }
-      const calls = (event.payload.calls ?? []) as ToolCall[];
       const text = String(event.payload.text ?? '').slice(0, 40_000);
-      if (calls.length)
+      if (calls.length) {
+        for (const call of calls) pendingCalls.set(call.id, call);
         messages.push({
           role: 'assistant',
           content: [
@@ -137,19 +214,21 @@ export function buildPrompt(
             })),
           ],
         });
-      else if (text) messages.push({ role: 'assistant', content: text });
+      } else if (text) messages.push({ role: 'assistant', content: text });
     }
     if (
       event.type === 'tool_finished' ||
       event.type === 'tool_unknown' ||
       event.type === 'tool_denied'
     ) {
+      const callId = String(event.payload.callId);
+      pendingCalls.delete(callId);
       messages.push({
         role: 'tool',
         content: [
           {
             type: 'tool-result',
-            toolCallId: String(event.payload.callId),
+            toolCallId: callId,
             toolName: String(event.payload.name),
             output: {
               type: 'text',
@@ -160,5 +239,6 @@ export function buildPrompt(
       });
     }
   }
+  flushPendingCalls();
   return messages;
 }

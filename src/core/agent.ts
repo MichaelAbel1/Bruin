@@ -118,7 +118,10 @@ export class AgentRunner {
         planState(this.store.events(session.id)).approved)
     )
       await this.services.runHooks('turn_started', session, signal);
-    for (let step = 0; step < 24; step++) {
+    const envSteps = Number(process.env.BRUIN_MAX_STEPS);
+    const maxSteps =
+      Number.isFinite(envSteps) && envSteps > 0 ? Math.min(Math.floor(envSteps), 100) : 24;
+    for (let step = 0; step < maxSteps; step++) {
       if (signal.aborted) throw new Error('已取消');
       const events = this.store.events(session.id);
       const plan = planState(events);
@@ -180,12 +183,35 @@ export class AgentRunner {
         modelProtocol(session.profile),
       );
       let reply;
-      try {
-        reply = await this.gateway.complete(session.profile, prompt, signal, (delta) =>
-          this.io.text(delta),
-        );
-      } catch (err) {
-        let message = formatModelError(err);
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let streamedChars = 0;
+        try {
+          reply = await this.gateway.complete(session.profile, prompt, signal, (delta) => {
+            streamedChars += delta.length;
+            this.io.text(delta);
+          });
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (signal.aborted) throw err;
+          const status = (err as { statusCode?: number })?.statusCode;
+          if (
+            attempt < 2 &&
+            streamedChars === 0 &&
+            (status === 429 || status === 500 || status === 502 || status === 503 || status === 529)
+          ) {
+            const backoff = (attempt + 1) * 1000;
+            this.io.notice(`模型服务暂忙 (HTTP ${status})，将在 ${backoff / 1000}s 后重试...`);
+            await new Promise((r) => setTimeout(r, backoff));
+            continue;
+          }
+          break;
+        }
+      }
+      if (lastErr) {
+        let message = formatModelError(lastErr);
         try {
           const key = resolveApiKey(session.profile);
           if (key) message = message.replaceAll(key, '[REDACTED]');
@@ -198,14 +224,14 @@ export class AgentRunner {
         throw new Error(message);
       }
       this.store.append(session.id, 'assistant', {
-        text: reply.text,
-        calls: reply.calls,
-        usage: reply.usage,
+        text: reply!.text,
+        calls: reply!.calls,
+        usage: reply!.usage,
         profileAlias: session.profile.alias,
         protocol: modelProtocol(session.profile),
-        providerMessages: reply.providerMessages,
+        providerMessages: reply!.providerMessages,
       });
-      if (!reply.calls.length) {
+      if (!reply!.calls.length) {
         this.store.append(session.id, 'turn_completed', {});
         if (
           this.services &&
@@ -215,7 +241,7 @@ export class AgentRunner {
           await this.services.runHooks('turn_finished', session, signal);
         return;
       }
-      for (const call of reply.calls) {
+      for (const call of reply!.calls) {
         this.store.append(session.id, 'tool_requested', {
           callId: call.id,
           name: call.name,
@@ -224,7 +250,12 @@ export class AgentRunner {
         const schema = toolSchemas[call.name];
         const parsed = schema?.inputSchema.safeParse(call.input);
         if (!parsed?.success) {
-          const reason = '工具参数不符合 schema';
+          const detail = parsed?.error
+            ? parsed.error.issues
+                .map((i) => `${i.path.join('.') || 'input'}: ${i.message}`)
+                .join('; ')
+            : '';
+          const reason = `工具参数不符合 schema${detail ? `: ${detail}` : ''}`;
           this.store.append(session.id, 'tool_denied', {
             callId: call.id,
             name: call.name,
@@ -342,12 +373,12 @@ export class AgentRunner {
       if (
         planState(this.store.events(session.id)).enabled &&
         !planState(this.store.events(session.id)).approved &&
-        reply.calls.some((call) => call.name === 'update_plan')
+        reply!.calls.some((call) => call.name === 'update_plan')
       ) {
         this.store.append(session.id, 'turn_completed', { awaitingPlanApproval: true });
         return;
       }
     }
-    throw new Error('达到每轮最多 24 次模型调用的限制');
+    throw new Error(`达到每轮最多 ${maxSteps} 次模型调用的限制`);
   }
 }

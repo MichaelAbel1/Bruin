@@ -43,6 +43,43 @@ test('custom OpenAI base URL uses chat completions', async () => {
   }
 });
 
+test('text encoded think blocks do not reach streaming UI or final answer', async () => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const content of ['<thi', 'nk>private reasoning', '</think>', 'Final answer'])
+      res.write(
+        `data: ${JSON.stringify({ id: '1', object: 'chat.completion.chunk', created: 1, model: 'mock', choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`,
+      );
+    res.write(
+      `data: ${JSON.stringify({ id: '1', object: 'chat.completion.chunk', created: 1, model: 'mock', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`,
+    );
+    res.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('no address');
+  let streamed = '';
+  try {
+    const reply = await new AiSdkGateway().complete(
+      {
+        alias: 'think-test',
+        provider: 'openai-compatible',
+        model: 'mock',
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      },
+      [{ role: 'user', content: 'hi' }],
+      new AbortController().signal,
+      (delta) => {
+        streamed += delta;
+      },
+    );
+    assert.equal(streamed, 'Final answer');
+    assert.equal(reply.text, streamed);
+  } finally {
+    server.close();
+  }
+});
+
 test('OpenAI-compatible SSE stream is normalized', async () => {
   const server = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
