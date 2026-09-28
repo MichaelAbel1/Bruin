@@ -4,7 +4,7 @@ import type { EventStore } from '../storage/event-store.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { Session, ToolCall, ToolResult } from './types.js';
-import { buildPrompt } from './history.js';
+import { budgetPrompt, buildPrompt } from './history.js';
 import { decisionFor } from './permissions.js';
 import { listSkills, loadSkill } from '../skills/registry.js';
 import { modelProtocol, resolveApiKey, toolSchemas } from '../providers/gateway.js';
@@ -95,17 +95,23 @@ export class AgentRunner {
   /** Reconcile incomplete tool calls. Never automatically repeat an uncertain external action. */
   recover(session: Session): number {
     const events = this.store.events(session.id);
-    const calls = new Map<string, ToolCall>();
-    const finished = new Set<string>();
+    const pending = new Map<string, ToolCall[]>();
     for (const event of events) {
       if (event.type === 'assistant')
-        for (const call of (event.payload.calls ?? []) as ToolCall[]) calls.set(call.id, call);
-      if (['tool_finished', 'tool_unknown', 'tool_denied'].includes(event.type))
-        finished.add(String(event.payload.callId));
+        for (const call of (event.payload.calls ?? []) as ToolCall[]) {
+          const queue = pending.get(call.id) ?? [];
+          queue.push(call);
+          pending.set(call.id, queue);
+        }
+      if (['tool_finished', 'tool_unknown', 'tool_denied'].includes(event.type)) {
+        const queue = pending.get(String(event.payload.callId));
+        queue?.shift();
+        if (queue?.length === 0) pending.delete(String(event.payload.callId));
+      }
     }
     let unknown = 0;
-    for (const call of calls.values())
-      if (!finished.has(call.id)) {
+    for (const queue of pending.values())
+      for (const call of queue) {
         this.store.append(session.id, 'tool_unknown', {
           callId: call.id,
           name: call.name,
@@ -191,21 +197,25 @@ export class AgentRunner {
       const preferenceInstruction = preferences
         ? `\nUser preferences saved locally (apply when relevant; the current user request takes precedence):\n${preferences}`
         : '';
-      const prompt = buildPrompt(
-        events,
-        systemPrompt(session.workspace) +
-          loadInstructions(session.workspace) +
-          '\nRemember only explicit, lasting user preferences with remember_preference; never store secrets or infer preferences.' +
-          (this.readOnly
-            ? '\nYou are a read-only subagent. Research and report; never modify files or invoke external tools.'
-            : '') +
-          planInstruction +
-          mcpInstruction +
-          taskInstruction +
-          memoryInstruction +
-          preferenceInstruction,
-        session.profile.alias,
-        modelProtocol(session.profile),
+      const prompt = budgetPrompt(
+        buildPrompt(
+          events,
+          systemPrompt(session.workspace) +
+            loadInstructions(session.workspace) +
+            '\nRemember only explicit, lasting user preferences with remember_preference; never store secrets or infer preferences.' +
+            (this.readOnly
+              ? '\nYou are a read-only subagent. Research and report; never modify files or invoke external tools.'
+              : '') +
+            planInstruction +
+            mcpInstruction +
+            taskInstruction +
+            memoryInstruction +
+            preferenceInstruction,
+          session.profile.alias,
+          modelProtocol(session.profile),
+          Math.max(100_000, (session.profile.contextWindowTokens ?? 32_768) * 3),
+        ),
+        session.profile.contextWindowTokens ?? 32_768,
       );
       let reply;
       let lastErr: unknown;
@@ -252,6 +262,18 @@ export class AgentRunner {
         this.store.append(session.id, 'model_error', {
           message,
         });
+        throw new Error(message);
+      }
+      const callIds = new Set<string>();
+      if (
+        reply!.calls.some((call) => {
+          if (!call.id || callIds.has(call.id)) return true;
+          callIds.add(call.id);
+          return false;
+        })
+      ) {
+        const message = '模型返回了空白或重复的工具调用 ID，已拒绝执行该批工具';
+        this.store.append(session.id, 'model_error', { message });
         throw new Error(message);
       }
       this.store.append(session.id, 'assistant', {

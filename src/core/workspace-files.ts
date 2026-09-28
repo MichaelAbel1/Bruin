@@ -93,14 +93,30 @@ export function writeWorkspaceFile(
   if (!relative) throw new Error('请选择文件');
   const target = checkedWorkspacePath(workspace, relative, true);
   const parent = path.dirname(target);
-  fs.mkdirSync(parent, { recursive: true });
+  const root = fs.realpathSync(workspace);
+  let current = root;
+  for (const component of path.relative(root, parent).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    try {
+      fs.mkdirSync(current, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    const stat = fs.lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new Error('父路径不是工作区内的真实目录');
+  }
+  checkedWorkspacePath(workspace, parent);
+  const parentStat = fs.lstatSync(parent);
   let mode = 0o644;
+  let expected: fs.Stats | null = null;
   try {
     const stat = fs.lstatSync(target);
     if (stat.isSymbolicLink()) throw new Error('不允许修改符号链接');
     if (stat.isDirectory()) throw new Error('目标路径是一个目录');
     if (!stat.isFile()) throw new Error('只能写入普通文件');
     mode = stat.mode & 0o777;
+    expected = stat;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
@@ -122,6 +138,32 @@ export function writeWorkspaceFile(
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
+    checkedWorkspacePath(workspace, target, true);
+    const currentParent = fs.lstatSync(parent);
+    if (
+      !currentParent.isDirectory() ||
+      currentParent.isSymbolicLink() ||
+      currentParent.dev !== parentStat.dev ||
+      currentParent.ino !== parentStat.ino
+    )
+      throw new Error('写入期间父目录发生变化');
+    let currentTarget: fs.Stats | null = null;
+    try {
+      currentTarget = fs.lstatSync(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (
+      Boolean(currentTarget) !== Boolean(expected) ||
+      (currentTarget &&
+        expected &&
+        (currentTarget.isSymbolicLink() ||
+          currentTarget.dev !== expected.dev ||
+          currentTarget.ino !== expected.ino ||
+          currentTarget.size !== expected.size ||
+          currentTarget.mtimeMs !== expected.mtimeMs))
+    )
+      throw new Error('写入期间目标文件发生变化');
     fs.renameSync(temp, target);
   } finally {
     if (fd !== undefined) {

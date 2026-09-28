@@ -8,16 +8,22 @@ export function buildPrompt(
   system: string,
   profileAlias?: string,
   protocol?: string,
+  maxHistoryChars = 100_000,
 ): ModelMessage[] {
   // Keep whole turns within a conservative character budget. Durable events remain untouched.
   const userIndexes = events.flatMap((e, i) => (e.type === 'user' ? [i] : []));
-  const maxHistoryChars = 100_000;
   let firstTurn = Math.max(0, userIndexes.length - 10);
-  while (
-    firstTurn < userIndexes.length - 1 &&
-    JSON.stringify(events.slice(userIndexes[firstTurn])).length > maxHistoryChars
-  )
-    firstTurn++;
+  const firstEvent = userIndexes[firstTurn];
+  if (firstEvent !== undefined) {
+    const eventSizes = events.slice(firstEvent).map((event) => JSON.stringify(event).length);
+    let tailChars = 2 + eventSizes.reduce((sum, size) => sum + size + 1, -1);
+    while (firstTurn < userIndexes.length - 1 && tailChars > maxHistoryChars) {
+      const removed = userIndexes[firstTurn + 1] - userIndexes[firstTurn];
+      for (let i = 0; i < removed; i++)
+        tailChars -= eventSizes[userIndexes[firstTurn] - firstEvent + i] + 1;
+      firstTurn++;
+    }
+  }
   if (firstTurn > 0) {
     const cut = userIndexes[firstTurn];
     const old = events
@@ -244,4 +250,53 @@ export function buildPrompt(
   }
   flushPendingCalls();
   return messages;
+}
+
+/** A conservative text budget: UTF-8 JSON bytes bound ordinary text token counts. */
+export function budgetPrompt(
+  messages: ModelMessage[],
+  contextWindowTokens = 32_768,
+): ModelMessage[] {
+  const inputBytes = Math.floor(contextWindowTokens * 0.75);
+  const copy = [...messages];
+  const size = () =>
+    Buffer.byteLength(
+      JSON.stringify(copy, (_key, value: unknown) =>
+        typeof value === 'string' && value.startsWith('data:image/') ? 'x'.repeat(16_384) : value,
+      ),
+      'utf8',
+    );
+  while (size() > inputBytes) {
+    const firstUser = copy.findIndex((message, index) => index > 0 && message.role === 'user');
+    const nextUser = copy.findIndex(
+      (message, index) => index > firstUser && message.role === 'user',
+    );
+    if (firstUser < 0 || nextUser < 0) break;
+    copy.splice(firstUser, nextUser - firstUser);
+  }
+  if (size() > inputBytes) {
+    for (let index = 0; index < copy.length; index++) {
+      const message = copy[index];
+      if (message.role !== 'tool' || !Array.isArray(message.content)) continue;
+      copy[index] = {
+        ...message,
+        content: message.content.map((part) =>
+          part.type === 'tool-result' &&
+          part.output.type === 'text' &&
+          part.output.value.length > 2000
+            ? {
+                ...part,
+                output: {
+                  type: 'text' as const,
+                  value: `${part.output.value.slice(0, 2000)}\n[较长工具结果已截断]`,
+                },
+              }
+            : part,
+        ),
+      };
+    }
+  }
+  if (size() > inputBytes)
+    throw new Error(`当前轮输入超过上下文预算 (${inputBytes} 估算字节)，请缩短输入或附件`);
+  return copy;
 }

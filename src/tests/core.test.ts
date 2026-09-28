@@ -6,7 +6,7 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { SqliteEventStore } from '../storage/event-store.js';
 import Database from 'better-sqlite3';
-import { buildPrompt } from '../core/history.js';
+import { budgetPrompt, buildPrompt } from '../core/history.js';
 import { decisionFor } from '../core/permissions.js';
 import { AgentRunner, formatModelError } from '../core/agent.js';
 import type { ModelGateway } from '../providers/gateway.js';
@@ -572,6 +572,47 @@ test('uncertain tool call is reconciled once and not replayed', () => {
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+test('recovery tracks reused tool call IDs by occurrence', () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    const call = { id: 'reused', name: 'write_file' as const, input: { path: 'x', content: 'a' } };
+    store.append(session.id, 'assistant', { text: '', calls: [call] });
+    store.append(session.id, 'tool_finished', {
+      callId: 'reused',
+      name: 'write_file',
+      output: 'done',
+    });
+    store.append(session.id, 'assistant', { text: '', calls: [call] });
+    const runner = new AgentRunner(
+      store,
+      {
+        async complete() {
+          throw new Error('unexpected');
+        },
+      },
+      {
+        async execute() {
+          throw new Error('unexpected');
+        },
+        async close() {},
+      },
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return false;
+        },
+      },
+    );
+    assert.equal(runner.recover(session), 1);
+    assert.equal(runner.recover(session), 0);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('permission boundary denies escaped and symlinked reads', () => {
   const dir = temp();
   fs.writeFileSync(path.join(dir, 'inside'), 'a');
@@ -638,6 +679,27 @@ test('executor runs in child process and enforces path restrictions', async () =
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('executor rejects a duplicate in-flight request ID without losing the first result', async () => {
+  const dir = temp();
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'hello');
+  const executor = new ProcessExecutor();
+  const request: ToolRequest = {
+    requestId: 'same',
+    name: 'read_file',
+    input: { path: 'a.txt' },
+    workspace: dir,
+    timeoutMs: 5000,
+    maxOutputBytes: 100,
+  };
+  try {
+    const first = executor.execute(request);
+    await assert.rejects(executor.execute(request), /请求 ID/);
+    assert.equal((await first).output, 'hello');
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('file tools replace content without losing permissions or changing files on failed edits', async () => {
   const dir = temp();
   const file = path.join(dir, 'script.sh');
@@ -679,6 +741,29 @@ test('file tools replace content without losing permissions or changing files on
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('edit_file refuses invalid UTF-8 without changing the original bytes', async () => {
+  const dir = temp();
+  const original = Buffer.from([0x6f, 0x6c, 0x64, 0xff, 0x74, 0x65, 0x78, 0x74]);
+  const file = path.join(dir, 'mixed.txt');
+  fs.writeFileSync(file, original);
+  const executor = new ProcessExecutor();
+  try {
+    const result = await executor.execute({
+      requestId: 'invalid-utf8-edit',
+      name: 'edit_file',
+      input: { path: 'mixed.txt', oldText: 'old', newText: 'new' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 100,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.output, /UTF-8/);
+    assert.deepEqual(fs.readFileSync(file), original);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('executor caps command output', async () => {
   const dir = temp();
   const executor = new ProcessExecutor();
@@ -706,6 +791,138 @@ test('executor caps command output', async () => {
     assert.ok(Buffer.byteLength(read.output) < 100);
   } finally {
     await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('search treats no matches as a successful empty result', async () => {
+  const dir = temp();
+  const executor = new ProcessExecutor();
+  try {
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'hello');
+    const result = await executor.execute({
+      requestId: 'search-miss',
+      name: 'search',
+      input: { pattern: 'absent-pattern' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 100,
+    });
+    assert.equal(result.isError, false, result.output);
+    assert.equal(result.output, '');
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('cancelled Docker shell force-removes its named container', async () => {
+  const dir = temp();
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  const marker = path.join(dir, 'docker.log');
+  const slowCleanup = path.join(dir, 'slow-cleanup');
+  const docker = path.join(bin, 'docker');
+  fs.writeFileSync(
+    docker,
+    '#!/bin/sh\n' +
+      'if [ "$1" = "run" ]; then\n' +
+      '  shift\n' +
+      '  while [ "$1" != "--name" ]; do shift; done\n' +
+      `  echo "run:$2" >> '${marker}'\n` +
+      '  sleep 30\n' +
+      'else\n' +
+      `  echo "rm:$3" >> '${marker}'\n` +
+      `  if [ -f '${slowCleanup}' ]; then sleep 3; echo "rm-done:$3" >> '${marker}'; fi\n` +
+      'fi\n',
+    { mode: 0o755 },
+  );
+  const previous = {
+    path: process.env.PATH,
+    backend: process.env.BRUIN_SHELL_BACKEND,
+    image: process.env.BRUIN_DOCKER_IMAGE,
+  };
+  process.env.PATH = `${bin}${path.delimiter}${previous.path ?? ''}`;
+  process.env.BRUIN_SHELL_BACKEND = 'docker';
+  process.env.BRUIN_DOCKER_IMAGE = 'test-image';
+  const executor = new ProcessExecutor();
+  try {
+    const controller = new AbortController();
+    const result = executor.execute(
+      {
+        requestId: 'docker-cancel',
+        name: 'shell',
+        input: { command: 'sleep 30' },
+        workspace: dir,
+        timeoutMs: 5000,
+        maxOutputBytes: 100,
+      },
+      controller.signal,
+    );
+    for (let i = 0; i < 100 && !fs.existsSync(marker); i++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(fs.existsSync(marker), true);
+    controller.abort();
+    assert.equal((await result).isError, true);
+    const entries = fs.readFileSync(marker, 'utf8').trim().split('\n');
+    const name = entries.find((entry) => entry.startsWith('run:'))?.slice(4);
+    assert.ok(name?.startsWith('bruin-'));
+    assert.ok(entries.includes(`rm:${name}`));
+    const timedOut = await executor.execute({
+      requestId: 'docker-timeout',
+      name: 'shell',
+      input: { command: 'sleep 30' },
+      workspace: dir,
+      timeoutMs: 500,
+      maxOutputBytes: 100,
+    });
+    assert.equal(timedOut.isError, true);
+    const afterTimeout = fs.readFileSync(marker, 'utf8').trim().split('\n');
+    const timeoutName = afterTimeout
+      .filter((entry) => entry.startsWith('run:'))
+      .at(-1)
+      ?.slice(4);
+    assert.ok(timeoutName?.startsWith('bruin-'));
+    assert.ok(afterTimeout.includes(`rm:${timeoutName}`));
+    const pendingClose = executor
+      .execute({
+        requestId: 'docker-close',
+        name: 'shell',
+        input: { command: 'sleep 30' },
+        workspace: dir,
+        timeoutMs: 10_000,
+        maxOutputBytes: 100,
+      })
+      .catch(() => undefined);
+    for (let i = 0; i < 100; i++) {
+      if (
+        fs
+          .readFileSync(marker, 'utf8')
+          .split('\n')
+          .filter((entry) => entry.startsWith('run:')).length === 3
+      )
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const closeName = fs
+      .readFileSync(marker, 'utf8')
+      .split('\n')
+      .filter((entry) => entry.startsWith('run:'))
+      .at(-1)
+      ?.slice(4);
+    assert.ok(closeName?.startsWith('bruin-'));
+    fs.writeFileSync(slowCleanup, 'yes');
+    await executor.close();
+    await pendingClose;
+    assert.match(fs.readFileSync(marker, 'utf8'), new RegExp(`rm-done:${closeName}`));
+  } finally {
+    await executor.close();
+    for (const [key, value] of Object.entries({
+      PATH: previous.path,
+      BRUIN_SHELL_BACKEND: previous.backend,
+      BRUIN_DOCKER_IMAGE: previous.image,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -801,6 +1018,49 @@ test('agent rejects malformed tool input before approval or execution', async ()
     await runner.run(session, 'write it');
     assert.equal(approvals, 0);
     assert.ok(store.events(session.id).some((event) => event.type === 'tool_denied'));
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('agent rejects duplicate tool call IDs before any side effect', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    const runner = new AgentRunner(
+      store,
+      {
+        async complete() {
+          return {
+            text: '',
+            calls: [
+              { id: 'same', name: 'write_file', input: { path: 'a', content: 'first' } },
+              { id: 'same', name: 'write_file', input: { path: 'b', content: 'second' } },
+            ],
+          };
+        },
+      },
+      {
+        async execute() {
+          throw new Error('must not execute');
+        },
+        async close() {},
+      },
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          throw new Error('must not approve');
+        },
+      },
+    );
+    await assert.rejects(runner.run(session, 'write both'), /重复的工具调用 ID/);
+    assert.deepEqual(
+      store.events(session.id).map((event) => event.type),
+      ['user', 'model_error'],
+    );
+    assert.equal(fs.existsSync(path.join(dir, 'a')), false);
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -955,6 +1215,52 @@ test('buildPrompt heals dangling tool calls and preserves tool actions in summar
   const pmToolResults = pmPrompt.filter((m) => m.role === 'tool');
   assert.equal(pmToolResults.length, 1);
   assert.match(JSON.stringify(pmToolResults[0]), /ERROR: Action interrupted/);
+});
+test('buildPrompt keeps the newest complete turns within its history budget', () => {
+  const events: SessionEvent[] = Array.from({ length: 12 }, (_, index) => ({
+    sessionId: 'budget',
+    seq: index + 1,
+    type: 'user' as const,
+    at: '',
+    payload: { text: `${index}:` + 'x'.repeat(15_000) },
+  }));
+  const prompt = buildPrompt(events, 'system');
+  const users = prompt.filter((message) => message.role === 'user');
+  assert.equal(users.length, 7); // summary plus the newest six turns
+  assert.match(String(users[0].content), /Earlier conversation summary/);
+  assert.match(String(users[1].content), /^6:/);
+  assert.match(String(users.at(-1)?.content), /^11:/);
+});
+test('budgetPrompt removes old turns and rejects oversized current input', () => {
+  const messages = [
+    { role: 'system' as const, content: 'instructions' },
+    { role: 'user' as const, content: 'old:' + 'x'.repeat(15_000) },
+    { role: 'assistant' as const, content: 'old reply' },
+    { role: 'user' as const, content: 'new:' + 'y'.repeat(15_000) },
+  ];
+  const budgeted = budgetPrompt(messages, 32_768);
+  assert.equal(budgeted.length, 2);
+  assert.equal(budgeted[1], messages[3]);
+  assert.equal(messages.length, 4);
+  assert.equal(budgetPrompt(messages, 65_536).length, 4);
+  assert.throws(
+    () => budgetPrompt([{ role: 'system', content: 'x'.repeat(30_000) }], 32_768),
+    /上下文预算/,
+  );
+  const imagePrompt = budgetPrompt([
+    { role: 'system', content: 'instructions' },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'image',
+          image: new URL(`data:image/png;base64,${'a'.repeat(30_000)}`),
+          mediaType: 'image/png',
+        },
+      ],
+    },
+  ]);
+  assert.equal(imagePrompt.length, 2);
 });
 test('tasks can be deleted safely without removing unrelated files or breaking dependents', () => {
   const dir = temp();
@@ -1124,6 +1430,42 @@ test('deleteSession removes associated attachments directory from disk', () => {
     assert.equal(fs.readFileSync(path.join(unrelatedDir, 'keep.txt'), 'utf8'), 'unrelated');
   } finally {
     store.close();
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('failed attachment batch removes files already copied in that batch', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-attach-rollback-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  const first = path.join(dir, 'first.txt');
+  const second = path.join(dir, 'second.txt');
+  fs.writeFileSync(first, 'first');
+  fs.writeFileSync(second, 'second');
+  const originalWrite = fs.writeFileSync;
+  let writes = 0;
+  try {
+    fs.writeFileSync = ((...args: Parameters<typeof fs.writeFileSync>) => {
+      if (typeof args[0] === 'string' && args[0].includes(`${path.sep}attachments${path.sep}`)) {
+        writes++;
+        if (writes === 3) throw new Error('simulated disk failure');
+      }
+      return originalWrite(...args);
+    }) as typeof fs.writeFileSync;
+    assert.throws(
+      () => importAttachments('00000000-0000-0000-0000-000000000000', [first, second]),
+      /simulated disk failure/,
+    );
+    assert.deepEqual(
+      fs.readdirSync(
+        path.join(process.env.BRUIN_HOME, 'attachments', '00000000-0000-0000-0000-000000000000'),
+      ),
+      [],
+    );
+  } finally {
+    fs.writeFileSync = originalWrite;
     if (oldHome === undefined) delete process.env.BRUIN_HOME;
     else process.env.BRUIN_HOME = oldHome;
     fs.rmSync(dir, { recursive: true, force: true });

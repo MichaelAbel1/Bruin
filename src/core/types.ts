@@ -33,6 +33,7 @@ export interface ModelProfile {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
+  contextWindowTokens?: number;
 }
 export interface ToolCall {
   id: string;

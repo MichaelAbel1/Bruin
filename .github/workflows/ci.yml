@@ -10,8 +10,18 @@ permissions:
   contents: read
 
 jobs:
-  macos:
-    runs-on: macos-latest
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
@@ -25,9 +35,15 @@ jobs:
       - run: npm run desktop:check
       - run: npm test
       - run: npm run desktop:dist -- --mac zip --publish never
+        if: matrix.platform == 'macos'
+      - run: npm run desktop:dist -- --linux AppImage --publish never
+        if: matrix.platform == 'linux'
+      - run: npm run desktop:dist -- --win nsis --publish never
+        if: matrix.platform == 'windows'
       - run: unzip -tq desktop/release-current/Bruin-*-mac.zip
+        if: matrix.platform == 'macos'
       - uses: actions/upload-artifact@v7
         with:
-          name: bruin-macos-unsigned
-          path: desktop/release-current/Bruin-*-mac.zip
+          name: bruin-${{ matrix.platform }}-unsigned
+          path: desktop/release-current/*
           if-no-files-found: error

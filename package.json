@@ -21,7 +21,7 @@
     "desktop:dist": "npm run desktop:build && node desktop/scripts/stage-runtime.cjs && electron-builder --config desktop/electron-builder.yml"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.0",

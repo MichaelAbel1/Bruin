@@ -97,7 +97,9 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       model: 'test',
       baseUrl: `http://127.0.0.1:${address.port}/v1`,
       apiKey: key,
+      contextWindowTokens: 65_536,
     });
+    assert.equal(config.profiles[0].contextWindowTokens, 65_536);
     assert.equal(config.defaultProfile, 'local');
     await assert.rejects(
       request('saveProfile', { alias: 'bad', provider: 'openai', model: 'test', apiKeyEnv: key }),
@@ -139,10 +141,13 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       provider: 'openai-compatible',
       model: 'test-edited',
       baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      contextWindowTokens: 49_152,
     });
     assert.equal(edited.profiles[0].model, 'test-edited');
+    assert.equal(edited.profiles[0].contextWindowTokens, 49_152);
     const reopened = await request('openSession', { sessionId: created.session.id });
     assert.equal(reopened.session.profile.model, 'test-edited');
+    assert.equal(reopened.session.profile.contextWindowTokens, 49_152);
     assert.equal(reopened.events.at(-1).type, 'model_switched');
     const switched = await request('setSessionModel', {
       sessionId: created.session.id,

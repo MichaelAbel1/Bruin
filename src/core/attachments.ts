@@ -108,39 +108,58 @@ export function importAttachments(sessionId: string, selected: string[]): Attach
   if (total > maxSelectionBytes) throw new Error('一次上传总量不能超过 20 MB');
   const root = attachmentDir(sessionId);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  return files.map((file) => {
-    const id = randomUUID();
-    const name = path.basename(file);
-    const ext = path.extname(name).toLowerCase();
-    const kind = imageTypes[ext]
-      ? 'image'
-      : ['.docx', '.xlsx', '.pdf', '.doc', '.xls', '.csv', '.txt', '.md'].includes(ext)
-        ? 'document'
-        : 'file';
-    const target = path.join(root, id);
-    const source = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    try {
-      const stat = fs.fstatSync(source);
-      if (!stat.isFile() || stat.size > maxFileBytes)
-        throw new Error(`附件不是普通文件或超过 5 MB: ${name}`);
-      fs.writeFileSync(target, fs.readFileSync(source), { mode: 0o600, flag: 'wx' });
-    } finally {
-      fs.closeSync(source);
-    }
-    const extracted = kind === 'image' ? { text: '' } : extractText(target, name);
-    const metadata = {
-      id,
-      name,
-      kind,
-      mimeType: imageTypes[ext] ?? 'application/octet-stream',
-      ...extracted,
-    };
-    fs.writeFileSync(path.join(root, `${id}.json`), JSON.stringify(metadata), {
-      mode: 0o600,
-      flag: 'wx',
+  const created: string[] = [];
+  try {
+    return files.map((file) => {
+      const id = randomUUID();
+      const name = path.basename(file);
+      const ext = path.extname(name).toLowerCase();
+      const kind = imageTypes[ext]
+        ? 'image'
+        : ['.docx', '.xlsx', '.pdf', '.doc', '.xls', '.csv', '.txt', '.md'].includes(ext)
+          ? 'document'
+          : 'file';
+      const target = path.join(root, id);
+      const source = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const stat = fs.fstatSync(source);
+        if (!stat.isFile() || stat.size > maxFileBytes)
+          throw new Error(`附件不是普通文件或超过 5 MB: ${name}`);
+        created.push(target);
+        fs.writeFileSync(target, fs.readFileSync(source), { mode: 0o600, flag: 'wx' });
+      } finally {
+        fs.closeSync(source);
+      }
+      const extracted = kind === 'image' ? { text: '' } : extractText(target, name);
+      const metadata = {
+        id,
+        name,
+        kind,
+        mimeType: imageTypes[ext] ?? 'application/octet-stream',
+        ...extracted,
+      };
+      const metadataPath = path.join(root, `${id}.json`);
+      created.push(metadataPath);
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata), {
+        mode: 0o600,
+        flag: 'wx',
+      });
+      return { id, name, kind, ...(extracted.note ? { note: extracted.note } : {}) };
     });
-    return { id, name, kind, ...(extracted.note ? { note: extracted.note } : {}) };
-  });
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    for (const file of created.reverse()) {
+      try {
+        fs.rmSync(file, { force: true });
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length) {
+      throw new AggregateError([error, ...cleanupErrors], '附件导入失败，部分文件清理失败');
+    }
+    throw error;
+  }
 }
 export function loadAttachment(
   sessionId: string,

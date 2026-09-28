@@ -52,6 +52,7 @@ type Profile = {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
+  contextWindowTokens?: number;
 };
 type Session = {
   id: string;
@@ -2582,6 +2583,7 @@ function ModelDialog({
   const [model, setModel] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKeyEnv, setApiKeyEnv] = useState('');
+  const [contextWindowTokens, setContextWindowTokens] = useState('32768');
   const [apiKey, setApiKey] = useState('');
   const [clearApiKey, setClearApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -2594,6 +2596,7 @@ function ModelDialog({
     setModel('');
     setBaseUrl('');
     setApiKeyEnv('');
+    setContextWindowTokens('32768');
     setApiKey('');
     setClearApiKey(false);
   }
@@ -2604,6 +2607,7 @@ function ModelDialog({
     setModel(profile.model);
     setBaseUrl(profile.baseUrl ?? '');
     setApiKeyEnv(profile.apiKeyEnv ?? '');
+    setContextWindowTokens(String(profile.contextWindowTokens ?? 32768));
     setApiKey('');
     setClearApiKey(false);
     formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -2613,6 +2617,11 @@ function ModelDialog({
     if (profile) edit(profile);
   }, [focusAlias]);
   async function save() {
+    const contextTokens = Number(contextWindowTokens);
+    if (!Number.isInteger(contextTokens) || contextTokens < 8192 || contextTokens > 2_000_000) {
+      fail(new Error('上下文窗口须为 8192 到 2000000 之间的整数'));
+      return;
+    }
     if (apiKeyEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
       fail(new Error('环境变量名只能包含字母、数字和下划线；密钥值请填入 API Key 输入框'));
       return;
@@ -2626,6 +2635,7 @@ function ModelDialog({
           model,
           baseUrl,
           apiKeyEnv,
+          contextWindowTokens: contextTokens,
           apiKey,
           clearApiKey,
         }),
@@ -2664,7 +2674,7 @@ function ModelDialog({
             <div>
               <strong>{p.alias}</strong>
               <small>
-                {p.provider} · {p.model}
+                {p.provider} · {p.model} · 上下文 {p.contextWindowTokens ?? 32768} tokens
               </small>
             </div>
             {config.defaultProfile === p.alias ? (
@@ -2733,6 +2743,18 @@ function ModelDialog({
           onChange={(e) => setModel(e.target.value)}
           placeholder="例如 gpt-4.1"
         />
+        <label>上下文窗口（tokens）</label>
+        <input
+          type="number"
+          min="8192"
+          max="2000000"
+          step="1"
+          value={contextWindowTokens}
+          onChange={(e) => setContextWindowTokens(e.target.value)}
+        />
+        <p className="form-help">
+          请填写模型公布的上下文窗口。未配置时按 32768 处理，预留四分之一给回复及工具。
+        </p>
         <label>Base URL {provider === 'openai-compatible' ? '' : '（可选）'}</label>
         <input
           value={baseUrl}

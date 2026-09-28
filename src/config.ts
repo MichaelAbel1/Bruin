@@ -31,6 +31,7 @@ const profileSchema = z.object({
   model: z.string().min(1),
   baseUrl: z.string().url().optional(),
   apiKeyEnv: z.string().regex(envNamePattern).optional(),
+  contextWindowTokens: z.number().int().min(8192).max(2_000_000).optional(),
 });
 export const mcpServerSchema = z.discriminatedUnion('transport', [
   z.object({

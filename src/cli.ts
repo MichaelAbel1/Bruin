@@ -37,7 +37,7 @@ import { RuntimeServices } from './runtime/services.js';
 
 const help = `Bruin — local coding agent
 
-bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV]
+bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV] [--context-tokens N]
 bruin model list | default ALIAS
 bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [PROMPT]
 bruin sessions list | show SESSION_ID
@@ -70,6 +70,7 @@ async function main(): Promise<void> {
       return;
     }
     if (action === 'add') {
+      const contextTokensArg = takeFlag(args, '--context-tokens');
       const [alias, provider, model, baseUrl, apiKeyEnv] = args;
       if (
         !alias ||
@@ -81,12 +82,22 @@ async function main(): Promise<void> {
         throw new Error('openai-compatible 需要 BASE_URL');
       if (apiKeyEnv && !validApiKeyEnv(apiKeyEnv))
         throw new Error('API_KEY_ENV 只能填写环境变量名称，不能填写密钥值');
+      const contextWindowTokens =
+        contextTokensArg === undefined ? undefined : Number(contextTokensArg);
+      if (
+        contextWindowTokens !== undefined &&
+        (!Number.isInteger(contextWindowTokens) ||
+          contextWindowTokens < 8192 ||
+          contextWindowTokens > 2_000_000)
+      )
+        throw new Error('--context-tokens 须为 8192 到 2000000 之间的整数');
       const profile: ModelProfile = {
         alias,
         provider: provider as ProviderKind,
         model,
         ...(baseUrl ? { baseUrl } : {}),
         ...(apiKeyEnv ? { apiKeyEnv } : {}),
+        ...(contextWindowTokens ? { contextWindowTokens } : {}),
       };
       updateConfig((current) => {
         current.profiles = current.profiles.filter((x) => x.alias !== alias);

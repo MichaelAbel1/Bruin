@@ -46,7 +46,15 @@ function readBounded(file: string, max: number): ToolResult {
     fs.closeSync(fd);
   }
 }
-function replaceFile(file: string, content: Buffer, mode: number): void {
+function replaceFile(
+  root: string,
+  file: string,
+  content: Buffer,
+  mode: number,
+  expected: fs.Stats | null,
+): void {
+  const parent = path.dirname(file);
+  const parentStat = fs.lstatSync(parent);
   const temp = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
   let fd: number | undefined;
   try {
@@ -64,6 +72,32 @@ function replaceFile(file: string, content: Buffer, mode: number): void {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
+    checkedPath(root, file, true);
+    const currentParent = fs.lstatSync(parent);
+    if (
+      !currentParent.isDirectory() ||
+      currentParent.isSymbolicLink() ||
+      currentParent.dev !== parentStat.dev ||
+      currentParent.ino !== parentStat.ino
+    )
+      throw new Error('写入期间父目录发生变化');
+    let current: fs.Stats | null = null;
+    try {
+      current = fs.lstatSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (
+      Boolean(current) !== Boolean(expected) ||
+      (current &&
+        expected &&
+        (current.isSymbolicLink() ||
+          current.dev !== expected.dev ||
+          current.ino !== expected.ino ||
+          current.size !== expected.size ||
+          current.mtimeMs !== expected.mtimeMs))
+    )
+      throw new Error('写入期间目标文件发生变化');
     fs.renameSync(temp, file);
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
@@ -74,8 +108,41 @@ function replaceFile(file: string, content: Buffer, mode: number): void {
     }
   }
 }
-const active = new Map<string, () => void>();
-async function command(program: string, args: string[], req: ToolRequest): Promise<ToolResult> {
+const active = new Map<string, () => Promise<void>>();
+function dockerEnvironment(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    DOCKER_CONFIG: process.env.BRUIN_DOCKER_CONFIG ?? path.join(os.homedir(), '.docker'),
+    DOCKER_HOST: process.env.DOCKER_HOST,
+  };
+}
+function removeDockerContainer(name: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn('docker', ['rm', '-f', name], {
+      env: dockerEnvironment(),
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let errorText = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+      errorText += chunk.toString('utf8').slice(0, 1000);
+    });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 || errorText.includes('No such container'));
+    });
+  });
+}
+async function command(
+  program: string,
+  args: string[],
+  req: ToolRequest,
+  dockerName?: string,
+): Promise<ToolResult> {
   return new Promise((resolve) => {
     const child = spawn(program, args, {
       cwd: req.workspace,
@@ -84,12 +151,7 @@ async function command(program: string, args: string[], req: ToolRequest): Promi
         HOME: req.workspace,
         TMPDIR: process.env.TMPDIR ?? '/tmp',
         LANG: process.env.LANG ?? 'C',
-        ...(program === 'docker'
-          ? {
-              DOCKER_CONFIG: process.env.BRUIN_DOCKER_CONFIG ?? path.join(os.homedir(), '.docker'),
-              DOCKER_HOST: process.env.DOCKER_HOST,
-            }
-          : {}),
+        ...(program === 'docker' ? dockerEnvironment() : {}),
       },
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -98,6 +160,14 @@ async function command(program: string, args: string[], req: ToolRequest): Promi
     let size = 0;
     let truncated = false;
     let done = false;
+    let interrupted = false;
+    let markSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      markSettled = resolve;
+    });
+    let cleanupStarted: Promise<boolean> | undefined;
+    const cleanup = () =>
+      (cleanupStarted ??= dockerName ? removeDockerContainer(dockerName) : Promise.resolve(true));
     const add = (b: Buffer) => {
       const remaining = Math.max(0, req.maxOutputBytes - size);
       if (remaining) {
@@ -109,7 +179,8 @@ async function command(program: string, args: string[], req: ToolRequest): Promi
     };
     child.stdout?.on('data', add);
     child.stderr?.on('data', add);
-    const kill = () => {
+    const kill = async () => {
+      interrupted = true;
       if (child.pid) {
         try {
           if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
@@ -118,28 +189,42 @@ async function command(program: string, args: string[], req: ToolRequest): Promi
           /* already exited */
         }
       }
+      await cleanup();
+      await settled;
     };
     active.set(req.requestId, kill);
-    const timer = setTimeout(kill, req.timeoutMs);
+    const timer = setTimeout(() => {
+      void kill();
+    }, req.timeoutMs);
     child.on('error', (err) => {
       if (!done) {
         done = true;
         active.delete(req.requestId);
         clearTimeout(timer);
         resolve({ output: err.message, isError: true });
+        markSettled();
       }
     });
-    child.on('close', (code) => {
+    child.on('close', async (code) => {
       if (!done) {
         done = true;
         active.delete(req.requestId);
         clearTimeout(timer);
+        // A second removal closes the race between Docker creating the container and cancellation.
+        const cleaned =
+          dockerName && (interrupted || code !== 0)
+            ? await removeDockerContainer(dockerName)
+            : true;
         resolve({
-          output: Buffer.concat(chunks).toString('utf8') + (truncated ? '\n[输出已截断]' : ''),
+          output:
+            Buffer.concat(chunks).toString('utf8') +
+            (truncated ? '\n[输出已截断]' : '') +
+            (!cleaned ? '\n[Docker 容器清理未确认]' : ''),
           truncated,
           exitCode: code ?? -1,
-          isError: code !== 0,
+          isError: code !== 0 || interrupted || !cleaned,
         });
+        markSettled();
       }
     });
   });
@@ -291,14 +376,16 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       }
       checkedPath(req.workspace, parent);
       let mode = 0o600;
+      let expected: fs.Stats | null = null;
       try {
         const stat = fs.lstatSync(file);
         if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('只能写入普通文件');
         mode = stat.mode & 0o777;
+        expected = stat;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
-      replaceFile(file, Buffer.from(String(req.input.content ?? '')), mode);
+      replaceFile(root, file, Buffer.from(String(req.input.content ?? '')), mode, expected);
       return { output: `已写入 ${path.relative(root, file)}`, isError: false };
     }
     case 'edit_file': {
@@ -316,13 +403,19 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         const stat = fs.fstatSync(fd);
         if (!stat.isFile()) throw new Error('只能编辑普通文件');
         if (stat.size > 5_000_000) throw new Error('文件过大，无法使用 edit_file 编辑');
-        const source = fs.readFileSync(fd, 'utf8');
+        let source: string;
+        try {
+          source = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(fd));
+        } catch (error) {
+          if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
+          throw error;
+        }
         const parts = source.split(old);
         if (parts.length === 1) throw new Error('未找到要替换的文本 (oldText)');
         if (parts.length > 2)
           throw new Error(`要替换的文本 (oldText) 在文件中出现了 ${parts.length - 1} 次，必须唯一`);
         const updated = Buffer.from(parts[0] + replacement + parts[1]);
-        replaceFile(file, updated, stat.mode & 0o777);
+        replaceFile(root, file, updated, stat.mode & 0o777, stat);
       } finally {
         fs.closeSync(fd);
       }
@@ -333,7 +426,10 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       const args = ['-n', '--max-count', '100'];
       if (typeof req.input.glob === 'string' && req.input.glob) args.push('--glob', req.input.glob);
       args.push('--', String(req.input.pattern ?? ''));
-      return command('rg', args, req);
+      const result = await command('rg', args, req);
+      // ripgrep uses exit code 1 for a valid search with no matches.
+      if (result.exitCode === 1) return { ...result, isError: false };
+      return result;
     }
     case 'shell': {
       const shell = String(req.input.command ?? '');
@@ -341,11 +437,14 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       if (process.env.BRUIN_SHELL_BACKEND === 'docker') {
         const image = process.env.BRUIN_DOCKER_IMAGE;
         if (!image) throw new Error('Docker 执行需要 BRUIN_DOCKER_IMAGE');
+        const containerName = `bruin-${randomUUID()}`;
         return command(
           'docker',
           [
             'run',
             '--rm',
+            '--name',
+            containerName,
             '--network',
             'none',
             '--read-only',
@@ -371,6 +470,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
             shell,
           ],
           req,
+          containerName,
         );
       }
       if (process.env.BRUIN_ALLOW_UNSANDBOXED_SHELL === '1')
@@ -407,10 +507,11 @@ process.on('message', async (raw: ToolRequest | { type: 'cancel'; requestId: str
     isError: true,
   }));
   const reply: ToolResponse = { requestId: request.requestId, result };
-  process.send?.(reply);
+  if (process.connected) process.send?.(reply);
 });
 
 process.on('disconnect', () => {
-  for (const kill of active.values()) kill();
-  process.exit(0);
+  void Promise.allSettled([...active.values()].map((kill) => kill())).finally(() =>
+    process.exit(0),
+  );
 });

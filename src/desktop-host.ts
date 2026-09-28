@@ -562,6 +562,16 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         throw new Error('模型配置不完整');
       if (provider === 'openai-compatible' && !baseUrl) throw new Error('兼容接口需要 Base URL');
       const apiKeyEnv = String(p.apiKeyEnv ?? '').trim() || undefined;
+      const existingProfile = loadConfig().profiles.find((item) => item.alias === alias);
+      const contextWindowTokens = Number(
+        p.contextWindowTokens ?? existingProfile?.contextWindowTokens ?? 32_768,
+      );
+      if (
+        !Number.isInteger(contextWindowTokens) ||
+        contextWindowTokens < 8192 ||
+        contextWindowTokens > 2_000_000
+      )
+        throw new Error('上下文窗口须为 8192 到 2000000 之间的整数');
       if (apiKeyEnv && !validApiKeyEnv(apiKeyEnv))
         throw new Error(
           '密钥环境变量只能填写名称，例如 OPENAI_API_KEY；密钥值请填入 API Key 输入框',
@@ -572,6 +582,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         model,
         ...(baseUrl ? { baseUrl } : {}),
         ...(apiKeyEnv ? { apiKeyEnv } : {}),
+        contextWindowTokens,
       };
       if (
         store

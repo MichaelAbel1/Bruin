@@ -79,12 +79,14 @@ export class ProcessExecutor implements ToolExecutor {
     if (!this.isAlive(this.currentWorker.child)) this.spawnWorker();
     const worker = this.currentWorker;
     if (!this.isAlive(worker.child)) return Promise.reject(new Error('工具执行进程未连接'));
+    if (!request.requestId || worker.pending.has(request.requestId))
+      return Promise.reject(new Error('工具请求 ID 为空或仍在执行'));
 
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error('已取消'));
       const abort = () => worker.child.send({ type: 'cancel', requestId: request.requestId });
       signal?.addEventListener('abort', abort, { once: true });
-      worker.pending.set(request.requestId, {
+      const pending: { resolve: (value: ToolResult) => void; reject: (reason: Error) => void } = {
         resolve: (value) => {
           signal?.removeEventListener('abort', abort);
           resolve(value);
@@ -93,10 +95,12 @@ export class ProcessExecutor implements ToolExecutor {
           signal?.removeEventListener('abort', abort);
           reject(err);
         },
-      });
+      };
+      worker.pending.set(request.requestId, pending);
       worker.child.send(request, (err) => {
         if (err) {
-          worker.pending.delete(request.requestId);
+          if (worker.pending.get(request.requestId) === pending)
+            worker.pending.delete(request.requestId);
           signal?.removeEventListener('abort', abort);
           reject(err);
         }
@@ -111,7 +115,7 @@ export class ProcessExecutor implements ToolExecutor {
       if (worker.child.exitCode !== null || worker.child.signalCode !== null) continue;
       const exited = new Promise<void>((resolve) => worker.child.once('exit', () => resolve()));
       if (worker.child.connected) worker.child.disconnect();
-      const timer = setTimeout(() => worker.child.kill('SIGKILL'), 2000);
+      const timer = setTimeout(() => worker.child.kill('SIGKILL'), 12000);
       timer.unref();
       exitPromises.push(exited.finally(() => clearTimeout(timer)));
     }

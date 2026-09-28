@@ -277,7 +277,7 @@ app.on('before-quit', () => {
     host.stdin.end();
     setTimeout(() => {
       if (host && !host.killed) host.kill('SIGKILL');
-    }, 2000).unref();
+    }, 15000).unref();
   }
 });
 app.on('window-all-closed', () => {
