@@ -24,7 +24,7 @@ jobs:
       - run: npm run check
       - run: npm run desktop:check
       - run: npm test
-      - run: npm run desktop:dist -- --mac zip
+      - run: npm run desktop:dist -- --mac zip --publish never
       - run: unzip -tq desktop/release-current/Bruin-*-mac.zip
       - uses: actions/upload-artifact@v7
         with:
