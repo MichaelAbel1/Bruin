@@ -545,6 +545,45 @@ test('executor runs in child process and enforces path restrictions', async () =
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('file tools replace content without losing permissions or changing files on failed edits', async () => {
+  const dir = temp();
+  const file = path.join(dir, 'script.sh');
+  fs.writeFileSync(file, 'old text\n');
+  fs.chmodSync(file, 0o755);
+  const executor = new ProcessExecutor();
+  try {
+    const request = (
+      id: string,
+      name: 'write_file' | 'edit_file',
+      input: Record<string, unknown>,
+    ) =>
+      executor.execute({
+        requestId: id,
+        name,
+        input: { path: 'script.sh', ...input },
+        workspace: dir,
+        timeoutMs: 5000,
+        maxOutputBytes: 100,
+      });
+    const write = await request('write', 'write_file', { content: 'updated text\n' });
+    assert.equal(write.isError, false, write.output);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'updated text\n');
+    assert.equal(fs.statSync(file).mode & 0o777, 0o755);
+    assert.equal(
+      (await request('bad-edit', 'edit_file', { oldText: 'missing', newText: 'x' })).isError,
+      true,
+    );
+    assert.equal(fs.readFileSync(file, 'utf8'), 'updated text\n');
+    const edit = await request('edit', 'edit_file', { oldText: 'updated', newText: 'final' });
+    assert.equal(edit.isError, false, edit.output);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'final text\n');
+    assert.equal(fs.statSync(file).mode & 0o777, 0o755);
+    assert.deepEqual(fs.readdirSync(dir), ['script.sh']);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('executor caps command output', async () => {
   const dir = temp();
   const executor = new ProcessExecutor();
@@ -708,6 +747,41 @@ test('model errors redact the active API key before persistence and display', as
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('cancelling a model retry stops before another request', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  const controller = new AbortController();
+  let attempts = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      attempts++;
+      throw Object.assign(new Error('temporarily unavailable'), { statusCode: 503 });
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('unexpected');
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {
+        controller.abort();
+      },
+      async approve() {
+        return false;
+      },
+    });
+    await assert.rejects(runner.run(session, 'hello', controller.signal), /已取消/);
+    assert.equal(attempts, 1);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('buildPrompt heals dangling tool calls and preserves tool actions in summary', () => {
   const events: SessionEvent[] = [
     {
@@ -787,7 +861,7 @@ test('buildPrompt heals dangling tool calls and preserves tool actions in summar
   assert.equal(pmToolResults.length, 1);
   assert.match(JSON.stringify(pmToolResults[0]), /ERROR: Action interrupted/);
 });
-test('tasks can be deleted safely, clean up snapshots and prune orphans without breaking dependents', () => {
+test('tasks can be deleted safely without removing unrelated files or breaking dependents', () => {
   const dir = temp();
   const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
   const session = store.createSession(dir, profile);
@@ -805,13 +879,12 @@ test('tasks can be deleted safely, clean up snapshots and prune orphans without 
     assert.equal(store.listTasks(session.id).length, 1);
     assert.ok(!fs.existsSync(path.join(dir, '.tasks', `${child.id}.json`)));
 
-    // Manually create an orphaned task file
+    // Files outside the SQLite task graph may belong to the user.
     const orphanFile = path.join(dir, '.tasks', 'orphan-task.json');
     fs.writeFileSync(orphanFile, '{}');
     assert.ok(fs.existsSync(orphanFile));
     store.syncTasks(session.id);
-    // syncTasks should prune orphaned snapshot files
-    assert.ok(!fs.existsSync(orphanFile));
+    assert.ok(fs.existsSync(orphanFile));
 
     // Now deleting parent should succeed
     store.deleteTask(session.id, parent.id);
@@ -820,6 +893,26 @@ test('tasks can be deleted safely, clean up snapshots and prune orphans without 
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('task deletion refuses a replaced .tasks directory before changing SQLite', () => {
+  const dir = temp();
+  const outside = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    const task = store.createTask(session.id, 'Keep task', []);
+    fs.renameSync(path.join(dir, '.tasks'), path.join(dir, 'saved-tasks'));
+    const outsideFile = path.join(outside, `${task.id}.json`);
+    fs.writeFileSync(outsideFile, 'user data');
+    fs.symlinkSync(outside, path.join(dir, '.tasks'));
+    assert.throws(() => store.deleteTask(session.id, task.id), /真实目录/);
+    assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'user data');
+    assert.equal(store.getTask(session.id, task.id)?.id, task.id);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
   }
 });
 test('step limit is bounded and leaves uncompleted turn state to allow UI resume', async () => {

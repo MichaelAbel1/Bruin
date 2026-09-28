@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
 
@@ -45,12 +46,32 @@ function readBounded(file: string, max: number): ToolResult {
     fs.closeSync(fd);
   }
 }
-function replaceFd(fd: number, content: Buffer): void {
-  fs.ftruncateSync(fd, 0);
-  for (let offset = 0; offset < content.length;) {
-    const written = fs.writeSync(fd, content, offset, content.length - offset, offset);
-    if (!written) throw new Error('文件写入未完成');
-    offset += written;
+function replaceFile(file: string, content: Buffer, mode: number): void {
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(
+      temp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    for (let offset = 0; offset < content.length;) {
+      const written = fs.writeSync(fd, content, offset, content.length - offset, offset);
+      if (!written) throw new Error('文件写入未完成');
+      offset += written;
+    }
+    fs.fchmodSync(fd, mode);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, file);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try {
+      fs.unlinkSync(temp);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
 }
 const active = new Map<string, () => void>();
@@ -247,22 +268,16 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       const file = checkedPath(req.workspace, req.input.path, true);
       const parent = path.dirname(file);
       if (!fs.existsSync(parent)) throw new Error('父目录不存在');
-      checkedPath(req.workspace, path.relative(req.workspace, parent));
-      const fd = fs.openSync(
-        file,
-        fs.constants.O_WRONLY |
-          fs.constants.O_CREAT |
-          fs.constants.O_NOFOLLOW |
-          fs.constants.O_NONBLOCK,
-        0o600,
-      );
+      checkedPath(req.workspace, parent);
+      let mode = 0o600;
       try {
-        if (!fs.fstatSync(fd).isFile()) throw new Error('只能写入普通文件');
-        const content = Buffer.from(String(req.input.content ?? ''));
-        replaceFd(fd, content);
-      } finally {
-        fs.closeSync(fd);
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('只能写入普通文件');
+        mode = stat.mode & 0o777;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
+      replaceFile(file, Buffer.from(String(req.input.content ?? '')), mode);
       return { output: `已写入 ${path.relative(req.workspace, file)}`, isError: false };
     }
     case 'edit_file': {
@@ -272,14 +287,16 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       if (!old) throw new Error('oldText 不能为空');
       const fd = fs.openSync(
         file,
-        fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
       );
       try {
-        if (!fs.fstatSync(fd).isFile()) throw new Error('只能编辑普通文件');
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile()) throw new Error('只能编辑普通文件');
+        if (stat.size > 5_000_000) throw new Error('文件过大，无法使用 edit_file 编辑');
         const source = fs.readFileSync(fd, 'utf8');
         if (source.split(old).length !== 2) throw new Error('oldText 必须恰好出现一次');
         const updated = Buffer.from(source.replace(old, replacement));
-        replaceFd(fd, updated);
+        replaceFile(file, updated, stat.mode & 0o777);
       } finally {
         fs.closeSync(fd);
       }

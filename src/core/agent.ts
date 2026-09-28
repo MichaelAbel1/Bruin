@@ -49,6 +49,20 @@ export function formatModelError(err: unknown): string {
   const fallback = typeof error?.message === 'string' ? error.message : String(err);
   return (status + (detail || fallback)).replace(/[\r\n\t]+/g, ' ').slice(0, 600);
 }
+function waitForRetry(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new Error('已取消'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new Error('已取消'));
+    };
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
 export function systemPrompt(workspace: string): string {
   const skills = listSkills()
     .filter((x) => x.enabled)
@@ -204,7 +218,7 @@ export class AgentRunner {
           ) {
             const backoff = (attempt + 1) * 1000;
             this.io.notice(`模型服务暂忙 (HTTP ${status})，将在 ${backoff / 1000}s 后重试...`);
-            await new Promise((r) => setTimeout(r, backoff));
+            await waitForRetry(backoff, signal);
             continue;
           }
           break;
