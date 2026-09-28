@@ -327,10 +327,25 @@ export class AgentRunner {
             const previous = this.store
               .events(session.id)
               .find((e) => e.type === 'skill_loaded' && e.payload.name === skillName);
-            const content = previous ? String(previous.payload.content) : loadSkill(skillName);
-            if (!previous)
-              this.store.append(session.id, 'skill_loaded', { name: skillName, content });
-            result = { output: content, isError: false };
+            if (previous) {
+              result = { output: String(previous.payload.content), isError: false };
+            } else {
+              let loaded: { content: string } | { error: Error };
+              try {
+                loaded = { content: loadSkill(skillName) };
+              } catch (err) {
+                loaded = { error: err instanceof Error ? err : new Error(String(err)) };
+              }
+              if ('error' in loaded) {
+                result = { output: loaded.error.message, isError: true };
+              } else {
+                this.store.append(session.id, 'skill_loaded', {
+                  name: skillName,
+                  content: loaded.content,
+                });
+                result = { output: loaded.content, isError: false };
+              }
+            }
           } else if (
             !['read_file', 'write_file', 'edit_file', 'search', 'shell'].includes(call.name)
           ) {

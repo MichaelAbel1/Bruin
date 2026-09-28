@@ -134,7 +134,7 @@ export class McpManager {
       maxTotalTimeout: 10_000,
     });
     if (!available.tools.some((tool) => tool.name === name))
-      throw new Error(`MCP 工具不存在: ${name}`);
+      return { output: `MCP 工具不存在: ${name}`, isError: true };
     const result = await client.callTool(
       { name, arguments: args },
       { timeout: 30_000, maxTotalTimeout: 30_000 },

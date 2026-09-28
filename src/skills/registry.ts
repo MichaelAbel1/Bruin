@@ -213,7 +213,8 @@ export function readSkill(name: string): string {
 }
 export function loadSkill(name: string): string {
   const skill = listSkills().find((x) => x.name === name);
-  if (!skill?.enabled) throw new Error('Skill 未启用。请先查看内容并执行 bruin skill enable NAME');
+  if (!skill) throw new Error(`Skill 不存在: ${name}`);
+  if (!skill.enabled) throw new Error('Skill 未启用。请先查看内容并执行 bruin skill enable NAME');
   return readSkill(name);
 }
 export function setSkillEnabled(name: string, enabled: boolean): void {

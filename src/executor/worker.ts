@@ -201,20 +201,25 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
       } finally {
         fs.closeSync(fd);
       }
+      const stream = fs.createReadStream(fullPath, { encoding: 'utf8' });
       const rl = readline.createInterface({
-        input: fs.createReadStream(fullPath, { encoding: 'utf8' }),
+        input: stream,
         crlfDelay: Infinity,
       });
       let lineNum = 0;
-      for await (const line of rl) {
-        lineNum++;
-        if (line.includes(pattern)) {
-          const formatted = `${relPath}:${lineNum}:${line}\n`;
-          if (!appendMatch(formatted)) {
-            rl.close();
-            return false;
+      try {
+        for await (const line of rl) {
+          lineNum++;
+          if (line.includes(pattern)) {
+            const formatted = `${relPath}:${lineNum}:${line}\n`;
+            if (!appendMatch(formatted)) {
+              return false;
+            }
           }
         }
+      } finally {
+        rl.close();
+        stream.destroy();
       }
     } catch {}
     return true;

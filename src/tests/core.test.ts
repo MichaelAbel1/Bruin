@@ -1073,3 +1073,99 @@ test('tool execution runtime exception is recorded as tool_unknown and halts run
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('load_skill returns isError when skill does not exist without halting runner', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-skill-fail-'));
+  const store = new SqliteEventStore(path.join(dir, 'bruin.db'));
+  const session = store.createSession(dir, profile);
+  let step = 0;
+  const gateway: ModelGateway = {
+    async complete(_profile, _prompt, _signal, _onDelta) {
+      step++;
+      if (step === 1) {
+        return {
+          text: '',
+          calls: [{ id: 's1', name: 'load_skill', input: { name: 'missing-skill' } }],
+          providerMessages: [],
+        };
+      }
+      return {
+        text: 'Skill was not found, proceeding without it.',
+        calls: [],
+        providerMessages: [],
+      };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: '', isError: false };
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    });
+    await runner.run(session, 'test');
+    assert.equal(step, 2);
+    const toolEvent = store
+      .events(session.id)
+      .find((e) => e.type === 'tool_finished' && e.payload.callId === 's1');
+    assert.ok(toolEvent);
+    assert.equal(toolEvent.payload.isError, true);
+    assert.match(String(toolEvent.payload.output), /Skill 不存在/);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('storage failure during load_skill is not masked as a skill error', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-skill-store-fail-'));
+  const store = new SqliteEventStore(path.join(dir, 'bruin.db'));
+  const session = store.createSession(dir, profile);
+  const gateway: ModelGateway = {
+    async complete(_profile, _prompt, _signal, _onDelta) {
+      return {
+        text: '',
+        calls: [{ id: 's1', name: 'load_skill', input: { name: 'code-review' } }],
+        providerMessages: [],
+      };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: '', isError: false };
+    },
+    async close() {},
+  };
+  const originalAppend = store.append.bind(store);
+  store.append = (id, type, payload) => {
+    if (type === 'skill_loaded') {
+      throw new Error('disk full / SQLite I/O error');
+    }
+    return originalAppend(id, type, payload);
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    });
+    await assert.rejects(runner.run(session, 'test'), /disk full/);
+    const events = store.events(session.id);
+    assert.equal(
+      events.some((e) => e.type === 'tool_unknown'),
+      true,
+    );
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
