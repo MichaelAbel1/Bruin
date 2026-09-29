@@ -208,16 +208,7 @@ test('OpenAI-compatible streamed tool call is normalized', async () => {
   }
 });
 
-test('modelProtocol safely handles malformed baseUrl without crashing', () => {
-  assert.equal(
-    modelProtocol({
-      alias: 'custom',
-      provider: 'openai',
-      model: 'gpt-4o',
-      baseUrl: 'not-a-valid-url',
-    }),
-    'openai-chat',
-  );
+test('modelProtocol routes api.openai.com to openai-responses and throws on malformed url', () => {
   assert.equal(
     modelProtocol({
       alias: 'standard',
@@ -227,14 +218,59 @@ test('modelProtocol safely handles malformed baseUrl without crashing', () => {
     }),
     'openai-responses',
   );
+  assert.equal(
+    modelProtocol({
+      alias: 'custom',
+      provider: 'openai',
+      model: 'gpt-4o',
+      baseUrl: 'https://gateway.ai.corp/v1',
+    }),
+    'openai-chat',
+  );
+  assert.throws(
+    () =>
+      modelProtocol({
+        alias: 'bad',
+        provider: 'openai',
+        model: 'gpt-4o',
+        baseUrl: 'not-a-valid-url',
+      }),
+    /Invalid URL/,
+  );
 });
 
-test('resolveApiKey allows local 0.0.0.0 endpoints without API key', () => {
-  const profile = {
-    alias: 'local-docker',
+test('resolveApiKey validates local URLs strictly against host spoofing and excludes 0.0.0.0', () => {
+  const localProfile = {
+    alias: 'local-ollama',
+    provider: 'openai-compatible' as const,
+    model: 'llama3',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+  };
+  assert.equal(resolveApiKey(localProfile), undefined);
+
+  const ipv6Profile = {
+    alias: 'local-ipv6',
+    provider: 'openai-compatible' as const,
+    model: 'llama3',
+    baseUrl: 'http://[::1]:11434/v1',
+  };
+  assert.equal(resolveApiKey(ipv6Profile), undefined);
+
+  // 0.0.0.0 is for binding, not client targeting; requires api key
+  const zeroProfile = {
+    alias: 'zero-host',
     provider: 'openai-compatible' as const,
     model: 'llama3',
     baseUrl: 'http://0.0.0.0:11434/v1',
   };
-  assert.equal(resolveApiKey(profile), undefined);
+  assert.throws(() => resolveApiKey(zeroProfile), /缺少 API Key 环境变量/);
+
+  // Userinfo spoofing http://localhost:443@evil.example/v1 resolves hostname to evil.example, not local
+  const spoofedProfile = {
+    alias: 'spoofed',
+    provider: 'openai-compatible' as const,
+    model: 'llama3',
+    baseUrl: 'http://localhost:443@evil.example/v1',
+  };
+  assert.throws(() => resolveApiKey(spoofedProfile), /缺少 API Key 环境变量/);
 });

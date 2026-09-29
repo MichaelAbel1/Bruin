@@ -113,7 +113,7 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     assert.equal(created.session.profile.alias, 'local');
     await assert.rejects(
       request('createSession', { workspace: path.join(dir, 'non_existent_subdir') }),
-      /工作区目录不存在/,
+      /ENOENT/,
     );
     await assert.rejects(
       request('saveProfile', {

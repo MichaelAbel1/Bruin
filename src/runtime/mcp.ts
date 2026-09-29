@@ -2,7 +2,6 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import type { McpServerConfig } from '../config.js';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -43,8 +42,7 @@ function resolveExecutable(command: string, workspace: string): string {
 function sandboxProfile(workspace: string, _executable: string): string {
   const root = fs.realpathSync(workspace).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
   if (!fs.statSync(root).isDirectory()) throw new Error('MCP 工作区不是目录');
-  const tmpReal = fs.realpathSync(os.tmpdir()).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-  return `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "/tmp")) (allow file-write* (subpath "${tmpReal}"))`;
+  return `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "/tmp"))`;
 }
 
 /** Connections are owned by the host. No MCP process inherits model credentials by default. */

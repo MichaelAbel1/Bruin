@@ -151,6 +151,22 @@ export const toolSchemas = {
     inputSchema: z.object({ content: z.string().min(1).max(1000) }),
   },
 };
+function isLocalUrl(urlString?: string): boolean {
+  if (!urlString) return false;
+  try {
+    const url = new URL(urlString);
+    if (url.protocol !== 'http:') return false;
+    return (
+      url.hostname === 'localhost' ||
+      url.hostname === '127.0.0.1' ||
+      url.hostname === '[::1]' ||
+      url.hostname === '::1'
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function resolveApiKey(profile: ModelProfile): string | undefined {
   const keyName =
     profile.apiKeyEnv ??
@@ -163,27 +179,14 @@ export function resolveApiKey(profile: ModelProfile): string | undefined {
       } as const
     )[profile.provider];
   const key = getRuntimeApiKey(profile.alias) ?? process.env[keyName];
-  const isLocalCompatible =
-    profile.provider === 'openai-compatible' &&
-    (profile.baseUrl?.startsWith('http://localhost:') ||
-      profile.baseUrl?.startsWith('http://127.0.0.1:') ||
-      profile.baseUrl === 'http://localhost' ||
-      profile.baseUrl === 'http://127.0.0.1' ||
-      profile.baseUrl?.startsWith('http://0.0.0.0:') ||
-      profile.baseUrl === 'http://0.0.0.0' ||
-      profile.baseUrl?.startsWith('http://[::1]:') ||
-      profile.baseUrl === 'http://[::1]');
+  const isLocalCompatible = profile.provider === 'openai-compatible' && isLocalUrl(profile.baseUrl);
   if (!key && !isLocalCompatible) throw new Error(`缺少 API Key 环境变量: ${keyName}`);
   return key;
 }
 export function modelProtocol(profile: ModelProfile): string {
   if (profile.provider === 'openai') {
-    if (!profile.baseUrl) return 'openai-responses';
-    try {
-      if (new URL(profile.baseUrl).origin === 'https://api.openai.com') return 'openai-responses';
-    } catch {
-      return 'openai-chat';
-    }
+    if (!profile.baseUrl || new URL(profile.baseUrl).origin === 'https://api.openai.com')
+      return 'openai-responses';
     return 'openai-chat';
   }
   return profile.provider === 'openai-compatible' ? 'openai-chat' : profile.provider;

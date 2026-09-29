@@ -1754,6 +1754,35 @@ test('ProcessExecutor auto-respawns worker child if it unexpectedly terminates',
   }
 });
 
+test('ProcessExecutor handles cancellation race when worker terminates concurrently without crashing', async () => {
+  const dir = temp();
+  fs.writeFileSync(path.join(dir, 'test.txt'), 'content');
+  const executor = new ProcessExecutor();
+  try {
+    const controller = new AbortController();
+    const promise = executor.execute(
+      {
+        requestId: 'race-cancel',
+        name: 'read_file',
+        input: { path: 'test.txt' },
+        workspace: dir,
+        timeoutMs: 5000,
+        maxOutputBytes: 100,
+      },
+      controller.signal,
+    );
+
+    const child = (executor as any).child;
+    child.kill('SIGKILL');
+    controller.abort();
+
+    await assert.rejects(promise, /(工具执行进程退出|已取消)/);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('edit_file accurately differentiates between missing text and multiple occurrences', async () => {
   const dir = temp();
   fs.writeFileSync(path.join(dir, 'test.txt'), 'hello world hello');
