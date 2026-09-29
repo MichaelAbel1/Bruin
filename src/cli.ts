@@ -88,9 +88,9 @@ async function main(): Promise<void> {
         contextWindowTokens !== undefined &&
         (!Number.isInteger(contextWindowTokens) ||
           contextWindowTokens < 8192 ||
-          contextWindowTokens > 2_000_000)
+          contextWindowTokens > 1_048_576)
       )
-        throw new Error('--context-tokens 须为 8192 到 2000000 之间的整数');
+        throw new Error('--context-tokens 须为 8192 到 1048576 之间的整数');
       const profile: ModelProfile = {
         alias,
         provider: provider as ProviderKind,
@@ -285,13 +285,25 @@ async function main(): Promise<void> {
       while (!controller.signal.aborted && stdin.isTTY) {
         const line = await rl.question('\n你> ');
         if (line.trim() === '/exit') break;
+        if (line.trim() === '/continue' || !line.trim()) {
+          if (store.events(session.id).at(-1)?.type === 'turn_paused')
+            await runner.run(session, undefined, controller.signal);
+          else if (line.trim()) console.log('当前没有暂停的任务');
+          continue;
+        }
+        if (line.trim() === '/stop') {
+          if (store.events(session.id).at(-1)?.type === 'turn_paused') {
+            store.append(session.id, 'turn_completed', { stoppedByUser: true });
+            console.log('已结束暂停的任务');
+          } else console.log('当前没有暂停的任务');
+          continue;
+        }
         if (line.startsWith('/model ')) {
           store.setProfile(session.id, findProfile(line.slice(7).trim()), leaseOwner);
           session = store.getSession(session.id)!;
           console.log(`模型已切换为 ${session.profile.alias}`);
           continue;
         }
-        if (!line.trim()) continue;
         await runner.run(session, line, controller.signal);
         stdout.write('\n');
       }

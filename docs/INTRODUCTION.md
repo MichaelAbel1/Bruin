@@ -248,7 +248,7 @@ node dist/cli.js chat --model my-gpt --workspace /Users/yourname/my-cool-project
 
 - **默认轮数**：在 [`src/core/agent.ts`](file:///Users/bear/Projects/agentProjects/Bruin/src/core/agent.ts) 中，单次用户交互的最大调用步数（推理-行动循环）默认为 **24 步**。
 - **动态覆盖与安全硬顶**：支持通过环境变量 `BRUIN_MAX_STEPS` 自定义，但底层施加了严格约束：`Math.min(Math.floor(envSteps), 100)`，即单轮**最大上限不得超过 100 步**。
-- **未完成状态保留与现场保护**：如果任务复杂度极高导致步数耗尽，Runner 抛错退出时**不会写入 `turn_completed` 事件**。桌面端与命令行能识别出会话处于“进行中/未闭环”，向用户呈现「继续运行 (Resume)」按钮，用户点击即可无缝从现场断点接续执行，而不会从头重复执行。
+- **暂停与续跑**：达到步数上限时，Runner 记录已执行工具、文件写入和 Shell 命令的报告，追加 `turn_paused` 事件并正常交还控制权。桌面端提供「继续任务」和「结束任务」；继续时从已保存的工具结果恢复，不会自动重放已完成的副作用。
 
 ---
 
@@ -258,24 +258,23 @@ Bruin 设计了**双层动态控制体系**：
 
 ```mermaid
 flowchart TD
-    RawEvents["原始事件序列 (可能几十万字)"] --> Layer1["第一层: buildPrompt 滑动窗口与摘要折叠"]
-    Layer1 --> CheckChars{"超出模型字符预算?"}
-    CheckChars -- 是 --> FoldSummary["将最旧完整轮次折叠为 compact summary (8KB)"]
-    FoldSummary --> Layer1
-    CheckChars -- 否 --> Layer2["第二层: budgetPrompt 硬预算截断"]
+    RawEvents["SQLite 原始事件序列"] --> Layer1["检查上下文预算"]
+    Layer1 --> CheckChars{"接近预算?"}
+    CheckChars -- 是 --> FoldSummary["模型分段提炼并保存摘要检查点"]
+    FoldSummary --> Layer2["从检查点重建 Prompt"]
+    CheckChars -- 否 --> Layer2
     Layer2 --> CheckTokens{"输入字节 > contextWindowTokens * 0.75?"}
-    CheckTokens -- 是 --> PruneHistory["优先剔除最早轮次消息"]
-    PruneHistory --> TruncateTools["若仍超限: 将工具结果截断至 2KB"]
-    TruncateTools --> FinalPrompt["安全 Prompt (预留 25% 空间给模型输出)"]
+    CheckTokens -- 是 --> PruneHistory["压缩较早轮次、工具结果及当前输入"]
+    PruneHistory --> FinalPrompt["预留 25% 空间给模型输出"]
     CheckTokens -- 否 --> FinalPrompt
 ```
 
-1. **第一层：动态滑动窗口与历史摘要折叠**（[`src/core/history.ts: buildPrompt`](file:///Users/bear/Projects/agentProjects/Bruin/src/core/history.ts)）：
-   - 默认保留最近 10 轮交互，超出预算时以完整轮次为粒度裁切，并生成不超过 8,000 字符的摘要记录历史目标和关键工具成功/失败状态。
+1. **第一层：持久摘要检查点**（`src/core/agent.ts`、`src/core/history.ts`）：
+   - 接近预算时分段提炼较早轮次，保存摘要及已覆盖事件序号；恢复后复用摘要，原始事件仍保留在 SQLite。当前输入过长时也会提炼。
    - 历史多模态图片只在当前轮发送真实 Base64，历史轮次自动忽略，避免几兆甚至几十兆的 Base64 冗余反复上传。
-2. **第二层：硬预算截断兜底**（[`src/core/history.ts: budgetPrompt`](file:///Users/bear/Projects/agentProjects/Bruin/src/core/history.ts)）：
+2. **第二层：本地预算压缩兜底**（`src/core/history.ts`）：
    - 以模型配置的 `contextWindowTokens * 0.75` 作为硬输入字节上限，保留 25% 空间用于推理与回答。
-   - 历史工具调用返回的大段日志在空间紧绷时自动截断为 2,000 字符并附注 `[较长工具结果已截断]`。
+   - 继续超限时压缩较早轮次、工具输出和当前输入。若 Provider 仍报告上下文超限，会用更小预算重试；摘要是有损的，无法保证保留全部细节。
 
 ---
 

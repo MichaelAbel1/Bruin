@@ -31,7 +31,7 @@ const profileSchema = z.object({
   model: z.string().min(1),
   baseUrl: z.string().url().optional(),
   apiKeyEnv: z.string().regex(envNamePattern).optional(),
-  contextWindowTokens: z.number().int().min(8192).max(2_000_000).optional(),
+  contextWindowTokens: z.number().int().min(8192).max(1_048_576).optional(),
 });
 export const mcpServerSchema = z.discriminatedUnion('transport', [
   z.object({
@@ -71,6 +71,12 @@ const configSchema = z.object({
   marketplaces: z.array(z.object({ name: z.string(), source: z.string() })).default([]),
   mcpServers: z.array(mcpServerSchema).default([]),
   hooks: z.array(hookSchema).default([]),
+  approvalMode: z.enum(['ask', 'autoSafe']).default('ask'),
+  approvedCommands: z
+    .array(
+      z.object({ workspace: z.string(), command: z.string(), sessionId: z.string().optional() }),
+    )
+    .default([]),
 });
 export type AppConfig = z.infer<typeof configSchema>;
 export function dataDir(): string {
@@ -81,13 +87,20 @@ export function configPath(): string {
 }
 export function loadConfig(): AppConfig {
   if (!fs.existsSync(configPath()))
-    return { profiles: [], marketplaces: [], mcpServers: [], hooks: [] };
+    return {
+      profiles: [],
+      marketplaces: [],
+      mcpServers: [],
+      hooks: [],
+      approvalMode: 'ask',
+      approvedCommands: [],
+    };
   let raw: {
-    profiles?: Array<{ alias?: string; apiKeyEnv?: string }>;
+    profiles?: Array<{ alias?: string; apiKeyEnv?: string; contextWindowTokens?: number }>;
   };
   try {
     raw = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as {
-      profiles?: Array<{ alias?: string; apiKeyEnv?: string }>;
+      profiles?: Array<{ alias?: string; apiKeyEnv?: string; contextWindowTokens?: number }>;
     };
   } catch (error) {
     throw new Error(
@@ -100,6 +113,13 @@ export function loadConfig(): AppConfig {
   let migrated = false;
   for (const profile of Array.isArray(raw.profiles) ? raw.profiles : []) {
     if (profile === null || typeof profile !== 'object') continue;
+    if (
+      typeof profile.contextWindowTokens === 'number' &&
+      profile.contextWindowTokens > 1_048_576
+    ) {
+      profile.contextWindowTokens = 1_048_576;
+      migrated = true;
+    }
     const value = profile.apiKeyEnv;
     if (typeof value !== 'string' || validApiKeyEnv(value)) continue;
     // Older desktop versions allowed a key to be entered as an environment variable name.
@@ -209,7 +229,7 @@ export function withConfigLock<T>(fn: () => T): T {
   }
 }
 
-export function saveConfig(config: AppConfig): void {
+export function saveConfig(config: z.input<typeof configSchema>): void {
   withConfigLock(() => {
     fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
     const temp = `${configPath()}.${process.pid}.${randomUUID()}.tmp`;

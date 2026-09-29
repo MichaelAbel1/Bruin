@@ -90,6 +90,9 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
   try {
     const initial = await request('bootstrap');
     assert.deepEqual(initial.sessions, []);
+    assert.equal(initial.config.approvalMode, 'ask');
+    assert.equal((await request('setApprovalMode', { mode: 'autoSafe' })).approvalMode, 'autoSafe');
+    await assert.rejects(request('setApprovalMode', { mode: 'unsafe' }), /无效的审批模式/);
     const key = 'sk-test-key-used-only-in-memory';
     const config = await request('saveProfile', {
       alias: 'local',
@@ -109,6 +112,29 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       },
     );
     const created = await request('createSession', { workspace: dir });
+    assert.deepEqual(
+      (await request('getApprovalSettings', { sessionId: created.session.id })).sessionCommands,
+      [],
+    );
+    const configFile = path.join(dir, 'home', 'config.json');
+    const persisted = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    persisted.approvedCommands = [
+      { workspace: created.session.workspace, command: 'pwd', sessionId: created.session.id },
+    ];
+    fs.writeFileSync(configFile, JSON.stringify(persisted));
+    assert.deepEqual(
+      (await request('getApprovalSettings', { sessionId: created.session.id })).sessionCommands,
+      [[created.session.workspace, 'pwd']],
+    );
+    await request('removeSessionCommand', {
+      sessionId: created.session.id,
+      workspace: created.session.workspace,
+      command: 'pwd',
+    });
+    assert.deepEqual(
+      (await request('getApprovalSettings', { sessionId: created.session.id })).sessionCommands,
+      [],
+    );
     assert.equal(created.session.workspace, fs.realpathSync(dir));
     assert.equal(created.session.profile.alias, 'local');
     await assert.rejects(
@@ -247,6 +273,23 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     });
     assert.equal(writeRes.path, 'written.txt');
     assert.equal(fs.readFileSync(path.join(dir, 'written.txt'), 'utf8'), 'hello written');
+
+    const pauseStore = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
+    pauseStore.append(created.session.id, 'turn_paused', { reason: 'step_limit', limit: 2 });
+    pauseStore.acquireLease(created.session.id, 'external-process', 30_000);
+    await assert.rejects(
+      request('finishPausedTurn', { sessionId: created.session.id }),
+      /运行/,
+    );
+    pauseStore.releaseLease(created.session.id, 'external-process');
+    pauseStore.close();
+    const ended = await request('finishPausedTurn', { sessionId: created.session.id });
+    assert.equal(ended.events.at(-1).type, 'turn_completed');
+    assert.equal(ended.events.at(-1).payload.stoppedByUser, true);
+    await assert.rejects(
+      request('finishPausedTurn', { sessionId: created.session.id }),
+      /未处于暂停状态/,
+    );
 
     const afterRemoval = await request('removeProfile', { alias: 'local' });
     assert.deepEqual(afterRemoval.profiles, []);

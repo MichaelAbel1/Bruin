@@ -6,7 +6,9 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { SqliteEventStore } from '../storage/event-store.js';
 import Database from 'better-sqlite3';
-import { budgetPrompt, buildPrompt } from '../core/history.js';
+import { budgetPrompt, buildPrompt, promptBytes } from '../core/history.js';
+import { isAutoSafeShell } from '../core/approval-policy.js';
+
 import { decisionFor } from '../core/permissions.js';
 import { AgentRunner, formatModelError } from '../core/agent.js';
 import type { ModelGateway } from '../providers/gateway.js';
@@ -38,6 +40,52 @@ import {
 } from '../core/workspace-files.js';
 import { importAttachments } from '../core/attachments.js';
 
+test('automatic Shell approval rejects command composition and mutation', () => {
+  assert.equal(isAutoSafeShell('git status --short'), true);
+  for (const command of [
+    'git status --short; rm -rf .',
+    'git status --short && curl example.com',
+    'git diff --stat --ext-diff',
+    'git reset --hard',
+    'cat /etc/passwd',
+  ])
+    assert.equal(isAutoSafeShell(command), false, command);
+});
+
+test('history keeps more than ten turns when the configured budget allows it', () => {
+  const events = Array.from({ length: 12 }, (_, index) => ({
+    sessionId: 'history',
+    seq: index + 1,
+    type: 'user' as const,
+    at: '2026-01-01T00:00:00.000Z',
+    payload: { text: `turn ${index + 1}` },
+  }));
+  const prompt = buildPrompt(events, 'system', undefined, undefined, 100_000);
+  assert.ok(prompt.some((message) => message.role === 'user' && message.content === 'turn 1'));
+  assert.ok(prompt.some((message) => message.role === 'user' && message.content === 'turn 12'));
+});
+
+test('history rebuild uses only the newest durable compaction checkpoint', () => {
+  const event = (
+    seq: number,
+    type: SessionEvent['type'],
+    payload: Record<string, unknown>,
+  ): SessionEvent => ({ sessionId: 'checkpoint', seq, type, at: '', payload });
+  const messages = buildPrompt(
+    [
+      event(1, 'user', { text: 'obsolete raw request' }),
+      event(2, 'summary', { throughSeq: 1, text: 'older summary' }),
+      event(3, 'user', { text: 'another raw request' }),
+      event(4, 'summary', { throughSeq: 3, text: 'latest retained summary' }),
+      event(5, 'user', { text: 'current request' }),
+    ],
+    'system',
+  );
+  const serialized = JSON.stringify(messages);
+  assert.match(serialized, /latest retained summary/);
+  assert.match(serialized, /current request/);
+  assert.doesNotMatch(serialized, /older summary|obsolete raw request|another raw request/);
+});
 const profile: ModelProfile = {
   alias: 'mock',
   provider: 'openai-compatible',
@@ -1311,7 +1359,7 @@ test('buildPrompt keeps the newest complete turns within its history budget', ()
   assert.match(String(users[1].content), /^6:/);
   assert.match(String(users.at(-1)?.content), /^11:/);
 });
-test('budgetPrompt removes old turns and rejects oversized current input', () => {
+test('budgetPrompt compresses old and oversized current input without aborting', () => {
   const messages = [
     { role: 'system' as const, content: 'instructions' },
     { role: 'user' as const, content: 'old:' + 'x'.repeat(15_000) },
@@ -1319,14 +1367,24 @@ test('budgetPrompt removes old turns and rejects oversized current input', () =>
     { role: 'user' as const, content: 'new:' + 'y'.repeat(15_000) },
   ];
   const budgeted = budgetPrompt(messages, 32_768);
-  assert.equal(budgeted.length, 2);
-  assert.equal(budgeted[1], messages[3]);
+  assert.equal(budgeted.length, 3);
+  assert.match(String(budgeted[1].content), /Earlier conversation summary/);
+  assert.equal(budgeted[2], messages[3]);
   assert.equal(messages.length, 4);
   assert.equal(budgetPrompt(messages, 65_536).length, 4);
-  assert.throws(
-    () => budgetPrompt([{ role: 'system', content: 'x'.repeat(30_000) }], 32_768),
-    /上下文预算/,
+  assert.ok(
+    promptBytes(budgetPrompt([{ role: 'system', content: 'x'.repeat(30_000) }], 32_768)) <= 24_576,
   );
+  const huge = budgetPrompt(
+    [
+      { role: 'system', content: 'instructions' },
+      { role: 'user', content: 'begin:' + 'z'.repeat(100_000) + ':end' },
+    ],
+    8192,
+  );
+  assert.ok(promptBytes(huge) <= 6144);
+  assert.match(JSON.stringify(huge), /begin:/);
+  assert.match(JSON.stringify(huge), /:end/);
   const imagePrompt = budgetPrompt([
     { role: 'system', content: 'instructions' },
     {
@@ -1341,6 +1399,138 @@ test('budgetPrompt removes old turns and rejects oversized current input', () =>
     },
   ]);
   assert.equal(imagePrompt.length, 2);
+});
+
+test('agent persists a model summary and reuses it after context compaction', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, { ...profile, contextWindowTokens: 8192 });
+    for (let index = 0; index < 4; index++) {
+      store.append(session.id, 'user', { text: `request ${index}: ${'detail '.repeat(300)}` });
+      store.append(session.id, 'assistant', { text: `result ${index}: ${'finding '.repeat(300)}` });
+    }
+    let summaries = 0;
+    let delivered = '';
+    const gateway: ModelGateway = {
+      async summarize() {
+        summaries++;
+        return 'User goal: inspect the project. Decision: retain existing behavior. Tests pending.';
+      },
+      async complete(_profile, prompt) {
+        delivered = JSON.stringify(prompt);
+        return { text: 'continued', calls: [] };
+      },
+    };
+    const executor: ToolExecutor = {
+      async execute() {
+        throw new Error('unexpected tool');
+      },
+      async close() {},
+    };
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return false;
+      },
+    });
+    await runner.run(session, 'continue the analysis');
+    assert.ok(summaries > 0);
+    const checkpoint = store
+      .events(session.id)
+      .find((event) => event.type === 'summary' && event.payload.throughSeq);
+    assert.ok(checkpoint);
+    assert.match(String(checkpoint.payload.text), /retain existing behavior/);
+    assert.match(delivered, /retain existing behavior/);
+    assert.match(delivered, /continue the analysis/);
+    assert.equal(store.events(session.id).filter((event) => event.type === 'user').length, 5);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('agent summarizes an oversized current request and completes the turn', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, { ...profile, contextWindowTokens: 8192 });
+    let summaries = 0;
+    let delivered = '';
+    const gateway: ModelGateway = {
+      async summarize() {
+        summaries++;
+        return 'Current request: inspect files and report findings; keep all user constraints.';
+      },
+      async complete(_profile, prompt) {
+        delivered = JSON.stringify(prompt);
+        return { text: 'done', calls: [] };
+      },
+    };
+    const executor: ToolExecutor = {
+      async execute() {
+        throw new Error('unexpected tool');
+      },
+      async close() {},
+    };
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return false;
+      },
+    });
+    await runner.run(session, `inspect files ${'specific requirement '.repeat(6000)}finish`);
+    assert.ok(summaries > 0);
+    assert.match(delivered, /keep all user constraints/);
+    assert.ok(
+      store
+        .events(session.id)
+        .some((event) => event.type === 'summary' && event.payload.throughSeq),
+    );
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('agent retries a provider context-limit error with a smaller prompt', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, { ...profile, contextWindowTokens: 32_768 });
+    const sizes: number[] = [];
+    const gateway: ModelGateway = {
+      async complete(_profile, prompt) {
+        sizes.push(promptBytes(prompt));
+        if (sizes.length === 1)
+          throw Object.assign(new Error('maximum context length exceeded'), { statusCode: 400 });
+        return { text: 'continued', calls: [] };
+      },
+    };
+    const executor: ToolExecutor = {
+      async execute() {
+        throw new Error('unexpected tool');
+      },
+      async close() {},
+    };
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return false;
+      },
+    });
+    await runner.run(session, `Start ${'constraint '.repeat(1600)} End`);
+    assert.equal(sizes.length, 2);
+    assert.ok(sizes[1] < sizes[0]);
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 test('tasks can be deleted safely without removing unrelated files or breaking dependents', () => {
   const dir = temp();
@@ -1396,29 +1586,39 @@ test('task deletion refuses a replaced .tasks directory before changing SQLite',
     fs.rmSync(outside, { recursive: true, force: true });
   }
 });
-test('step limit is bounded and leaves uncompleted turn state to allow UI resume', async () => {
+test('step limit pauses with a side-effect report and resumes without replaying completed tools', async () => {
   const dir = temp();
   const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
   const session = store.createSession(dir, profile);
   let stepCalls = 0;
+  let writes = 0;
   const gateway: ModelGateway = {
     async complete() {
       stepCalls++;
-      return {
-        text: '',
-        calls: [{ id: `call-${stepCalls}`, name: 'read_file', input: { path: 'a.txt' } }],
-      };
+      return stepCalls <= 2
+        ? {
+            text: '',
+            calls: [
+              {
+                id: 'reused-call',
+                name: 'write_file',
+                input: { path: `changed-${stepCalls}.txt`, content: `result ${stepCalls}` },
+              },
+            ],
+          }
+        : { text: 'All work verified.', calls: [] };
     },
   };
   const executor: ToolExecutor = {
-    async execute() {
-      return { output: 'content', isError: false };
+    async execute(request) {
+      writes++;
+      fs.writeFileSync(path.join(dir, String(request.input.path)), String(request.input.content));
+      return { output: 'written', isError: false };
     },
     async close() {},
   };
   process.env.BRUIN_MAX_STEPS = '2';
   try {
-    fs.writeFileSync(path.join(dir, 'a.txt'), 'content');
     const runner = new AgentRunner(store, gateway, executor, {
       text() {},
       notice() {},
@@ -1426,12 +1626,19 @@ test('step limit is bounded and leaves uncompleted turn state to allow UI resume
         return true;
       },
     });
-    await assert.rejects(runner.run(session, 'start loop'), /达到每轮最多 2 次模型调用的限制/);
+    await runner.run(session, 'modify two files and verify');
     assert.equal(stepCalls, 2);
     const lastEvent = store.events(session.id).at(-1);
-    // Crucial: last event must NOT be turn_completed so desktop UI shows "继续未完成的运行"
-    assert.notEqual(lastEvent?.type, 'turn_completed');
-    assert.equal(lastEvent?.type, 'tool_finished');
+    assert.equal(lastEvent?.type, 'turn_paused');
+    assert.match(String(lastEvent.payload.report), /changed-1\.txt/);
+    assert.match(String(lastEvent.payload.report), /changed-2\.txt/);
+    assert.equal(fs.readFileSync(path.join(dir, 'changed-1.txt'), 'utf8'), 'result 1');
+    assert.equal(fs.readFileSync(path.join(dir, 'changed-2.txt'), 'utf8'), 'result 2');
+    assert.equal(runner.recover(session), 0);
+    await runner.run(session);
+    assert.equal(stepCalls, 3);
+    assert.equal(writes, 2);
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
   } finally {
     delete process.env.BRUIN_MAX_STEPS;
     store.close();
@@ -1936,6 +2143,16 @@ test('loadConfig reports descriptive error on corrupted config file and saveConf
 
     fs.writeFileSync(configPath(), JSON.stringify({ profiles: [null] }));
     assert.throws(() => loadConfig(), /配置文件格式无效/);
+
+    fs.writeFileSync(
+      configPath(),
+      JSON.stringify({
+        profiles: [
+          { alias: 'legacy', provider: 'openai', model: 'test', contextWindowTokens: 2_000_000 },
+        ],
+      }),
+    );
+    assert.equal(loadConfig().profiles[0].contextWindowTokens, 1_048_576);
 
     saveConfig({ profiles: [], marketplaces: [], mcpServers: [], hooks: [] });
     const loaded = loadConfig();

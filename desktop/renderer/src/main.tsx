@@ -102,6 +102,7 @@ type Approval = {
   call: { name: string; input: Record<string, unknown> };
   reason: string;
 };
+type ApprovalScope = 'once' | 'session' | 'always';
 type McpServer =
   | { name: string; transport: 'stdio'; command: string; args: string[]; envNames: string[] }
   | { name: string; transport: 'http'; url: string; tokenEnv?: string };
@@ -117,6 +118,8 @@ type Config = {
   marketplaces: Market[];
   mcpServers: McpServer[];
   hooks: Hook[];
+  approvalMode: 'ask' | 'autoSafe';
+  approvedCommands: { workspace: string; command: string; sessionId?: string }[];
 };
 type HostEvent = {
   type: string;
@@ -554,6 +557,8 @@ function App() {
     marketplaces: [],
     mcpServers: [],
     hooks: [],
+    approvalMode: 'ask',
+    approvedCommands: [],
   });
   const [sessions, setSessions] = useState<Session[]>([]);
   const [view, setView] = useState<SessionView | null>(null);
@@ -564,8 +569,10 @@ function App() {
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const [quote, setQuote] = useState<{ seq: number; text: string } | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
+  const [approvalScope, setApprovalScope] = useState<ApprovalScope>('once');
+  const [sessionApprovedCommands, setSessionApprovedCommands] = useState<[string, string][]>([]);
   const [dialog, setDialog] = useState<
-    'model' | 'new' | 'skills' | 'appearance' | 'runtime' | 'preferences' | null
+    'model' | 'new' | 'skills' | 'appearance' | 'runtime' | 'preferences' | 'approvals' | null
   >(null);
   const [iconBackground, setIconBackground] = useState('white');
   const [uiTheme, setUiTheme] = useState<'light' | 'dark'>('light');
@@ -748,6 +755,7 @@ function App() {
         return;
       }
       if (message.type === 'approval' && message.approvalId && message.call && message.sessionId) {
+        setApprovalScope('once');
         setApproval({
           approvalId: message.approvalId,
           call: message.call,
@@ -894,8 +902,33 @@ function App() {
   async function decide(approved: boolean) {
     if (!approval) return;
     try {
-      await api('answerApproval', { approvalId: approval.approvalId, approved });
+      await api('answerApproval', {
+        approvalId: approval.approvalId,
+        approved,
+        scope: approvalScope,
+      });
       setApproval(null);
+      if (approved && approvalScope !== 'once') {
+        const settings = await api<{ config: Config; sessionCommands: [string, string][] }>(
+          'getApprovalSettings',
+          { sessionId: approval.sessionId },
+        );
+        setConfig(settings.config);
+        setSessionApprovedCommands(settings.sessionCommands);
+      }
+    } catch (err) {
+      fail(err);
+    }
+  }
+  async function openApprovalSettings() {
+    try {
+      const settings = await api<{ config: Config; sessionCommands: [string, string][] }>(
+        'getApprovalSettings',
+        { sessionId: view?.session.id },
+      );
+      setConfig(settings.config);
+      setSessionApprovedCommands(settings.sessionCommands);
+      setDialog('approvals');
     } catch (err) {
       fail(err);
     }
@@ -922,6 +955,14 @@ function App() {
       await api('resume', { sessionId: view.session.id });
     } catch (err) {
       setBusy(false);
+      fail(err);
+    }
+  }
+  async function finishPausedTurn() {
+    if (!view || busy) return;
+    try {
+      setView(await api<SessionView>('finishPausedTurn', { sessionId: view.session.id }));
+    } catch (err) {
       fail(err);
     }
   }
@@ -1030,6 +1071,9 @@ function App() {
           </div>
         )}
         <div className="sidebar-footer">
+          <button onClick={() => void openApprovalSettings()}>
+            <ShieldCheck size={17} /> 免审批命令
+          </button>
           <button onClick={() => setDialog('appearance')}>
             <Palette size={17} /> 外观
           </button>
@@ -1264,24 +1308,16 @@ function App() {
                       批准计划并允许执行
                     </button>
                   )}
-                  {view.plan.approved && <small>计划已批准。修改仍遵循逐项工具审批。</small>}
+                  {view.plan.approved && <small>计划已批准。工具仍遵循当前审批设置。</small>}
                 </div>
               )}
-              {view.events
-                .filter((e) =>
-                  [
-                    'user',
-                    'assistant',
-                    'tool_finished',
-                    'tool_denied',
-                    'tool_unknown',
-                    'model_error',
-                  ].includes(e.type),
-                )
-                .map((e) => (
+              {groupConversationEvents(view.events).map((item) =>
+                item.kind === 'tools' ? (
+                  <ToolActivity key={`tools-${item.events[0].seq}`} events={item.events} />
+                ) : (
                   <EventCard
-                    key={e.seq}
-                    event={e}
+                    key={item.event.seq}
+                    event={item.event}
                     onQuote={(selected) =>
                       setQuote({
                         seq: selected.seq,
@@ -1289,7 +1325,8 @@ function App() {
                       })
                     }
                   />
-                ))}
+                ),
+              )}
               {stream && (
                 <div className="message assistant">
                   <div className="message-icon">
@@ -1318,9 +1355,17 @@ function App() {
                 </div>
               )}
               {canResume && !view.needsReview && (
-                <button className="resume-button" onClick={() => void resume()}>
-                  <Sparkles size={16} /> 继续未完成的运行
-                </button>
+                <div className="resume-actions">
+                  <button className="resume-button" onClick={() => void resume()}>
+                    <Sparkles size={16} />{' '}
+                    {lastEvent?.type === 'turn_paused' ? '继续任务' : '继续未完成的运行'}
+                  </button>
+                  {lastEvent?.type === 'turn_paused' && (
+                    <button className="secondary" onClick={() => void finishPausedTurn()}>
+                      结束任务
+                    </button>
+                  )}
+                </div>
               )}
               <div ref={bottom} />
             </div>
@@ -1559,16 +1604,111 @@ function App() {
               {approval.call.name}
             </div>
             <pre>{JSON.stringify(approval.call.input, null, 2)}</pre>
+            {approval.call.name === 'shell' && (
+              <div className="approval-scope">
+                <label htmlFor="approval-scope">授权范围（仅对相同工作区中的完整命令生效）</label>
+                <select
+                  id="approval-scope"
+                  value={approvalScope}
+                  onChange={(e) => setApprovalScope(e.target.value as ApprovalScope)}
+                >
+                  <option value="once">仅本次</option>
+                  <option value="session">本会话</option>
+                  <option value="always">永久允许</option>
+                </select>
+              </div>
+            )}
             <div className="modal-actions">
               <button className="secondary" onClick={() => void decide(false)}>
                 拒绝
               </button>
               <button className="primary" onClick={() => void decide(true)}>
-                <Check size={16} /> 允许本次操作
+                <Check size={16} /> 允许
+                {approvalScope === 'session' && approval.call.name === 'shell'
+                  ? '本会话'
+                  : approvalScope === 'always' && approval.call.name === 'shell'
+                    ? '并记住'
+                    : '本次操作'}
               </button>
             </div>
           </div>
         </div>
+      )}
+      {dialog === 'approvals' && (
+        <Modal title="免审批命令" eyebrow="APPROVAL SETTINGS" close={() => setDialog(null)}>
+          <div className="form-stack">
+            <label>Agent 审批模式</label>
+            <select
+              value={config.approvalMode}
+              onChange={(e) =>
+                void api<Config>('setApprovalMode', { mode: e.target.value })
+                  .then(setConfig)
+                  .catch(fail)
+              }
+            >
+              <option value="ask">每次询问</option>
+              <option value="autoSafe">自动执行固定只读命令</option>
+            </select>
+            <p className="form-help">
+              自主模式仅自动允许 pwd、git status、git diff --stat、git diff --name-only 和 git
+              branch --show-current。其他 Shell 命令、写入及外部工具仍需审批。
+            </p>
+            <h3>永久允许的命令</h3>
+            {config.approvedCommands.filter((rule) => !rule.sessionId).length ? (
+              config.approvedCommands
+                .filter((rule) => !rule.sessionId)
+                .map((rule) => (
+                  <div className="approved-command" key={`${rule.workspace}:${rule.command}`}>
+                    <div>
+                      <small>{rule.workspace}</small>
+                      <code>{rule.command}</code>
+                    </div>
+                    <button
+                      className="secondary"
+                      onClick={() =>
+                        void api<Config>('removeApprovedCommand', rule).then(setConfig).catch(fail)
+                      }
+                    >
+                      撤销
+                    </button>
+                  </div>
+                ))
+            ) : (
+              <p className="form-help">暂无永久授权。会话授权随会话保存。</p>
+            )}
+            <h3>本会话允许的命令</h3>
+            {sessionApprovedCommands.length ? (
+              sessionApprovedCommands.map(([workspace, command]) => (
+                <div className="approved-command" key={`${workspace}:${command}`}>
+                  <div>
+                    <small>{workspace}</small>
+                    <code>{command}</code>
+                  </div>
+                  <button
+                    className="secondary"
+                    onClick={() =>
+                      void api('removeSessionCommand', {
+                        sessionId: view?.session.id,
+                        workspace,
+                        command,
+                      })
+                        .then(() =>
+                          setSessionApprovedCommands((rules) =>
+                            rules.filter((rule) => rule[0] !== workspace || rule[1] !== command),
+                          ),
+                        )
+                        .catch(fail)
+                    }
+                  >
+                    撤销
+                  </button>
+                </div>
+              ))
+            ) : (
+              <p className="form-help">暂无本会话授权。</p>
+            )}
+          </div>
+        </Modal>
       )}
       {dialog === 'new' && (
         <NewSessionDialog
@@ -1754,6 +1894,69 @@ function PreferencesDialog({ close, fail }: { close: () => void; fail: (error: u
   );
 }
 
+type ConversationItem =
+  { kind: 'event'; event: SessionEvent } | { kind: 'tools'; events: SessionEvent[] };
+
+function groupConversationEvents(events: SessionEvent[]): ConversationItem[] {
+  const items: ConversationItem[] = [];
+  let tools: SessionEvent[] = [];
+  const flush = () => {
+    if (tools.length) items.push({ kind: 'tools', events: tools });
+    tools = [];
+  };
+  for (const event of events) {
+    if (event.type === 'assistant') {
+      if (String(event.payload.text ?? '').trim()) {
+        flush();
+        items.push({ kind: 'event', event });
+      }
+      if (Array.isArray(event.payload.calls) && event.payload.calls.length) tools.push(event);
+    } else if (['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type)) {
+      tools.push(event);
+    } else if (
+      event.type === 'user' ||
+      event.type === 'model_error' ||
+      event.type === 'turn_paused'
+    ) {
+      flush();
+      items.push({ kind: 'event', event });
+    }
+  }
+  flush();
+  return items;
+}
+
+function ToolActivity({ events }: { events: SessionEvent[] }) {
+  const results = events.filter((event) =>
+    ['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type),
+  );
+  const pending =
+    events.flatMap((event) =>
+      event.type === 'assistant' && Array.isArray(event.payload.calls) ? event.payload.calls : [],
+    ).length - results.length;
+  const failures = results.filter(
+    (event) => event.type !== 'tool_finished' || event.payload.isError,
+  ).length;
+  return (
+    <details className="tool-activity">
+      <summary>
+        <Terminal size={15} />
+        <span>
+          工具调用 {results.length + Math.max(0, pending)} 次
+          {failures > 0 ? ` · ${failures} 次失败或需检查` : ''}
+        </span>
+        <ChevronDown size={14} />
+      </summary>
+      <div className="tool-activity-list">
+        {results.map((event) => (
+          <EventCard key={event.seq} event={event} onQuote={() => {}} />
+        ))}
+        {pending > 0 && <small>{pending} 项调用尚无结果</small>}
+      </div>
+    </details>
+  );
+}
+
 function EventCard({
   event,
   onQuote,
@@ -1761,6 +1964,12 @@ function EventCard({
   event: SessionEvent;
   onQuote: (event: SessionEvent) => void;
 }) {
+  if (event.type === 'turn_paused')
+    return (
+      <div className="pause-banner">
+        <CircleAlert size={16} /> 本段运行在步数上限处暂停。上方是当时的执行记录。
+      </div>
+    );
   if (event.type === 'user')
     return (
       <div className="message user">
@@ -1795,10 +2004,7 @@ function EventCard({
     );
   if (event.type === 'assistant') {
     const text = String(event.payload.text ?? '');
-    const calls = Array.isArray(event.payload.calls)
-      ? (event.payload.calls as Array<{ name: string }>)
-      : [];
-    if (!text && !calls.length) return null;
+    if (!text) return null;
     return (
       <div className="message assistant">
         <div className="message-icon">
@@ -1813,16 +2019,6 @@ function EventCard({
             <button className="quote-action" onClick={() => onQuote(event)}>
               引用
             </button>
-          )}
-          {calls.length > 0 && (
-            <div className="tool-chips">
-              {calls.map((call, index) => (
-                <span key={index}>
-                  <Terminal size={13} />
-                  {call.name}
-                </span>
-              ))}
-            </div>
           )}
         </div>
       </div>
@@ -2618,8 +2814,8 @@ function ModelDialog({
   }, [focusAlias]);
   async function save() {
     const contextTokens = Number(contextWindowTokens);
-    if (!Number.isInteger(contextTokens) || contextTokens < 8192 || contextTokens > 2_000_000) {
-      fail(new Error('上下文窗口须为 8192 到 2000000 之间的整数'));
+    if (!Number.isInteger(contextTokens) || contextTokens < 8192 || contextTokens > 1_048_576) {
+      fail(new Error('上下文窗口须为 8192 到 1048576 之间的整数'));
       return;
     }
     if (apiKeyEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
@@ -2745,15 +2941,24 @@ function ModelDialog({
         />
         <label>上下文窗口（tokens）</label>
         <input
+          type="range"
+          min="8192"
+          max="1048576"
+          step="8192"
+          value={contextWindowTokens}
+          onChange={(e) => setContextWindowTokens(e.target.value)}
+          aria-label="上下文窗口滑块"
+        />
+        <input
           type="number"
           min="8192"
-          max="2000000"
+          max="1048576"
           step="1"
           value={contextWindowTokens}
           onChange={(e) => setContextWindowTokens(e.target.value)}
         />
         <p className="form-help">
-          请填写模型公布的上下文窗口。未配置时按 32768 处理，预留四分之一给回复及工具。
+          上限 1,048,576 tokens。请按模型实际支持的窗口设置；预留四分之一给回复及工具。
         </p>
         <label>Base URL {provider === 'openai-compatible' ? '' : '（可选）'}</label>
         <input

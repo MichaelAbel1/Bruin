@@ -21,6 +21,7 @@ import { AiSdkGateway, toolSchemas } from './providers/gateway.js';
 import { discoverModels } from './providers/catalog.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
+import { isAutoSafeShell } from './core/approval-policy.js';
 import {
   addMarket,
   installFromMarket,
@@ -56,7 +57,10 @@ const store = new SqliteEventStore(path.join(dataDir(), 'sessions.sqlite'));
 const executor = new ProcessExecutor();
 let active: { sessionId: string; controller: AbortController } | undefined;
 let activeRun: Promise<unknown> | undefined;
-const approvals = new Map<string, (approved: boolean) => void>();
+const approvals = new Map<
+  string,
+  { resolve: (approved: boolean) => void; sessionId: string; call: ToolCall }
+>();
 const reviewedUnknownSeq = new Map<string, number>();
 
 // Remove secrets accidentally persisted by older desktop versions from session profiles.
@@ -64,6 +68,8 @@ const startupConfig = loadConfig();
 let legacyKeyExposure = legacyKeyWasMigrated();
 for (const session of store.listSessions()) {
   if (store.isLeased(session.id)) continue;
+  if ((session.profile.contextWindowTokens ?? 0) > 1_048_576)
+    store.setProfile(session.id, { ...session.profile, contextWindowTokens: 1_048_576 });
   const legacyValue = session.profile.apiKeyEnv;
   if (!legacyValue || validApiKeyEnv(legacyValue)) continue;
   legacyKeyExposure = true;
@@ -112,9 +118,25 @@ const runner = new AgentRunner(
     notice: (message) => event('notice', { sessionId: active?.sessionId, message }),
     approve: (call: ToolCall, reason: string) =>
       new Promise<boolean>((resolve) => {
+        const sessionId = active?.sessionId;
+        if (!sessionId) return resolve(false);
+        const command = call.name === 'shell' ? String(call.input.command ?? '') : '';
+        const workspace = getSession(sessionId).workspace;
+        const config = loadConfig();
+        if (
+          command &&
+          (config.approvedCommands.some(
+            (rule) =>
+              rule.workspace === workspace &&
+              rule.command === command &&
+              (!rule.sessionId || rule.sessionId === sessionId),
+          ) ||
+            (config.approvalMode === 'autoSafe' && isAutoSafeShell(command)))
+        )
+          return resolve(true);
         const approvalId = randomUUID();
-        approvals.set(approvalId, resolve);
-        event('approval', { sessionId: active?.sessionId, approvalId, call, reason });
+        approvals.set(approvalId, { resolve, sessionId, call });
+        event('approval', { sessionId, approvalId, call, reason });
       }),
   },
   services,
@@ -203,7 +225,7 @@ async function startRun(
       store.releaseLease(session.id, owner);
       active = undefined;
       activeRun = undefined;
-      for (const resolve of approvals.values()) resolve(false);
+      for (const pending of approvals.values()) pending.resolve(false);
       approvals.clear();
     });
   return { started: true };
@@ -309,6 +331,10 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const session = getSession(p.sessionId);
       if (active?.sessionId === session.id) throw new Error('运行中的会话不能删除');
       store.deleteSession(session.id);
+      updateConfig((config) => ({
+        ...config,
+        approvedCommands: config.approvedCommands.filter((rule) => rule.sessionId !== session.id),
+      }));
       reviewedUnknownSeq.delete(session.id);
       return store.listSessions();
     }
@@ -378,20 +404,99 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     }
     case 'resume':
       return startRun(getSession(p.sessionId));
+    case 'finishPausedTurn': {
+      if (active) throw new Error('请等待当前任务结束');
+      const session = getSession(p.sessionId);
+      const leaseOwner = randomUUID();
+      store.acquireLease(session.id, leaseOwner, 10_000);
+      try {
+        if (store.events(session.id).at(-1)?.type !== 'turn_paused')
+          throw new Error('当前任务未处于暂停状态');
+        store.append(session.id, 'turn_completed', { stoppedByUser: true });
+        return viewSession(session);
+      } finally {
+        store.releaseLease(session.id, leaseOwner);
+      }
+    }
     case 'cancel': {
       if (!active || active.sessionId !== String(p.sessionId)) return { cancelled: false };
       active.controller.abort();
-      for (const resolve of approvals.values()) resolve(false);
+      for (const pending of approvals.values()) pending.resolve(false);
       approvals.clear();
       return { cancelled: true };
     }
     case 'answerApproval': {
       const id = String(p.approvalId ?? '');
-      const resolve = approvals.get(id);
-      if (!resolve) throw new Error('审批请求已失效');
+      const pending = approvals.get(id);
+      if (!pending) throw new Error('审批请求已失效');
+      const scope = String(p.scope ?? 'once');
+      if (!['once', 'session', 'always'].includes(scope)) throw new Error('无效的授权范围');
+      if (p.approved === true && scope !== 'once') {
+        if (pending.call.name !== 'shell' || typeof pending.call.input.command !== 'string')
+          throw new Error('仅 Shell 命令支持记住授权');
+        const workspace = getSession(pending.sessionId).workspace;
+        const command = pending.call.input.command;
+        const sessionId = scope === 'session' ? pending.sessionId : undefined;
+        updateConfig((config) => {
+          if (
+            !config.approvedCommands.some(
+              (rule) =>
+                rule.workspace === workspace &&
+                rule.command === command &&
+                rule.sessionId === sessionId,
+            )
+          )
+            config.approvedCommands.push({
+              workspace,
+              command,
+              ...(sessionId ? { sessionId } : {}),
+            });
+          return config;
+        });
+      }
       approvals.delete(id);
-      resolve(p.approved === true);
+      pending.resolve(p.approved === true);
       return { accepted: true };
+    }
+    case 'getApprovalSettings': {
+      const sessionId = String(p.sessionId ?? '');
+      const config = loadConfig();
+      return {
+        config,
+        sessionCommands: config.approvedCommands
+          .filter((rule) => rule.sessionId === sessionId)
+          .map((rule) => [rule.workspace, rule.command]),
+      };
+    }
+    case 'removeSessionCommand': {
+      const sessionId = String(p.sessionId ?? '');
+      const workspace = String(p.workspace ?? '');
+      const command = String(p.command ?? '');
+      updateConfig((config) => ({
+        ...config,
+        approvedCommands: config.approvedCommands.filter(
+          (rule) =>
+            rule.sessionId !== sessionId ||
+            rule.workspace !== workspace ||
+            rule.command !== command,
+        ),
+      }));
+      return { removed: true };
+    }
+    case 'setApprovalMode': {
+      const mode = String(p.mode ?? '');
+      if (mode !== 'ask' && mode !== 'autoSafe') throw new Error('无效的审批模式');
+      return updateConfig((config) => ({ ...config, approvalMode: mode }));
+    }
+    case 'removeApprovedCommand': {
+      const workspace = String(p.workspace ?? '');
+      const command = String(p.command ?? '');
+      return updateConfig((config) => ({
+        ...config,
+        approvedCommands: config.approvedCommands.filter(
+          (rule) => rule.sessionId || rule.workspace !== workspace || rule.command !== command,
+        ),
+      }));
     }
     case 'setSessionModel': {
       if (active) throw new Error('任务运行中不能切换模型');
@@ -577,9 +682,9 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       if (
         !Number.isInteger(contextWindowTokens) ||
         contextWindowTokens < 8192 ||
-        contextWindowTokens > 2_000_000
+        contextWindowTokens > 1_048_576
       )
-        throw new Error('上下文窗口须为 8192 到 2000000 之间的整数');
+        throw new Error('上下文窗口须为 8192 到 1048576 之间的整数');
       if (apiKeyEnv && !validApiKeyEnv(apiKeyEnv))
         throw new Error(
           '密钥环境变量只能填写名称，例如 OPENAI_API_KEY；密钥值请填入 API Key 输入框',
@@ -764,7 +869,7 @@ lines.on('line', (line) => {
 async function shutdown() {
   clearInterval(scheduler);
   active?.controller.abort();
-  for (const resolve of approvals.values()) resolve(false);
+  for (const pending of approvals.values()) pending.resolve(false);
   approvals.clear();
   await activeRun;
   await services.close();

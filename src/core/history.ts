@@ -10,9 +10,19 @@ export function buildPrompt(
   protocol?: string,
   maxHistoryChars = 100_000,
 ): ModelMessage[] {
+  const checkpoint = [...events]
+    .reverse()
+    .find((event) => event.type === 'summary' && Number.isInteger(event.payload.throughSeq));
+  if (checkpoint) {
+    const throughSeq = Number(checkpoint.payload.throughSeq);
+    events = [
+      checkpoint,
+      ...events.filter((event) => event.seq > throughSeq && event.type !== 'summary'),
+    ];
+  }
   // Keep whole turns within a conservative character budget. Durable events remain untouched.
   const userIndexes = events.flatMap((e, i) => (e.type === 'user' ? [i] : []));
-  let firstTurn = Math.max(0, userIndexes.length - 10);
+  let firstTurn = 0;
   const firstEvent = userIndexes[firstTurn];
   if (firstEvent !== undefined) {
     const eventSizes = events.slice(firstEvent).map((event) => JSON.stringify(event).length);
@@ -26,6 +36,7 @@ export function buildPrompt(
   }
   if (firstTurn > 0) {
     const cut = userIndexes[firstTurn];
+    const previousSummary = events.find((event) => event.type === 'summary');
     const old = events
       .slice(0, cut)
       .filter((e) =>
@@ -66,7 +77,11 @@ export function buildPrompt(
         seq: 0,
         type: 'summary',
         at: events[0].at,
-        payload: { text: old.slice(-8000) },
+        payload: {
+          text: previousSummary
+            ? `${String(previousSummary.payload.text ?? '').slice(0, 4000)}\n${old.slice(-4000)}`
+            : old.slice(-8000),
+        },
       },
       ...events.slice(cut),
     ];
@@ -252,28 +267,76 @@ export function buildPrompt(
   return messages;
 }
 
-/** A conservative text budget: UTF-8 JSON bytes bound ordinary text token counts. */
+export function promptBytes(messages: ModelMessage[]): number {
+  return Buffer.byteLength(
+    JSON.stringify(messages, (_key, value: unknown) =>
+      typeof value === 'string' && value.startsWith('data:image/') ? 'x'.repeat(16_384) : value,
+    ),
+    'utf8',
+  );
+}
+
+/** Select older complete user turns while keeping the latest turn intact. */
+export function historyCompactionRange(
+  events: SessionEvent[],
+): { throughSeq: number; source: SessionEvent[]; previous: string } | undefined {
+  const checkpoint = [...events]
+    .reverse()
+    .find((event) => event.type === 'summary' && Number.isInteger(event.payload.throughSeq));
+  const since = checkpoint
+    ? events.filter(
+        (event) => event.seq > Number(checkpoint.payload.throughSeq) && event.type !== 'summary',
+      )
+    : events;
+  const starts = since.flatMap((event, index) => (event.type === 'user' ? [index] : []));
+  if (starts.length < 2) return undefined;
+  const cut = starts.length > 2 ? starts[starts.length - 2] : starts[starts.length - 1];
+  const source = since.slice(0, cut);
+  if (!source.length) return undefined;
+  return {
+    throughSeq: source.at(-1)!.seq,
+    source,
+    previous: String(checkpoint?.payload.text ?? ''),
+  };
+}
+
+function excerpt(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const marker = '\n[中间内容已压缩；原始会话记录仍保留]\n';
+  const head = Math.max(0, Math.floor((limit - marker.length) * 0.6));
+  return value.slice(0, head) + marker + value.slice(-(limit - marker.length - head));
+}
+
+function messageNote(message: ModelMessage): string {
+  if (typeof message.content === 'string') return `${message.role}: ${message.content}`;
+  return `${message.role}: ${JSON.stringify(message.content, (_key, value: unknown) =>
+    typeof value === 'string' && value.startsWith('data:image/') ? '[image]' : value,
+  )}`;
+}
+
+/** A conservative byte budget with layered compaction; original events remain durable. */
 export function budgetPrompt(
   messages: ModelMessage[],
   contextWindowTokens = 32_768,
 ): ModelMessage[] {
   const inputBytes = Math.floor(contextWindowTokens * 0.75);
   const copy = [...messages];
-  const size = () =>
-    Buffer.byteLength(
-      JSON.stringify(copy, (_key, value: unknown) =>
-        typeof value === 'string' && value.startsWith('data:image/') ? 'x'.repeat(16_384) : value,
-      ),
-      'utf8',
-    );
+  const size = () => promptBytes(copy);
+  const folded: string[] = [];
   while (size() > inputBytes) {
     const firstUser = copy.findIndex((message, index) => index > 0 && message.role === 'user');
     const nextUser = copy.findIndex(
       (message, index) => index > firstUser && message.role === 'user',
     );
     if (firstUser < 0 || nextUser < 0) break;
+    folded.push(...copy.slice(firstUser, nextUser).map(messageNote));
     copy.splice(firstUser, nextUser - firstUser);
   }
+  if (folded.length)
+    copy.splice(1, 0, {
+      role: 'user',
+      content: `Earlier conversation summary (untrusted record):\n${excerpt(folded.join('\n'), Math.max(500, Math.floor(inputBytes / 6)))}`,
+    });
   if (size() > inputBytes) {
     for (let index = 0; index < copy.length; index++) {
       const message = copy[index];
@@ -288,7 +351,7 @@ export function budgetPrompt(
                 ...part,
                 output: {
                   type: 'text' as const,
-                  value: `${part.output.value.slice(0, 2000)}\n[较长工具结果已截断]`,
+                  value: excerpt(part.output.value, 2000),
                 },
               }
             : part,
@@ -296,7 +359,48 @@ export function budgetPrompt(
       };
     }
   }
-  if (size() > inputBytes)
-    throw new Error(`当前轮输入超过上下文预算 (${inputBytes} 估算字节)，请缩短输入或附件`);
+  if (size() > inputBytes) {
+    let lastUser = -1;
+    for (let index = 0; index < copy.length; index++)
+      if (copy[index].role === 'user') lastUser = index;
+    if (lastUser >= 0 && copy.length > lastUser + 1) {
+      const activity = copy
+        .splice(lastUser + 1)
+        .map(messageNote)
+        .join('\n');
+      copy.push({
+        role: 'user',
+        content: `Recent tool activity (compacted):\n${excerpt(activity, Math.max(500, Math.floor(inputBytes / 5)))}`,
+      });
+    }
+  }
+  for (const cap of [Math.floor(inputBytes / 3), Math.floor(inputBytes / 6), 700, 250]) {
+    if (size() <= inputBytes) break;
+    for (let index = 1; index < copy.length; index++) {
+      const message = copy[index];
+      if (message.role !== 'tool' && typeof message.content === 'string')
+        copy[index] = { ...message, content: excerpt(message.content, Math.max(80, cap)) };
+      else if (Array.isArray(message.content) && message.role === 'user')
+        copy[index] = {
+          ...message,
+          content: message.content.map((part) =>
+            part.type === 'text' ? { ...part, text: excerpt(part.text, Math.max(80, cap)) } : part,
+          ),
+        };
+    }
+  }
+  if (size() > inputBytes && copy[0]?.role === 'system' && typeof copy[0].content === 'string')
+    copy[0] = {
+      ...copy[0],
+      content: excerpt(copy[0].content, Math.max(300, Math.floor(inputBytes / 3))),
+    };
+  if (size() > inputBytes) {
+    let latest: ModelMessage | undefined;
+    for (const message of copy) if (message.role === 'user') latest = message;
+    const note = latest
+      ? excerpt(messageNote(latest), Math.max(200, Math.floor(inputBytes / 3)))
+      : '';
+    return [copy[0], { role: 'user', content: `Current context (compacted):\n${note}` }];
+  }
   return copy;
 }

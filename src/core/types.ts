@@ -50,6 +50,7 @@ export type EventType =
   | 'tool_finished'
   | 'tool_unknown'
   | 'turn_completed'
+  | 'turn_paused'
   | 'model_error'
   | 'summary'
   | 'skill_loaded'
