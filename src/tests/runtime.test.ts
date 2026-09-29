@@ -250,10 +250,12 @@ test('worktree, hooks, background task and read-only subagent use durable events
 test('MCP stdio client lists and invokes a configured tool without inheriting secrets', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-mcp-'));
   const script = path.join(dir, 'server.cjs');
+  const launches = path.join(dir, 'launches.txt');
   fs.writeFileSync(
     script,
     `
     const readline = require('node:readline');
+    require('node:fs').appendFileSync(${JSON.stringify(launches)}, 'start\\n');
     readline.createInterface({ input: process.stdin }).on('line', (line) => {
       const message = JSON.parse(line);
       if (message.id === undefined) return;
@@ -276,8 +278,13 @@ test('MCP stdio client lists and invokes a configured tool without inheriting se
       args: [script],
       envNames: [],
     };
-    const tools = await manager.listTools(server, dir);
+    const [tools, duplicate] = await Promise.all([
+      manager.listTools(server, dir),
+      manager.listTools(server, dir),
+    ]);
     assert.equal(tools[0].name, 'echo');
+    assert.equal(duplicate[0].name, 'echo');
+    assert.equal(fs.readFileSync(launches, 'utf8').trim(), 'start');
     const result = await manager.callTool(server, 'echo', { text: 'hello' }, dir);
     assert.match(result.output, /hello/);
     assert.match(result.output, /inheritedSecret\\\":null/);

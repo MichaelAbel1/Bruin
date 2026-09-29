@@ -185,6 +185,30 @@ function removeDockerContainer(name: string): Promise<boolean> {
     });
   });
 }
+function terminateWindowsTree(pid: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const executable = process.env.SystemRoot
+      ? path.join(process.env.SystemRoot, 'System32', 'taskkill.exe')
+      : 'taskkill.exe';
+    const killer = spawn(executable, ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    let settled = false;
+    const finish = (success: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(success);
+    };
+    const timer = setTimeout(() => {
+      killer.kill('SIGKILL');
+      finish(false);
+    }, 5000);
+    killer.on('error', () => finish(false));
+    killer.on('close', (code) => finish(code === 0));
+  });
+}
 async function command(
   program: string,
   args: string[],
@@ -235,19 +259,30 @@ async function command(
     };
     child.stdout?.on('data', add);
     child.stderr?.on('data', add);
-    const kill = async () => {
-      interrupted = true;
-      if (child.pid) {
+    let killStarted: Promise<void> | undefined;
+    const kill = () =>
+      (killStarted ??= (async () => {
+        interrupted = true;
+        const forceClose = setTimeout(() => {
+          child.kill('SIGKILL');
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }, 5000);
         try {
-          if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
-          else child.kill('SIGKILL');
-        } catch {
-          /* already exited */
+          if (child.pid) {
+            try {
+              if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
+              else if (!(await terminateWindowsTree(child.pid))) child.kill('SIGKILL');
+            } catch {
+              /* already exited */
+            }
+          }
+          await cleanup();
+          await settled;
+        } finally {
+          clearTimeout(forceClose);
         }
-      }
-      await cleanup();
-      await settled;
-    };
+      })());
     active.set(req.requestId, kill);
     const timer = setTimeout(() => {
       void kill();

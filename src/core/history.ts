@@ -122,13 +122,14 @@ export function buildPrompt(
         > = [{ type: 'text', text: intro || '请查看这些附件。' }];
         for (const ref of refs.slice(0, 30)) {
           try {
-            const item = loadAttachment(event.sessionId, ref.id);
+            const current = event.seq === latestUserSeq;
+            const item = loadAttachment(event.sessionId, ref.id, current);
             parts.push({
               type: 'text',
               text: `\n附件：${item.ref.name}${item.ref.note ? `（${item.ref.note}）` : ''}`,
             });
-            if (item.image) {
-              if (event.seq === latestUserSeq)
+            if (item.ref.kind === 'image') {
+              if (current && item.image)
                 parts.push({
                   type: 'image',
                   image: new URL(
@@ -142,7 +143,6 @@ export function buildPrompt(
                   text: '之前的图片内容未重复发送；如需再次分析，请重新附上。',
                 });
             } else if (item.text) {
-              const current = event.seq === latestUserSeq;
               const content = item.text.slice(
                 0,
                 current ? remainingCurrentAttachmentText : remainingOldAttachmentText,

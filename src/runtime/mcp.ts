@@ -84,8 +84,25 @@ function sandboxProfile(workspace: string, _executable: string): string {
 /** Connections are owned by the host. No MCP process inherits model credentials by default. */
 export class McpManager {
   private clients = new Map<string, { client: Client; signature: string }>();
+  private connecting = new Map<string, Promise<Client>>();
+  private closing = false;
 
   private async connect(server: McpServerConfig, workspace?: string): Promise<Client> {
+    if (this.closing) throw new Error('MCP 管理器已关闭');
+    const previous = this.connecting.get(server.name);
+    const pending = (previous?.catch(() => {}) ?? Promise.resolve()).then(() =>
+      this.connectUnshared(server, workspace),
+    );
+    this.connecting.set(server.name, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.connecting.get(server.name) === pending) this.connecting.delete(server.name);
+    }
+  }
+
+  private async connectUnshared(server: McpServerConfig, workspace?: string): Promise<Client> {
+    if (this.closing) throw new Error('MCP 管理器已关闭');
     // Direct library callers predating workspace support use the server script's directory.
     // Desktop and agent calls always pass the selected session workspace explicitly.
     const script =
@@ -101,7 +118,7 @@ export class McpManager {
     const signature = JSON.stringify({ server, root });
     const existing = this.clients.get(server.name);
     if (existing?.signature === signature) return existing.client;
-    if (existing) await this.disconnect(server.name);
+    if (existing) await this.disconnectConnected(server.name);
     const client = new Client({ name: 'bruin', version: '0.6.0' });
 
     let transport: StdioClientTransport | StreamableHTTPClientTransport;
@@ -229,11 +246,17 @@ export class McpManager {
   }
 
   async disconnect(name: string): Promise<void> {
+    await this.connecting.get(name)?.catch(() => {});
+    await this.disconnectConnected(name);
+  }
+  private async disconnectConnected(name: string): Promise<void> {
     const existing = this.clients.get(name);
     this.clients.delete(name);
     if (existing) await existing.client.close().catch(() => {});
   }
   async close(): Promise<void> {
+    this.closing = true;
+    await Promise.allSettled([...this.connecting.values()]);
     await Promise.allSettled([...this.clients.keys()].map((name) => this.disconnect(name)));
   }
 }

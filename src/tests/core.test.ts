@@ -960,6 +960,48 @@ test('ProcessExecutor executes shell commands out of the box without docker', as
   }
 });
 
+test(
+  'Windows shell cancellation stops child processes',
+  { skip: process.platform !== 'win32' || process.env.BRUIN_SHELL_BACKEND === 'docker' },
+  async () => {
+    const dir = temp();
+    const ready = path.join(dir, 'ready.txt');
+    const escaped = path.join(dir, 'escaped.txt');
+    const script = path.join(dir, 'child.cjs');
+    fs.writeFileSync(
+      script,
+      `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); setTimeout(() => fs.writeFileSync(${JSON.stringify(escaped)}, 'escaped'), 1200);`,
+    );
+    const executor = new ProcessExecutor();
+    const controller = new AbortController();
+    try {
+      const pending = executor.execute(
+        {
+          requestId: 'windows-tree-cancel',
+          name: 'shell',
+          input: { command: `"${process.execPath}" "${script}"` },
+          workspace: dir,
+          timeoutMs: 5000,
+          maxOutputBytes: 1000,
+        },
+        controller.signal,
+      );
+      const deadline = Date.now() + 3000;
+      while (!fs.existsSync(ready) && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(fs.existsSync(ready), true, 'nested process did not start');
+      controller.abort();
+      assert.equal((await pending).isError, true);
+      await new Promise((resolve) => setTimeout(resolve, 1400));
+      assert.equal(fs.existsSync(escaped), false, 'nested process survived cancellation');
+    } finally {
+      controller.abort();
+      await executor.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
 test('local skill installs and loads on demand', () => {
   const dir = temp();
   process.env.BRUIN_HOME = path.join(dir, 'home');
@@ -1506,6 +1548,30 @@ test('failed attachment batch removes files already copied in that batch', () =>
   }
 });
 
+test('history does not read image bytes from an older turn', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-old-image-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  const sessionId = '00000000-0000-0000-0000-000000000001';
+  try {
+    const source = path.join(dir, 'picture.png');
+    fs.writeFileSync(source, 'image bytes');
+    const [ref] = importAttachments(sessionId, [source]);
+    const events: SessionEvent[] = [
+      { sessionId, seq: 1, type: 'user', at: '', payload: { text: '旧图片', attachments: [ref] } },
+      { sessionId, seq: 2, type: 'user', at: '', payload: { text: '新问题' } },
+    ];
+    fs.unlinkSync(path.join(process.env.BRUIN_HOME, 'attachments', sessionId, ref.id));
+    const prompt = buildPrompt(events, 'system');
+    assert.match(JSON.stringify(prompt), /之前的图片内容未重复发送/);
+    assert.doesNotMatch(JSON.stringify(prompt), /附件 picture.png 已不可读取/);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('tool execution runtime exception is recorded as tool_unknown and halts runner', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-tool-unknown-'));
   const store = new SqliteEventStore(path.join(dir, 'bruin.db'));
@@ -1924,6 +1990,12 @@ test('withConfigLock supports reentrancy, stale lock cleanup, and updateConfig a
     const res = withConfigLock(() => 'recovered');
     assert.equal(res, 'recovered');
     assert.equal(fs.existsSync(lockFile), false);
+
+    // A live owner must keep its lock even if the timestamp is old.
+    const liveLock = `${process.pid}\n${Date.now() - 20000}`;
+    fs.writeFileSync(lockFile, liveLock);
+    assert.throws(() => withConfigLock(() => 'stolen'), /获取配置文件锁超时/);
+    assert.equal(fs.readFileSync(lockFile, 'utf8'), liveLock);
   } finally {
     if (oldHome === undefined) delete process.env.BRUIN_HOME;
     else process.env.BRUIN_HOME = oldHome;

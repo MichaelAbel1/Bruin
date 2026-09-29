@@ -81,6 +81,23 @@ function attachmentDir(sessionId: string): string {
   if (!/^[a-f0-9-]{36}$/.test(sessionId)) throw new Error('无效会话 ID');
   return path.join(dataDir(), 'attachments', sessionId);
 }
+function readAttachmentBytes(fd: number, name: string): Buffer {
+  let bytes = Buffer.alloc(Math.min(maxFileBytes + 1, Math.max(64_000, fs.fstatSync(fd).size + 1)));
+  let count = 0;
+  while (true) {
+    if (count === bytes.length) {
+      if (count === maxFileBytes + 1) break;
+      const grown = Buffer.alloc(Math.min(maxFileBytes + 1, bytes.length * 2));
+      bytes.copy(grown, 0, 0, count);
+      bytes = grown;
+    }
+    const read = fs.readSync(fd, bytes, count, bytes.length - count, count);
+    if (!read) break;
+    count += read;
+  }
+  if (count > maxFileBytes) throw new Error(`附件超过 5 MB: ${name}`);
+  return bytes.subarray(0, count);
+}
 function collect(files: string[], input: string): void {
   const stat = fs.lstatSync(input);
   if (stat.isSymbolicLink()) throw new Error('附件不允许符号链接');
@@ -126,7 +143,7 @@ export function importAttachments(sessionId: string, selected: string[]): Attach
         if (!stat.isFile() || stat.size > maxFileBytes)
           throw new Error(`附件不是普通文件或超过 5 MB: ${name}`);
         created.push(target);
-        fs.writeFileSync(target, fs.readFileSync(source), { mode: 0o600, flag: 'wx' });
+        fs.writeFileSync(target, readAttachmentBytes(source, name), { mode: 0o600, flag: 'wx' });
       } finally {
         fs.closeSync(source);
       }
@@ -164,6 +181,7 @@ export function importAttachments(sessionId: string, selected: string[]): Attach
 export function loadAttachment(
   sessionId: string,
   id: string,
+  includeImage = true,
 ): { ref: AttachmentRef; text: string; image?: { data: Buffer; mimeType: string } } {
   if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('无效附件 ID');
   const root = attachmentDir(sessionId);
@@ -176,12 +194,20 @@ export function loadAttachment(
     kind: metadata.kind,
     ...(metadata.note ? { note: metadata.note } : {}),
   };
+  let image: { data: Buffer; mimeType: string } | undefined;
+  if (metadata.kind === 'image' && includeImage) {
+    const fd = fs.openSync(path.join(root, id), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      if (!fs.fstatSync(fd).isFile()) throw new Error('附件不是普通文件');
+      image = { data: readAttachmentBytes(fd, metadata.name), mimeType: metadata.mimeType };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
   return {
     ref,
     text: metadata.text,
-    ...(metadata.kind === 'image'
-      ? { image: { data: fs.readFileSync(path.join(root, id)), mimeType: metadata.mimeType } }
-      : {}),
+    ...(image ? { image } : {}),
   };
 }
 

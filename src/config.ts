@@ -155,6 +155,7 @@ export function withConfigLock<T>(fn: () => T): T {
       const code = (err as { code?: string })?.code;
       if (code === 'EEXIST') {
         try {
+          const stat = fs.statSync(lockFile);
           const content = fs.readFileSync(lockFile, 'utf8');
           const [pidStr, timestampStr] = content.split('\n');
           const pid = parseInt(pidStr, 10);
@@ -172,14 +173,15 @@ export function withConfigLock<T>(fn: () => T): T {
               }
             }
           }
-          const isExpired = Number.isFinite(timestamp) && Date.now() - timestamp > 10000;
-          if (!isAlive || isExpired) {
+          const validPid = Number.isFinite(pid) && pid > 0;
+          const isExpired =
+            Date.now() - (Number.isFinite(timestamp) ? timestamp : stat.mtimeMs) > 10000;
+          if ((validPid && !isAlive) || (!validPid && isExpired)) {
             fs.unlinkSync(lockFile);
             continue;
           }
         } catch {
-          // File might have been removed or reading failed; retry
-          continue;
+          // The creator may still be writing the lock, or another process may have removed it.
         }
         const wait = 20 + Math.floor(Math.random() * 30);
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
@@ -211,8 +213,12 @@ export function saveConfig(config: AppConfig): void {
   withConfigLock(() => {
     fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
     const temp = `${configPath()}.${process.pid}.${randomUUID()}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(configSchema.parse(config), null, 2), { mode: 0o600 });
-    fs.renameSync(temp, configPath());
+    try {
+      fs.writeFileSync(temp, JSON.stringify(configSchema.parse(config), null, 2), { mode: 0o600 });
+      fs.renameSync(temp, configPath());
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
   });
 }
 
