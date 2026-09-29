@@ -308,8 +308,15 @@ export class RuntimeServices {
           timeout: 10_000,
           maxBuffer: 100_000,
         });
-        if (!stdout.split('\n').includes(`worktree ${destination}`))
-          return { output: '该路径不属于当前仓库的工作树', isError: true };
+        const belongsToRepository = stdout.split(/\r?\n/).some((line) => {
+          if (!line.startsWith('worktree ')) return false;
+          try {
+            return fs.realpathSync(line.slice('worktree '.length)) === destination;
+          } catch {
+            return false;
+          }
+        });
+        if (!belongsToRepository) return { output: '该路径不属于当前仓库的工作树', isError: true };
         await execFileAsync('git', ['worktree', 'remove', destination], {
           cwd: session.workspace,
           timeout: 30_000,

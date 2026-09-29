@@ -214,6 +214,7 @@ async function command(
   args: string[],
   req: ToolRequest,
   dockerName?: string,
+  windowsShell = false,
 ): Promise<ToolResult> {
   return new Promise((resolve) => {
     const child = spawn(program, args, {
@@ -234,6 +235,7 @@ async function command(
         ...(program === 'docker' ? dockerEnvironment() : {}),
       },
       detached: process.platform !== 'win32',
+      windowsVerbatimArguments: windowsShell,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const chunks: Buffer[] = [];
@@ -490,6 +492,9 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         file,
         fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
       );
+      let updated: Buffer;
+      let mode: number;
+      let expected: fs.Stats;
       try {
         const stat = fs.fstatSync(fd);
         if (!stat.isFile()) throw new Error('只能编辑普通文件');
@@ -505,11 +510,13 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         if (parts.length === 1) throw new Error('未找到要替换的文本 (oldText)');
         if (parts.length > 2)
           throw new Error(`要替换的文本 (oldText) 在文件中出现了 ${parts.length - 1} 次，必须唯一`);
-        const updated = Buffer.from(parts[0] + replacement + parts[1]);
-        replaceFile(root, file, updated, stat.mode & 0o777, stat);
+        updated = Buffer.from(parts[0] + replacement + parts[1]);
+        mode = stat.mode & 0o777;
+        expected = stat;
       } finally {
         fs.closeSync(fd);
       }
+      replaceFile(root, file, updated, mode, expected);
       return { output: `已编辑 ${path.relative(root, file)}`, isError: false };
     }
     case 'search': {
@@ -611,11 +618,15 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
           '当前平台缺少可用的 Shell 沙箱，自动执行的 Hook 或强制沙箱模式不能直接运行宿主命令。请配置 Docker 或安装 bwrap。',
         );
       }
-      return command(
-        process.platform === 'win32' ? process.env.COMSPEC || 'cmd.exe' : '/bin/sh',
-        process.platform === 'win32' ? ['/c', shell] : ['-lc', shell],
-        req,
-      );
+      return process.platform === 'win32'
+        ? command(
+            process.env.COMSPEC || 'cmd.exe',
+            ['/d', '/s', '/c', `"${shell}"`],
+            req,
+            undefined,
+            true,
+          )
+        : command('/bin/sh', ['-lc', shell], req);
     }
     default:
       throw new Error('未知工具');

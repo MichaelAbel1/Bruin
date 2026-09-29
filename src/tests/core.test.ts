@@ -724,7 +724,7 @@ test('file tools replace content without losing permissions or changing files on
     assert.equal(write.isError, false, write.output);
     assert.equal(write.output, '已写入 script.sh');
     assert.equal(fs.readFileSync(file, 'utf8'), 'updated text\n');
-    assert.equal(fs.statSync(file).mode & 0o777, 0o755);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o755);
     assert.equal(
       (await request('bad-edit', 'edit_file', { oldText: 'missing', newText: 'x' })).isError,
       true,
@@ -734,7 +734,7 @@ test('file tools replace content without losing permissions or changing files on
     assert.equal(edit.isError, false, edit.output);
     assert.equal(edit.output, '已编辑 script.sh');
     assert.equal(fs.readFileSync(file, 'utf8'), 'final text\n');
-    assert.equal(fs.statSync(file).mode & 0o777, 0o755);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o755);
     assert.deepEqual(fs.readdirSync(dir), ['script.sh']);
   } finally {
     await executor.close();
@@ -814,118 +814,122 @@ test('search treats no matches as a successful empty result', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
-test('cancelled Docker shell force-removes its named container', async () => {
-  const dir = temp();
-  const bin = path.join(dir, 'bin');
-  fs.mkdirSync(bin);
-  const marker = path.join(dir, 'docker.log');
-  const slowCleanup = path.join(dir, 'slow-cleanup');
-  const docker = path.join(bin, 'docker');
-  fs.writeFileSync(
-    docker,
-    '#!/bin/sh\n' +
-      'if [ "$1" = "run" ]; then\n' +
-      '  shift\n' +
-      '  while [ "$1" != "--name" ]; do shift; done\n' +
-      `  echo "run:$2" >> '${marker}'\n` +
-      '  sleep 30\n' +
-      'else\n' +
-      `  echo "rm:$3" >> '${marker}'\n` +
-      `  if [ -f '${slowCleanup}' ]; then sleep 3; echo "rm-done:$3" >> '${marker}'; fi\n` +
-      'fi\n',
-    { mode: 0o755 },
-  );
-  const previous = {
-    path: process.env.PATH,
-    backend: process.env.BRUIN_SHELL_BACKEND,
-    image: process.env.BRUIN_DOCKER_IMAGE,
-  };
-  process.env.PATH = `${bin}${path.delimiter}${previous.path ?? ''}`;
-  process.env.BRUIN_SHELL_BACKEND = 'docker';
-  process.env.BRUIN_DOCKER_IMAGE = 'test-image';
-  const executor = new ProcessExecutor();
-  try {
-    const controller = new AbortController();
-    const result = executor.execute(
-      {
-        requestId: 'docker-cancel',
-        name: 'shell',
-        input: { command: 'sleep 30' },
-        workspace: dir,
-        timeoutMs: 5000,
-        maxOutputBytes: 100,
-      },
-      controller.signal,
+test(
+  'cancelled Docker shell force-removes its named container',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const dir = temp();
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    const marker = path.join(dir, 'docker.log');
+    const slowCleanup = path.join(dir, 'slow-cleanup');
+    const docker = path.join(bin, 'docker');
+    fs.writeFileSync(
+      docker,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "run" ]; then\n' +
+        '  shift\n' +
+        '  while [ "$1" != "--name" ]; do shift; done\n' +
+        `  echo "run:$2" >> '${marker}'\n` +
+        '  sleep 30\n' +
+        'else\n' +
+        `  echo "rm:$3" >> '${marker}'\n` +
+        `  if [ -f '${slowCleanup}' ]; then sleep 3; echo "rm-done:$3" >> '${marker}'; fi\n` +
+        'fi\n',
+      { mode: 0o755 },
     );
-    for (let i = 0; i < 300 && !fs.existsSync(marker); i++)
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(fs.existsSync(marker), true);
-    controller.abort();
-    assert.equal((await result).isError, true);
-    const entries = fs.readFileSync(marker, 'utf8').trim().split('\n');
-    const name = entries.find((entry) => entry.startsWith('run:'))?.slice(4);
-    assert.ok(name?.startsWith('bruin-'));
-    assert.ok(entries.includes(`rm:${name}`));
-    const timedOut = await executor.execute({
-      requestId: 'docker-timeout',
-      name: 'shell',
-      input: { command: 'sleep 30' },
-      workspace: dir,
-      timeoutMs: 500,
-      maxOutputBytes: 100,
-    });
-    assert.equal(timedOut.isError, true);
-    const afterTimeout = fs.readFileSync(marker, 'utf8').trim().split('\n');
-    const timeoutName = afterTimeout
-      .filter((entry) => entry.startsWith('run:'))
-      .at(-1)
-      ?.slice(4);
-    assert.ok(timeoutName?.startsWith('bruin-'));
-    assert.ok(afterTimeout.includes(`rm:${timeoutName}`));
-    const pendingClose = executor
-      .execute({
-        requestId: 'docker-close',
+    const previous = {
+      path: process.env.PATH,
+      backend: process.env.BRUIN_SHELL_BACKEND,
+      image: process.env.BRUIN_DOCKER_IMAGE,
+    };
+    process.env.PATH = `${bin}${path.delimiter}${previous.path ?? ''}`;
+    process.env.BRUIN_SHELL_BACKEND = 'docker';
+    process.env.BRUIN_DOCKER_IMAGE = 'test-image';
+    const executor = new ProcessExecutor();
+    try {
+      const controller = new AbortController();
+      const result = executor.execute(
+        {
+          requestId: 'docker-cancel',
+          name: 'shell',
+          input: { command: 'sleep 30' },
+          workspace: dir,
+          timeoutMs: 5000,
+          maxOutputBytes: 100,
+        },
+        controller.signal,
+      );
+      for (let i = 0; i < 300 && !fs.existsSync(marker); i++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(fs.existsSync(marker), true);
+      controller.abort();
+      assert.equal((await result).isError, true);
+      const entries = fs.readFileSync(marker, 'utf8').trim().split('\n');
+      const name = entries.find((entry) => entry.startsWith('run:'))?.slice(4);
+      assert.ok(name?.startsWith('bruin-'));
+      assert.ok(entries.includes(`rm:${name}`));
+      const timedOut = await executor.execute({
+        requestId: 'docker-timeout',
         name: 'shell',
         input: { command: 'sleep 30' },
         workspace: dir,
-        timeoutMs: 10_000,
+        timeoutMs: 500,
         maxOutputBytes: 100,
-      })
-      .catch(() => undefined);
-    for (let i = 0; i < 100; i++) {
-      if (
-        fs
-          .readFileSync(marker, 'utf8')
-          .split('\n')
-          .filter((entry) => entry.startsWith('run:')).length === 3
-      )
-        break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+      assert.equal(timedOut.isError, true);
+      const afterTimeout = fs.readFileSync(marker, 'utf8').trim().split('\n');
+      const timeoutName = afterTimeout
+        .filter((entry) => entry.startsWith('run:'))
+        .at(-1)
+        ?.slice(4);
+      assert.ok(timeoutName?.startsWith('bruin-'));
+      assert.ok(afterTimeout.includes(`rm:${timeoutName}`));
+      const pendingClose = executor
+        .execute({
+          requestId: 'docker-close',
+          name: 'shell',
+          input: { command: 'sleep 30' },
+          workspace: dir,
+          timeoutMs: 10_000,
+          maxOutputBytes: 100,
+        })
+        .catch(() => undefined);
+      for (let i = 0; i < 100; i++) {
+        if (
+          fs
+            .readFileSync(marker, 'utf8')
+            .split('\n')
+            .filter((entry) => entry.startsWith('run:')).length === 3
+        )
+          break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const closeName = fs
+        .readFileSync(marker, 'utf8')
+        .split('\n')
+        .filter((entry) => entry.startsWith('run:'))
+        .at(-1)
+        ?.slice(4);
+      assert.ok(closeName?.startsWith('bruin-'));
+      fs.writeFileSync(slowCleanup, 'yes');
+      await executor.close();
+      await pendingClose;
+      assert.match(fs.readFileSync(marker, 'utf8'), new RegExp(`rm-done:${closeName}`));
+    } finally {
+      await executor.close();
+      for (const [key, value] of Object.entries({
+        PATH: previous.path,
+        BRUIN_SHELL_BACKEND: previous.backend,
+        BRUIN_DOCKER_IMAGE: previous.image,
+      })) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
     }
-    const closeName = fs
-      .readFileSync(marker, 'utf8')
-      .split('\n')
-      .filter((entry) => entry.startsWith('run:'))
-      .at(-1)
-      ?.slice(4);
-    assert.ok(closeName?.startsWith('bruin-'));
-    fs.writeFileSync(slowCleanup, 'yes');
-    await executor.close();
-    await pendingClose;
-    assert.match(fs.readFileSync(marker, 'utf8'), new RegExp(`rm-done:${closeName}`));
-  } finally {
-    await executor.close();
-    for (const [key, value] of Object.entries({
-      PATH: previous.path,
-      BRUIN_SHELL_BACKEND: previous.backend,
-      BRUIN_DOCKER_IMAGE: previous.image,
-    })) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test('ProcessExecutor executes shell commands out of the box without docker', async () => {
   const dir = temp();
