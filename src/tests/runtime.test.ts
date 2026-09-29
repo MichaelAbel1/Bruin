@@ -240,7 +240,20 @@ test('worktree, hooks, background task and read-only subagent use durable events
       f.session,
       new AbortController().signal,
     );
-    assert.match(removed.output, /已移除/);
+    assert.match(
+      removed.output,
+      /已移除/,
+      `target=${worktree.output}; listed=${listed.output}; realpaths=${listed.output
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('worktree '))
+        .map((line) => {
+          try {
+            return fs.realpathSync(line.slice('worktree '.length));
+          } catch (error) {
+            return String(error);
+          }
+        })}`,
+    );
   } finally {
     await services.close();
     f.close();
