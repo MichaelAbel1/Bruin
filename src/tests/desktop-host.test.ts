@@ -277,10 +277,7 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     const pauseStore = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
     pauseStore.append(created.session.id, 'turn_paused', { reason: 'step_limit', limit: 2 });
     pauseStore.acquireLease(created.session.id, 'external-process', 30_000);
-    await assert.rejects(
-      request('finishPausedTurn', { sessionId: created.session.id }),
-      /运行/,
-    );
+    await assert.rejects(request('finishPausedTurn', { sessionId: created.session.id }), /运行/);
     pauseStore.releaseLease(created.session.id, 'external-process');
     pauseStore.close();
     const ended = await request('finishPausedTurn', { sessionId: created.session.id });
