@@ -11,6 +11,7 @@ import { isAutoSafeShell } from '../core/approval-policy.js';
 
 import { decisionFor } from '../core/permissions.js';
 import { AgentRunner, formatModelError } from '../core/agent.js';
+import { RuntimeServices } from '../runtime/services.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type {
@@ -1641,6 +1642,157 @@ test('step limit pauses with a side-effect report and resumes without replaying 
     assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
   } finally {
     delete process.env.BRUIN_MAX_STEPS;
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('long run continues past the normal 24-call limit and records a durable checkpoint', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  fs.writeFileSync(path.join(dir, 'source.txt'), 'source');
+  let calls = 0;
+  const checkpoints: number[] = [];
+  const gateway: ModelGateway = {
+    async complete() {
+      calls++;
+      return calls <= 25
+        ? {
+            text: '',
+            calls: [{ id: `read-${calls}`, name: 'read_file', input: { path: 'source.txt' } }],
+          }
+        : { text: 'Verified.', calls: [] };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'source', isError: false };
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      checkpoint(modelCalls) {
+        checkpoints.push(modelCalls);
+      },
+      async approve() {
+        throw new Error('read_file must not need approval');
+      },
+    });
+    await runner.run(session, 'inspect all files', undefined, [], undefined, {
+      maxModelCalls: 30,
+      checkpointEvery: 24,
+    });
+    assert.equal(calls, 26);
+    assert.deepEqual(checkpoints, [24]);
+    const events = store.events(session.id);
+    assert.equal(events.filter((event) => event.type === 'turn_checkpoint').length, 1);
+    assert.equal(events.find((event) => event.type === 'turn_checkpoint')?.payload.modelCalls, 24);
+    assert.equal(events.at(-1)?.type, 'turn_completed');
+    assert.equal(events.filter((event) => event.type === 'turn_paused').length, 0);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('long run time budget pauses after completed tools without replaying them', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  fs.writeFileSync(path.join(dir, 'source.txt'), 'source');
+  let calls = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      calls++;
+      if (calls === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return {
+          text: '',
+          calls: [{ id: 'read-1', name: 'read_file', input: { path: 'source.txt' } }],
+        };
+      }
+      return { text: 'Done.', calls: [] };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'source', isError: false };
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        throw new Error('read_file must not need approval');
+      },
+    });
+    await runner.run(session, 'inspect', undefined, [], undefined, {
+      maxModelCalls: 30,
+      maxDurationMs: 1,
+    });
+    assert.equal(calls, 1);
+    assert.equal(store.events(session.id).at(-1)?.payload.reason, 'time_limit');
+    await runner.run(session);
+    assert.equal(calls, 2);
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resuming a paused turn does not rerun the turn-started hook', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  fs.writeFileSync(path.join(dir, 'source.txt'), 'source');
+  let calls = 0;
+  let started = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      calls++;
+      return calls === 1
+        ? { text: '', calls: [{ id: 'read-1', name: 'read_file', input: { path: 'source.txt' } }] }
+        : { text: 'Done.', calls: [] };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'source', isError: false };
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(store, executor, async () => {});
+  services.runHooks = async (event) => {
+    if (event === 'turn_started') started++;
+  };
+  try {
+    const runner = new AgentRunner(
+      store,
+      gateway,
+      executor,
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return true;
+        },
+      },
+      services,
+    );
+    await runner.run(session, 'inspect', undefined, [], undefined, { maxModelCalls: 1 });
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_paused');
+    await runner.run(session);
+    assert.equal(started, 1);
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    await services.close();
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -1466,6 +1466,37 @@ pre {
 .composer textarea::placeholder {
   color: #6e7b70;
 }
+.long-run-settings {
+  padding: 0 12px 7px;
+  color: #91a094;
+  font-size: 11px;
+}
+.long-run-settings > summary {
+  cursor: pointer;
+  width: fit-content;
+}
+.long-run-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding-top: 8px;
+}
+.long-run-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.long-run-controls select {
+  max-width: 150px;
+}
+.long-run-controls small {
+  flex-basis: 100%;
+  line-height: 1.4;
+}
+:root[data-theme='light'] .long-run-settings {
+  color: #57645a;
+}
 .composer-bottom {
   display: flex;
   align-items: center;

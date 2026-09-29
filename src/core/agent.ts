@@ -28,6 +28,7 @@ function explicitPreferences(message: string): string[] {
 export interface AgentIO {
   text(delta: string): void;
   notice(message: string): void;
+  checkpoint?(modelCalls: number): void;
   approve(call: ToolCall, reason: string): Promise<boolean>;
 }
 export function formatModelError(err: unknown): string {
@@ -94,6 +95,7 @@ function historyLine(event: SessionEvent): string {
 function stepLimitReport(
   events: SessionEvent[],
   maxSteps: number,
+  reason: 'step_limit' | 'time_limit' = 'step_limit',
 ): { text: string; changedFiles: string[]; toolCount: number } {
   const lastCompleted =
     [...events].reverse().find((event) => event.type === 'turn_completed')?.seq ?? 0;
@@ -157,7 +159,9 @@ function stepLimitReport(
       ? plan.steps.filter((_step, index) => plan.progress[index] !== 'completed')
       : [];
   const lines = [
-    `已达到本段运行的 ${maxSteps} 次模型调用上限，任务已暂停。已执行操作不会自动回滚。`,
+    reason === 'time_limit'
+      ? '已达到本段运行的时间上限，任务已暂停。已执行操作不会自动回滚。'
+      : `已达到本段运行的 ${maxSteps} 次模型调用上限，任务已暂停。已执行操作不会自动回滚。`,
     `工具结果：${finished.length} 项已返回，${failures} 项失败，${denied} 项被拒绝。`,
     changedFiles.length
       ? `记录中的文件写入：${changedFiles.slice(0, 15).join('、')}${changedFiles.length > 15 ? ` 等 ${changedFiles.length} 个文件` : ''}。`
@@ -269,8 +273,28 @@ export class AgentRunner {
     signal = new AbortController().signal,
     attachments: AttachmentRef[] = [],
     quote?: { text: string; seq: number },
+    options: { maxModelCalls?: number; maxDurationMs?: number; checkpointEvery?: number } = {},
   ): Promise<void> {
-    if (input || attachments.length || quote) {
+    const envSteps = Number(process.env.BRUIN_MAX_STEPS);
+    const defaultSteps =
+      Number.isFinite(envSteps) && envSteps > 0 ? Math.min(Math.floor(envSteps), 100) : 24;
+    const maxSteps = options.maxModelCalls ?? defaultSteps;
+    if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 240)
+      throw new Error('模型调用预算必须在 1 到 240 之间');
+    if (
+      options.maxDurationMs !== undefined &&
+      (!Number.isInteger(options.maxDurationMs) ||
+        options.maxDurationMs < 1 ||
+        options.maxDurationMs > 8 * 60 * 60 * 1000)
+    )
+      throw new Error('运行时间预算无效');
+    if (
+      options.checkpointEvery !== undefined &&
+      (!Number.isInteger(options.checkpointEvery) || options.checkpointEvery < 1)
+    )
+      throw new Error('检查点间隔无效');
+    const newTurn = Boolean(input || attachments.length || quote);
+    if (newTurn) {
       this.store.append(session.id, 'user', {
         text: input ?? '',
         attachments,
@@ -285,16 +309,31 @@ export class AgentRunner {
       }
     }
     if (
+      newTurn &&
       this.services &&
       (!planState(this.store.events(session.id)).enabled ||
         planState(this.store.events(session.id)).approved)
     )
       await this.services.runHooks('turn_started', session, signal);
-    const envSteps = Number(process.env.BRUIN_MAX_STEPS);
-    const maxSteps =
-      Number.isFinite(envSteps) && envSteps > 0 ? Math.min(Math.floor(envSteps), 100) : 24;
+    const deadline = options.maxDurationMs ? Date.now() + options.maxDurationMs : undefined;
+    const pause = (reason: 'step_limit' | 'time_limit') => {
+      const report = stepLimitReport(this.store.events(session.id), maxSteps, reason);
+      this.store.append(session.id, 'assistant', { text: report.text, calls: [] });
+      this.store.append(session.id, 'turn_paused', {
+        reason,
+        limit: maxSteps,
+        report: report.text,
+        changedFiles: report.changedFiles,
+        toolCount: report.toolCount,
+      });
+      this.io.text(report.text);
+    };
     for (let step = 0; step < maxSteps; step++) {
       if (signal.aborted) throw new Error('已取消');
+      if (deadline && Date.now() >= deadline) {
+        pause('time_limit');
+        return;
+      }
       const events = this.store.events(session.id);
       const latestPause = [...events].reverse().find((event) => event.type === 'turn_paused');
       const latestCompletion = [...events]
@@ -692,17 +731,29 @@ export class AgentRunner {
         this.store.append(session.id, 'turn_completed', { awaitingPlanApproval: true });
         return;
       }
+      if (
+        options.checkpointEvery &&
+        (step + 1) % options.checkpointEvery === 0 &&
+        step + 1 < maxSteps
+      ) {
+        const report = stepLimitReport(this.store.events(session.id), maxSteps);
+        const currentPlan = planState(this.store.events(session.id));
+        this.store.append(session.id, 'turn_checkpoint', {
+          modelCalls: step + 1,
+          changedFiles: report.changedFiles,
+          toolCount: report.toolCount,
+          pendingPlanSteps:
+            currentPlan.enabled && currentPlan.approved
+              ? currentPlan.steps.filter(
+                  (_step, index) => currentPlan.progress[index] !== 'completed',
+                )
+              : [],
+        });
+        this.io.checkpoint?.(step + 1);
+        this.io.notice(`长任务检查点：已进行 ${step + 1} 次模型调用`);
+      }
     }
     if (signal.aborted) throw new Error('已取消');
-    const report = stepLimitReport(this.store.events(session.id), maxSteps);
-    this.store.append(session.id, 'assistant', { text: report.text, calls: [] });
-    this.store.append(session.id, 'turn_paused', {
-      reason: 'step_limit',
-      limit: maxSteps,
-      report: report.text,
-      changedFiles: report.changedFiles,
-      toolCount: report.toolCount,
-    });
-    this.io.text(report.text);
+    pause('step_limit');
   }
 }

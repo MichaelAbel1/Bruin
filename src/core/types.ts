@@ -51,6 +51,8 @@ export type EventType =
   | 'tool_unknown'
   | 'turn_completed'
   | 'turn_paused'
+  | 'turn_checkpoint'
+  | 'run_configured'
   | 'model_error'
   | 'summary'
   | 'skill_loaded'

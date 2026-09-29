@@ -566,6 +566,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState('');
   const [composer, setComposer] = useState('');
+  const [maxModelCalls, setMaxModelCalls] = useState<24 | 96 | 240>(24);
+  const [allowWorkspaceEdits, setAllowWorkspaceEdits] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const [quote, setQuote] = useState<{ seq: number; text: string } | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
@@ -621,6 +623,8 @@ function App() {
       setActiveFile(null);
       setAttachments([]);
       setQuote(null);
+      setMaxModelCalls(24);
+      setAllowWorkspaceEdits(false);
       setStream('');
       setSidebarOpen(false);
       if (result.recoveredUnknown)
@@ -764,6 +768,10 @@ function App() {
         });
         return;
       }
+      if (message.type === 'runFinished' || message.type === 'runFailed') {
+        setMaxModelCalls(24);
+        setAllowWorkspaceEdits(false);
+      }
       if (message.sessionId !== selected.current) return;
       if (message.type === 'runStarted') {
         setBusy(true);
@@ -771,6 +779,10 @@ function App() {
       }
       if (message.type === 'text') setStream((previous) => previous + (message.delta ?? ''));
       if (message.type === 'notice') setNotice(message.message ?? '');
+      if (message.type === 'runCheckpoint' && message.events) {
+        setView((previous) => (previous ? { ...previous, events: message.events! } : previous));
+        setStream('');
+      }
       if (message.type === 'runFinished' || message.type === 'runFailed') {
         setBusy(false);
         setStream('');
@@ -869,6 +881,8 @@ function App() {
         prompt: text,
         attachments: submittedAttachments.map((item) => item.id),
         quoteSeq: submittedQuote?.seq,
+        maxModelCalls,
+        allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
       });
     } catch (err) {
       setBusy(false);
@@ -952,7 +966,11 @@ function App() {
     if (!view || busy || view.needsReview) return;
     try {
       setBusy(true);
-      await api('resume', { sessionId: view.session.id });
+      await api('resume', {
+        sessionId: view.session.id,
+        maxModelCalls,
+        allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+      });
     } catch (err) {
       setBusy(false);
       fail(err);
@@ -1414,6 +1432,44 @@ function App() {
                   }
                   disabled={view.needsReview}
                 />
+                <details className="long-run-settings">
+                  <summary>
+                    {maxModelCalls > 24
+                      ? `长任务：最多 ${maxModelCalls} 次模型调用 / 8 小时`
+                      : '运行预算：标准 24 次模型调用'}
+                  </summary>
+                  <div className="long-run-controls">
+                    <label>
+                      本段模型调用上限
+                      <select
+                        value={maxModelCalls}
+                        disabled={busy}
+                        onChange={(event) =>
+                          setMaxModelCalls(Number(event.target.value) as 24 | 96 | 240)
+                        }
+                      >
+                        <option value={24}>标准 · 24 次</option>
+                        <option value={96}>长任务 · 96 次</option>
+                        <option value={240}>长任务 · 240 次</option>
+                      </select>
+                    </label>
+                    {maxModelCalls > 24 && (
+                      <label className="long-run-write-choice">
+                        <input
+                          type="checkbox"
+                          checked={allowWorkspaceEdits}
+                          disabled={busy}
+                          onChange={(event) => setAllowWorkspaceEdits(event.target.checked)}
+                        />
+                        本段自动批准工作区内的文件写入和编辑
+                      </label>
+                    )}
+                    <small>
+                      长任务每 24 次记录检查点；模型调用数不是费用上限。自动写入可覆盖工作区文件。
+                      Shell、MCP 等仍按审批规则执行，无人批准时会等待。
+                    </small>
+                  </div>
+                </details>
                 <div className="composer-bottom">
                   <div className="composer-left">
                     <button
@@ -1916,7 +1972,9 @@ function groupConversationEvents(events: SessionEvent[]): ConversationItem[] {
     } else if (
       event.type === 'user' ||
       event.type === 'model_error' ||
-      event.type === 'turn_paused'
+      event.type === 'turn_paused' ||
+      event.type === 'turn_checkpoint' ||
+      (event.type === 'run_configured' && Number(event.payload.maxModelCalls) > 24)
     ) {
       flush();
       items.push({ kind: 'event', event });
@@ -1967,7 +2025,24 @@ function EventCard({
   if (event.type === 'turn_paused')
     return (
       <div className="pause-banner">
-        <CircleAlert size={16} /> 本段运行在步数上限处暂停。上方是当时的执行记录。
+        <CircleAlert size={16} /> 本段运行在
+        {event.payload.reason === 'time_limit' ? '时间' : '模型调用'}
+        上限处暂停。上方是当时的执行记录。
+      </div>
+    );
+  if (event.type === 'turn_checkpoint')
+    return (
+      <div className="pause-banner">
+        <Check size={16} /> 长任务检查点：已完成 {String(event.payload.modelCalls)} 次模型调用，
+        工具返回 {String(event.payload.toolCount)} 项，记录写入{' '}
+        {Array.isArray(event.payload.changedFiles) ? event.payload.changedFiles.length : 0} 个文件。
+      </div>
+    );
+  if (event.type === 'run_configured')
+    return (
+      <div className="pause-banner">
+        <Sparkles size={16} /> 长任务已开启：最多 {String(event.payload.maxModelCalls)} 次模型调用；
+        {event.payload.allowWorkspaceEdits ? '本段允许自动修改工作区文件。' : '文件修改仍需审批。'}
       </div>
     );
   if (event.type === 'user')

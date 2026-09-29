@@ -55,7 +55,8 @@ const send = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\
 const event = (type: string, data: Record<string, unknown> = {}) => send({ type, ...data });
 const store = new SqliteEventStore(path.join(dataDir(), 'sessions.sqlite'));
 const executor = new ProcessExecutor();
-let active: { sessionId: string; controller: AbortController } | undefined;
+let active:
+  { sessionId: string; controller: AbortController; allowWorkspaceEdits: boolean } | undefined;
 let activeRun: Promise<unknown> | undefined;
 const approvals = new Map<
   string,
@@ -116,10 +117,20 @@ const runner = new AgentRunner(
   {
     text: (delta) => event('text', { sessionId: active?.sessionId, delta }),
     notice: (message) => event('notice', { sessionId: active?.sessionId, message }),
+    checkpoint: () => {
+      const sessionId = active?.sessionId;
+      if (sessionId)
+        event('runCheckpoint', { sessionId, events: viewSession(getSession(sessionId)).events });
+    },
     approve: (call: ToolCall, reason: string) =>
       new Promise<boolean>((resolve) => {
         const sessionId = active?.sessionId;
         if (!sessionId) return resolve(false);
+        if (
+          active?.allowWorkspaceEdits &&
+          (call.name === 'write_file' || call.name === 'edit_file')
+        )
+          return resolve(true);
         const command = call.name === 'shell' ? String(call.input.command ?? '') : '';
         const workspace = getSession(sessionId).workspace;
         const config = loadConfig();
@@ -196,20 +207,42 @@ async function startRun(
   prompt?: string,
   attachments: AttachmentRef[] = [],
   quote?: { text: string; seq: number },
+  runSettings: { maxModelCalls: number; allowWorkspaceEdits: boolean } = {
+    maxModelCalls: 24,
+    allowWorkspaceEdits: false,
+  },
 ): Promise<{ started: boolean }> {
   if (active) throw new Error('已有任务正在运行');
   if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认继续');
   const owner = randomUUID();
   store.acquireLease(session.id, owner, 30_000);
+  try {
+    store.append(session.id, 'run_configured', runSettings);
+  } catch (error) {
+    store.releaseLease(session.id, owner);
+    throw error;
+  }
   const controller = new AbortController();
   const heartbeat = setInterval(() => {
     if (!store.renewLease(session.id, owner, 30_000)) controller.abort();
   }, 10_000);
   heartbeat.unref();
-  active = { sessionId: session.id, controller };
-  event('runStarted', { sessionId: session.id });
+  active = {
+    sessionId: session.id,
+    controller,
+    allowWorkspaceEdits: runSettings.allowWorkspaceEdits,
+  };
+  event('runStarted', { sessionId: session.id, longRun: runSettings.maxModelCalls > 24 });
   activeRun = runner
-    .run(session, prompt, controller.signal, attachments, quote)
+    .run(session, prompt, controller.signal, attachments, quote, {
+      ...(runSettings.maxModelCalls > 24
+        ? {
+            maxModelCalls: runSettings.maxModelCalls,
+            maxDurationMs: 8 * 60 * 60 * 1000,
+            checkpointEvery: 24,
+          }
+        : {}),
+    })
     .then(() =>
       event('runFinished', { sessionId: session.id, events: viewSession(session).events }),
     )
@@ -229,6 +262,14 @@ async function startRun(
       approvals.clear();
     });
   return { started: true };
+}
+function requestedRunSettings(p: Record<string, unknown>) {
+  const maxModelCalls = p.maxModelCalls === undefined ? 24 : Number(p.maxModelCalls);
+  const allowWorkspaceEdits = p.allowWorkspaceEdits === true;
+  if (![24, 96, 240].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
+  if (allowWorkspaceEdits && maxModelCalls === 24)
+    throw new Error('自动修改工作区文件只能在长任务模式下启用');
+  return { maxModelCalls, allowWorkspaceEdits };
 }
 async function dispatch(method: string, p: Record<string, unknown>) {
   switch (method) {
@@ -400,10 +441,10 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         ? { seq: source.seq, text: String(source.payload.text ?? '').slice(0, 4000) }
         : undefined;
       if (!prompt && !refs.length && !quote) throw new Error('消息不能为空');
-      return startRun(session, prompt, refs, quote);
+      return startRun(session, prompt, refs, quote, requestedRunSettings(p));
     }
     case 'resume':
-      return startRun(getSession(p.sessionId));
+      return startRun(getSession(p.sessionId), undefined, [], undefined, requestedRunSettings(p));
     case 'finishPausedTurn': {
       if (active) throw new Error('请等待当前任务结束');
       const session = getSession(p.sessionId);

@@ -228,6 +228,14 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       request('send', { sessionId: created.session.id, prompt: '' }),
       /消息不能为空/,
     );
+    await assert.rejects(
+      request('send', { sessionId: created.session.id, prompt: 'test', maxModelCalls: 999 }),
+      /无效的长任务调用预算/,
+    );
+    await assert.rejects(
+      request('send', { sessionId: created.session.id, prompt: 'test', allowWorkspaceEdits: true }),
+      /只能在长任务模式下启用/,
+    );
     await request('send', { sessionId: created.session.id, prompt: '创建文件' });
     const events = await runDone;
     assert.equal(approvalSeen, 1);
@@ -241,6 +249,29 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     assert.equal(fs.readFileSync(path.join(dir, 'result.txt'), 'utf8'), 'created');
     assert.ok(events.some((event) => event.type === 'tool_approved'));
     assert.equal(events.at(-1).type, 'turn_completed');
+
+    modelCalls = 0;
+    const unattendedDone = new Promise<any[]>((resolve, reject) => {
+      finishRun = resolve;
+      failRun = reject;
+    });
+    const unattended = await request('createSession', { workspace: dir });
+    await request('send', {
+      sessionId: unattended.session.id,
+      prompt: '再次创建文件',
+      maxModelCalls: 96,
+      allowWorkspaceEdits: true,
+    });
+    const unattendedEvents = await unattendedDone;
+    assert.equal(approvalSeen, 1);
+    assert.equal(modelCalls, 2);
+    assert.equal(unattendedEvents.at(-1).type, 'turn_completed');
+    assert.ok(
+      unattendedEvents.some(
+        (event) => event.type === 'run_configured' && event.payload.allowWorkspaceEdits === true,
+      ),
+    );
+    await request('deleteSession', { sessionId: unattended.session.id });
 
     const externalStore = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
     try {

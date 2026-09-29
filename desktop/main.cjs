@@ -1,4 +1,12 @@
-const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  powerSaveBlocker,
+  safeStorage,
+  shell,
+} = require('electron');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs');
@@ -13,6 +21,13 @@ const iconThemes = new Set(['white', 'black', 'sage', 'blue', 'orange']);
 let iconBackground = 'white';
 let uiTheme = 'light';
 let hostReady = Promise.resolve();
+let longRunPowerBlocker;
+
+function stopLongRunPowerBlocker() {
+  if (longRunPowerBlocker !== undefined && powerSaveBlocker.isStarted(longRunPowerBlocker))
+    powerSaveBlocker.stop(longRunPowerBlocker);
+  longRunPowerBlocker = undefined;
+}
 
 function secretsPath() {
   return path.join(
@@ -150,12 +165,18 @@ function startHost() {
       pending.delete(message.id);
       if (message.error) entry.reject(new Error(message.error));
       else entry.resolve(message.result);
-    } else if (window && !window.isDestroyed()) window.webContents.send('bruin:event', message);
+    } else {
+      if (message.type === 'runStarted' && message.longRun && longRunPowerBlocker === undefined)
+        longRunPowerBlocker = powerSaveBlocker.start('prevent-app-suspension');
+      if (message.type === 'runFinished' || message.type === 'runFailed') stopLongRunPowerBlocker();
+      if (window && !window.isDestroyed()) window.webContents.send('bruin:event', message);
+    }
   });
   host.stderr.on('data', (data) => {
     if (development) process.stderr.write(data);
   });
   host.on('exit', (code, signal) => {
+    stopLongRunPowerBlocker();
     for (const entry of pending.values()) entry.reject(new Error('Agent 后台进程已退出'));
     pending.clear();
     if (window && !window.isDestroyed())
@@ -273,6 +294,7 @@ app.whenReady().then(() => {
   });
 });
 app.on('before-quit', () => {
+  stopLongRunPowerBlocker();
   if (host && !host.killed) {
     host.stdin.end();
     setTimeout(() => {

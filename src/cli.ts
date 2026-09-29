@@ -19,6 +19,7 @@ import { SqliteEventStore } from './storage/event-store.js';
 import { AiSdkGateway } from './providers/gateway.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
+import { isAutoSafeShell } from './core/approval-policy.js';
 import {
   addMarket,
   installFromMarket,
@@ -39,7 +40,7 @@ const help = `Bruin — local coding agent
 
 bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV] [--context-tokens N]
 bruin model list | default ALIAS
-bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [PROMPT]
+bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--max-model-calls 24|96|240] [--allow-workspace-edits] [PROMPT]
 bruin sessions list | show SESSION_ID
 bruin skill list | show NAME | enable NAME | disable NAME | install-local DIR | install-github OWNER/REPO SUBDIR [REF] | update NAME | remove NAME
 bruin market add NAME OWNER/REPO | list | search NAME | install MARKET SKILL
@@ -201,6 +202,13 @@ async function main(): Promise<void> {
     const modelAlias = takeFlag(args, '--model');
     const workspaceArg = takeFlag(args, '--workspace');
     const resume = takeFlag(args, '--resume');
+    const maxCallsArg = takeFlag(args, '--max-model-calls');
+    const maxModelCalls = maxCallsArg === undefined ? 24 : Number(maxCallsArg);
+    const allowWorkspaceEdits = args.includes('--allow-workspace-edits');
+    if (allowWorkspaceEdits) args.splice(args.indexOf('--allow-workspace-edits'), 1);
+    if (![24, 96, 240].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
+    if (allowWorkspaceEdits && maxModelCalls === 24)
+      throw new Error('--allow-workspace-edits 需要长任务调用预算');
     const workspace = fs.realpathSync(workspaceArg ?? process.cwd());
     let session = resume
       ? store.getSession(resume)
@@ -225,6 +233,22 @@ async function main(): Promise<void> {
       text: (delta: string) => stdout.write(delta),
       notice: (message: string) => console.log(`\n[工具] ${message}`),
       approve: async (call: ToolCall, reason: string) => {
+        if (allowWorkspaceEdits && ['write_file', 'edit_file'].includes(call.name)) return true;
+        if (call.name === 'shell' && typeof call.input.command === 'string') {
+          const config = loadConfig();
+          const command = call.input.command;
+          if (
+            config.approvedCommands.some(
+              (rule) =>
+                rule.workspace === session!.workspace &&
+                rule.command === command &&
+                (!rule.sessionId || rule.sessionId === session!.id),
+            ) ||
+            (config.approvalMode === 'autoSafe' && isAutoSafeShell(command))
+          )
+            return true;
+        }
+        if (!stdin.isTTY) return false;
         const answer = await rl.question(
           `\n批准 ${call.name} ${JSON.stringify(call.input)}? ${reason} [y/N] `,
         );
@@ -248,6 +272,10 @@ async function main(): Promise<void> {
       ).run(childSession, childPrompt, signal),
     );
     const runner = new AgentRunner(store, new AiSdkGateway('full'), executor, io, services);
+    const runOptions =
+      maxModelCalls > 24
+        ? { maxModelCalls, maxDurationMs: 8 * 60 * 60 * 1000, checkpointEvery: 24 }
+        : {};
     const controller = new AbortController();
     const leaseOwner = randomUUID();
     const leaseSessionId = session.id;
@@ -272,23 +300,28 @@ async function main(): Promise<void> {
       );
       let prompt = args.join(' ');
       if (prompt) {
-        await runner.run(session, prompt, controller.signal);
+        store.append(session.id, 'run_configured', { maxModelCalls, allowWorkspaceEdits });
+        await runner.run(session, prompt, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
       } else if (
         resume &&
         store.events(session.id).length &&
         store.events(session.id).at(-1)?.type !== 'turn_completed'
       ) {
-        await runner.run(session, undefined, controller.signal);
+        store.append(session.id, 'run_configured', { maxModelCalls, allowWorkspaceEdits });
+        await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
       }
+      if (!stdin.isTTY && store.events(session.id).at(-1)?.type === 'turn_paused')
+        process.exitCode = 2;
       while (!controller.signal.aborted && stdin.isTTY) {
         const line = await rl.question('\n你> ');
         if (line.trim() === '/exit') break;
         if (line.trim() === '/continue' || !line.trim()) {
-          if (store.events(session.id).at(-1)?.type === 'turn_paused')
-            await runner.run(session, undefined, controller.signal);
-          else if (line.trim()) console.log('当前没有暂停的任务');
+          if (store.events(session.id).at(-1)?.type === 'turn_paused') {
+            store.append(session.id, 'run_configured', { maxModelCalls, allowWorkspaceEdits });
+            await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
+          } else if (line.trim()) console.log('当前没有暂停的任务');
           continue;
         }
         if (line.trim() === '/stop') {
@@ -304,7 +337,8 @@ async function main(): Promise<void> {
           console.log(`模型已切换为 ${session.profile.alias}`);
           continue;
         }
-        await runner.run(session, line, controller.signal);
+        store.append(session.id, 'run_configured', { maxModelCalls, allowWorkspaceEdits });
+        await runner.run(session, line, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
       }
     } finally {
