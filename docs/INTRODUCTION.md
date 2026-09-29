@@ -362,7 +362,7 @@ Bruin 针对不同类型的异常建立了清晰的退出分级矩阵：
   - `allow`：只读搜索、读取状态、任务查看等完全安全操作直接放行；
   - `ask`：文件覆写、终端 Shell、MCP 外部调用等高危操作必须等待用户交互确认；
   - `deny`：跨出工作区的相对路径逃逸（`../`）、符号链接伪装、子 Agent 越权调用写工具，直接硬拒绝。
-- **操作系统级沙箱兜底**：macOS 采用 `/usr/bin/sandbox-exec` 封锁网络外联并限制写操作仅在工作区及系统临时目录内。
+- **操作系统级沙箱与三端开箱即用支持**：macOS 原生使用 `/usr/bin/sandbox-exec`；Linux 优先自动探测并启用 `bwrap` (Bubblewrap) 轻量内核沙箱；在无内核沙箱环境（如 Windows 或极简 Linux）中，对齐现代 Agent（如 Claude Code / Cursor）哲学，以「每次执行强人工审批门禁（Human-in-the-Loop）」兜底直接运行，实现三端开箱即用，同时支持 `BRUIN_SHELL_BACKEND=docker` 强容器隔离与 `BRUIN_ENFORCE_SANDBOX=1` 强制沙箱检查。
 
 ---
 

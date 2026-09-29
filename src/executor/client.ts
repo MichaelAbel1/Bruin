@@ -33,10 +33,14 @@ export class ProcessExecutor implements ToolExecutor {
         TMPDIR: process.env.TMPDIR,
         LANG: process.env.LANG,
         BRUIN_ALLOW_UNSANDBOXED_SHELL: process.env.BRUIN_ALLOW_UNSANDBOXED_SHELL,
+        BRUIN_ENFORCE_SANDBOX: process.env.BRUIN_ENFORCE_SANDBOX,
         BRUIN_SHELL_BACKEND: process.env.BRUIN_SHELL_BACKEND,
         BRUIN_DOCKER_IMAGE: process.env.BRUIN_DOCKER_IMAGE,
         BRUIN_DOCKER_CONFIG: process.env.BRUIN_DOCKER_CONFIG,
         DOCKER_HOST: process.env.DOCKER_HOST,
+        SystemRoot: process.env.SystemRoot,
+        COMSPEC: process.env.COMSPEC,
+        PATHEXT: process.env.PATHEXT,
       },
     });
 
@@ -87,7 +91,7 @@ export class ProcessExecutor implements ToolExecutor {
       const abort = () => {
         try {
           if (worker.child.connected)
-            worker.child.send({ type: 'cancel', requestId: request.requestId });
+            worker.child.send({ type: 'cancel', requestId: request.requestId }, () => {});
         } catch {}
       };
       signal?.addEventListener('abort', abort, { once: true });

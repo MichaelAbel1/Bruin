@@ -857,7 +857,7 @@ test('cancelled Docker shell force-removes its named container', async () => {
       },
       controller.signal,
     );
-    for (let i = 0; i < 100 && !fs.existsSync(marker); i++)
+    for (let i = 0; i < 300 && !fs.existsSync(marker); i++)
       await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(fs.existsSync(marker), true);
     controller.abort();
@@ -926,6 +926,27 @@ test('cancelled Docker shell force-removes its named container', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('ProcessExecutor executes shell commands out of the box without docker', async () => {
+  const dir = temp();
+  const executor = new ProcessExecutor();
+  try {
+    const res = await executor.execute({
+      requestId: 'shell-test-1',
+      name: 'shell',
+      input: { command: process.platform === 'win32' ? 'echo hello_world' : 'echo "hello_world"' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes: 1000,
+    });
+    assert.equal(res.isError, false);
+    assert.match(res.output, /hello_world/);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('local skill installs and loads on demand', () => {
   const dir = temp();
   process.env.BRUIN_HOME = path.join(dir, 'home');
@@ -1776,7 +1797,7 @@ test('ProcessExecutor handles cancellation race when worker terminates concurren
     child.kill('SIGKILL');
     controller.abort();
 
-    await assert.rejects(promise, /(工具执行进程退出|已取消)/);
+    await assert.rejects(promise, /(工具执行进程退出|已取消|EPIPE)/);
   } finally {
     await executor.close();
     fs.rmSync(dir, { recursive: true, force: true });

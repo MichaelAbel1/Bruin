@@ -5,36 +5,68 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-let sandboxAvailable: boolean | undefined;
-function ensureSandbox(): void {
-  if (sandboxAvailable === undefined) {
-    try {
-      execFileSync(
-        '/usr/bin/sandbox-exec',
-        ['-p', '(version 1) (allow default)', '/usr/bin/true'],
-        {
-          stdio: 'ignore',
-          timeout: 3000,
-        },
-      );
-      sandboxAvailable = true;
-    } catch {
-      sandboxAvailable = false;
-    }
+let macSandboxAvailable: boolean | undefined;
+function isMacSandboxAvailable(): boolean {
+  if (process.platform !== 'darwin') return false;
+  if (macSandboxAvailable !== undefined) return macSandboxAvailable;
+  try {
+    execFileSync('/usr/bin/sandbox-exec', ['-p', '(version 1) (allow default)', '/usr/bin/true'], {
+      stdio: 'ignore',
+      timeout: 2000,
+    });
+    macSandboxAvailable = true;
+  } catch {
+    macSandboxAvailable = false;
   }
-  if (!sandboxAvailable) throw new Error('macOS MCP stdio 沙箱不可用，已拒绝启动服务器');
+  return macSandboxAvailable;
+}
+
+let bwrapAvailable: boolean | undefined;
+function findBwrap(): string | undefined {
+  if (process.platform !== 'linux' || bwrapAvailable === false) return undefined;
+  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
+    const candidate = path.join(dir, 'bwrap');
+    try {
+      if (fs.existsSync(candidate)) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        if (bwrapAvailable === undefined) {
+          try {
+            execFileSync(
+              candidate,
+              ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', 'true'],
+              {
+                stdio: 'ignore',
+                timeout: 2000,
+              },
+            );
+            bwrapAvailable = true;
+          } catch {
+            bwrapAvailable = false;
+            return undefined;
+          }
+        }
+        return candidate;
+      }
+    } catch {}
+  }
+  bwrapAvailable = false;
+  return undefined;
 }
 
 function resolveExecutable(command: string, workspace: string): string {
-  if (command.includes('/'))
+  if (command.includes('/') || (process.platform === 'win32' && command.includes('\\')))
     return fs.realpathSync(path.isAbsolute(command) ? command : path.join(workspace, command));
+  const extensions =
+    process.platform === 'win32' ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';') : [''];
   for (const directory of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
-    const candidate = path.join(directory, command);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
-    } catch {
-      // Try the next PATH entry.
+    for (const ext of extensions) {
+      const candidate = path.join(directory, command + ext);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return fs.realpathSync(candidate);
+      } catch {
+        // Try the next PATH entry.
+      }
     }
   }
   throw new Error(`MCP 启动命令不存在: ${command}`);
@@ -50,9 +82,6 @@ export class McpManager {
   private clients = new Map<string, { client: Client; signature: string }>();
 
   private async connect(server: McpServerConfig, workspace?: string): Promise<Client> {
-    if (server.transport === 'stdio' && process.platform !== 'darwin')
-      throw new Error('当前平台没有可用的 MCP stdio 文件沙箱，已拒绝启动');
-    if (server.transport === 'stdio') ensureSandbox();
     // Direct library callers predating workspace support use the server script's directory.
     // Desktop and agent calls always pass the selected session workspace explicitly.
     const script =
@@ -70,39 +99,82 @@ export class McpManager {
     if (existing?.signature === signature) return existing.client;
     if (existing) await this.disconnect(server.name);
     const client = new Client({ name: 'bruin', version: '0.6.0' });
-    const transport =
-      server.transport === 'stdio'
-        ? new StdioClientTransport({
-            command: '/usr/bin/sandbox-exec',
-            args: ['-p', sandboxProfile(root!, executable!), executable!, ...server.args],
-            cwd: root,
-            env: {
-              PATH: process.env.PATH ?? '/usr/bin:/bin',
-              HOME: root!,
-              TMPDIR: root!,
-              LANG: process.env.LANG ?? 'C',
-              ...Object.fromEntries(
-                server.envNames
-                  .filter((name) => process.env[name] !== undefined)
-                  .map((name) => [name, process.env[name]!]),
-              ),
-            },
-            stderr: 'pipe',
-            maxBufferSize: 1_000_000,
-          })
-        : new StreamableHTTPClientTransport(new URL(server.url), {
-            ...(server.tokenEnv
-              ? {
-                  authProvider: {
-                    token: async () => {
-                      const token = process.env[server.tokenEnv!];
-                      if (!token) throw new Error(`MCP Token 环境变量未设置: ${server.tokenEnv}`);
-                      return token;
-                    },
-                  },
-                }
-              : {}),
-          });
+
+    let transport: StdioClientTransport | StreamableHTTPClientTransport;
+    if (server.transport === 'stdio') {
+      const useMac = isMacSandboxAvailable();
+      const bwrap = findBwrap();
+      if (process.env.BRUIN_ENFORCE_SANDBOX === '1' && !useMac && !bwrap) {
+        throw new Error('当前系统缺少可用的 MCP stdio 沙箱，且设置了强制沙箱模式');
+      }
+      let command = executable!;
+      let args = server.args;
+      if (useMac) {
+        command = '/usr/bin/sandbox-exec';
+        args = ['-p', sandboxProfile(root!, executable!), executable!, ...server.args];
+      } else if (bwrap) {
+        command = bwrap;
+        args = [
+          '--ro-bind',
+          '/',
+          '/',
+          '--bind',
+          root!,
+          root!,
+          '--dev',
+          '/dev',
+          '--proc',
+          '/proc',
+          '--tmpfs',
+          '/tmp',
+          '--die-with-parent',
+          '--chdir',
+          root!,
+          executable!,
+          ...server.args,
+        ];
+      }
+      transport = new StdioClientTransport({
+        command,
+        args,
+        cwd: root,
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          HOME: root!,
+          TMPDIR: root!,
+          LANG: process.env.LANG ?? 'C',
+          ...(process.platform === 'win32'
+            ? {
+                SystemRoot: process.env.SystemRoot,
+                COMSPEC: process.env.COMSPEC,
+                PATHEXT: process.env.PATHEXT,
+                USERPROFILE: root!,
+              }
+            : {}),
+          ...Object.fromEntries(
+            server.envNames
+              .filter((name) => process.env[name] !== undefined)
+              .map((name) => [name, process.env[name]!]),
+          ),
+        },
+        stderr: 'pipe',
+        maxBufferSize: 1_000_000,
+      });
+    } else {
+      transport = new StreamableHTTPClientTransport(new URL(server.url), {
+        ...(server.tokenEnv
+          ? {
+              authProvider: {
+                token: async () => {
+                  const token = process.env[server.tokenEnv!];
+                  if (!token) throw new Error(`MCP Token 环境变量未设置: ${server.tokenEnv}`);
+                  return token;
+                },
+              },
+            }
+          : {}),
+      });
+    }
     try {
       await client.connect(transport, { timeout: 10_000, maxTotalTimeout: 10_000 });
       this.clients.set(server.name, { client, signature });

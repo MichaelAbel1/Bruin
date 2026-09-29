@@ -1,10 +1,58 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
+
+let macSandboxAvailable: boolean | undefined;
+function isMacSandboxAvailable(): boolean {
+  if (process.platform !== 'darwin') return false;
+  if (macSandboxAvailable !== undefined) return macSandboxAvailable;
+  try {
+    execFileSync('/usr/bin/sandbox-exec', ['-p', '(version 1) (allow default)', '/usr/bin/true'], {
+      stdio: 'ignore',
+      timeout: 2000,
+    });
+    macSandboxAvailable = true;
+  } catch {
+    macSandboxAvailable = false;
+  }
+  return macSandboxAvailable;
+}
+
+let bwrapAvailable: boolean | undefined;
+function findBwrap(): string | undefined {
+  if (process.platform !== 'linux' || bwrapAvailable === false) return undefined;
+  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
+    const candidate = path.join(dir, 'bwrap');
+    try {
+      if (fs.existsSync(candidate)) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        if (bwrapAvailable === undefined) {
+          try {
+            execFileSync(
+              candidate,
+              ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', 'true'],
+              {
+                stdio: 'ignore',
+                timeout: 2000,
+              },
+            );
+            bwrapAvailable = true;
+          } catch {
+            bwrapAvailable = false;
+            return undefined;
+          }
+        }
+        return candidate;
+      }
+    } catch {}
+  }
+  bwrapAvailable = false;
+  return undefined;
+}
 
 function checkedPath(workspace: string, input: unknown, creating = false): string {
   const root = fs.realpathSync(workspace);
@@ -151,6 +199,14 @@ async function command(
         HOME: req.workspace,
         TMPDIR: process.env.TMPDIR ?? '/tmp',
         LANG: process.env.LANG ?? 'C',
+        ...(process.platform === 'win32'
+          ? {
+              SystemRoot: process.env.SystemRoot,
+              COMSPEC: process.env.COMSPEC,
+              PATHEXT: process.env.PATHEXT,
+              USERPROFILE: req.workspace,
+            }
+          : {}),
         ...(program === 'docker' ? dockerEnvironment() : {}),
       },
       detached: process.platform !== 'win32',
@@ -473,13 +529,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
           containerName,
         );
       }
-      if (process.env.BRUIN_ALLOW_UNSANDBOXED_SHELL === '1')
-        return command(
-          process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
-          process.platform === 'win32' ? ['/c', shell] : ['-lc', shell],
-          req,
-        );
-      if (process.platform === 'darwin') {
+      if (process.platform === 'darwin' && isMacSandboxAvailable()) {
         const root = fs.realpathSync(req.workspace).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
         const tmpReal = fs
           .realpathSync(os.tmpdir())
@@ -488,8 +538,48 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         const profile = `(version 1) (allow default) (deny network*) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "${tmpReal}"))`;
         return command('/usr/bin/sandbox-exec', ['-p', profile, '/bin/sh', '-lc', shell], req);
       }
-      throw new Error(
-        '当前平台缺少已配置的 Shell 沙箱，拒绝执行。可显式设置 BRUIN_ALLOW_UNSANDBOXED_SHELL=1（不安全）。',
+      const bwrap = findBwrap();
+      if (bwrap) {
+        const root = fs.realpathSync(req.workspace);
+        const tmpReal = fs.realpathSync(os.tmpdir());
+        return command(
+          bwrap,
+          [
+            '--ro-bind',
+            '/',
+            '/',
+            '--bind',
+            root,
+            root,
+            '--bind',
+            tmpReal,
+            tmpReal,
+            '--dev',
+            '/dev',
+            '--proc',
+            '/proc',
+            '--tmpfs',
+            '/tmp',
+            '--unshare-net',
+            '--die-with-parent',
+            '--chdir',
+            root,
+            '/bin/sh',
+            '-lc',
+            shell,
+          ],
+          req,
+        );
+      }
+      if (process.env.BRUIN_ENFORCE_SANDBOX === '1') {
+        throw new Error(
+          '当前平台缺少已配置的 Shell 内核沙箱，且设置了强制沙箱模式。请配置 Docker 或安装 bwrap。',
+        );
+      }
+      return command(
+        process.platform === 'win32' ? process.env.COMSPEC || 'cmd.exe' : '/bin/sh',
+        process.platform === 'win32' ? ['/c', shell] : ['-lc', shell],
+        req,
       );
     }
     default:

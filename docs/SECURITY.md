@@ -27,6 +27,16 @@
 
 Bruin 使用 `/usr/bin/sandbox-exec`，配置为拒绝网络与工作区、临时目录以外的文件写入。它仍允许读取工作区以外的文件，也没有完整限制进程与设备访问。macOS 上的 `sandbox-exec` 可用性和实际策略应在目标系统验收。此模式适合受信任开发机上的辅助防护，**不满足多租户或敌对代码运行的强隔离要求**。
 
+### Linux 模式（优先 bwrap 轻量内核沙箱）
+
+在 Linux 上，Bruin 会优先自动探测并启用 `bwrap` (Bubblewrap) 轻量沙箱。若系统安装有 `bwrap`，则利用 Linux 内核 Namespaces（Mount、Net、PID）限制网络访问并将写操作严格限制在当前工作区与临时目录，零后台守护进程、零开销启动。
+若系统未安装 `bwrap` 且未配置 Docker，Bruin 会对齐现代 Agent（如 Claude Code / Cursor）的开箱即用实践，依托每次命令严格的**人类审批门禁（Human-in-the-Loop）**，在获得用户批准后使用宿主 `/bin/sh` 执行。
+若需强制在缺少内核沙箱时硬报错拒绝，可配置 `BRUIN_ENFORCE_SANDBOX=1`。
+
+### Windows 模式
+
+在 Windows 上，默认通过宿主 `cmd.exe` 执行命令，全程依托人工审批门禁把关。若需强沙箱隔离，推荐配置 Docker 模式。
+
 ### Docker 模式
 
 ```sh
@@ -36,12 +46,6 @@ node dist/cli.js chat --workspace /path/to/project
 ```
 
 容器使用 `--network none`、只读根文件系统、移除 capabilities、`no-new-privileges`、PID/内存限制、受限 `/tmp`，并将工作区挂载到 `/workspace` 可写。镜像必须预先存在；不要把主机 Docker socket 挂载进容器。每次运行使用唯一容器名；取消、超时和正常关闭执行进程时会尝试 `docker rm -f` 并在清理无法确认时报告错误。进程被直接强杀、系统崩溃或 Docker daemon 不可用时仍可能留下容器，需要外部巡检与目标平台验收。
-
-### 显式无沙箱模式
-
-`BRUIN_ALLOW_UNSANDBOXED_SHELL=1` 可让 Shell 直接在主机运行，适用于受控测试环境。它跳过 Shell 操作系统隔离，不能作为默认生产配置。设置 `BRUIN_SHELL_BACKEND=docker` 时优先使用 Docker。
-
-Linux/Windows 若没有 Docker 配置，Bruin 默认拒绝 Shell；文件工具仍由独立 Node 子进程执行。**独立进程本身不是安全沙箱**，无法替代容器、受限系统用户或操作系统强制访问控制。
 
 ## MCP、Hook 与编排边界
 

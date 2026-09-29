@@ -272,27 +272,26 @@ test('MCP stdio client lists and invokes a configured tool without inheriting se
       args: [script],
       envNames: [],
     };
-    const sandboxWorks = (() => {
-      try {
-        execFileSync(
-          '/usr/bin/sandbox-exec',
-          ['-p', '(version 1) (allow default)', '/usr/bin/true'],
-          { stdio: 'ignore' },
-        );
-        return true;
-      } catch {
-        return false;
-      }
-    })();
-    if (!sandboxWorks) {
-      await assert.rejects(manager.listTools(server, dir), /沙箱不可用/);
-      return;
-    }
     const tools = await manager.listTools(server, dir);
     assert.equal(tools[0].name, 'echo');
     const result = await manager.callTool(server, 'echo', { text: 'hello' }, dir);
     assert.match(result.output, /hello/);
     assert.match(result.output, /inheritedSecret\\\":null/);
+
+    // Verify BRUIN_ENFORCE_SANDBOX enforces sandbox on platforms without one
+    const oldEnforce = process.env.BRUIN_ENFORCE_SANDBOX;
+    const oldPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const enforceManager = new McpManager();
+    try {
+      process.env.BRUIN_ENFORCE_SANDBOX = '1';
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      await assert.rejects(enforceManager.listTools(server, dir), /强制沙箱模式/);
+    } finally {
+      await enforceManager.close();
+      if (oldEnforce === undefined) delete process.env.BRUIN_ENFORCE_SANDBOX;
+      else process.env.BRUIN_ENFORCE_SANDBOX = oldEnforce;
+      if (oldPlatform) Object.defineProperty(process, 'platform', oldPlatform);
+    }
   } finally {
     await manager.close();
     delete process.env.BRUIN_TEST_SECRET;
