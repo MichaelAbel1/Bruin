@@ -29,13 +29,13 @@ Bruin 使用 `/usr/bin/sandbox-exec`，配置为拒绝网络与工作区、临�
 
 ### Linux 模式（优先 bwrap 轻量内核沙箱）
 
-在 Linux 上，Bruin 会优先自动探测并启用 `bwrap` (Bubblewrap) 轻量沙箱。若系统安装有 `bwrap`，则利用 Linux 内核 Namespaces（Mount、Net、PID）限制网络访问并将写操作严格限制在当前工作区与临时目录，零后台守护进程、零开销启动。
-若系统未安装 `bwrap` 且未配置 Docker，Bruin 会对齐现代 Agent（如 Claude Code / Cursor）的开箱即用实践，依托每次命令严格的**人类审批门禁（Human-in-the-Loop）**，在获得用户批准后使用宿主 `/bin/sh` 执行。
+在 Linux 上，Bruin 会优先探测并启用 `bwrap` (Bubblewrap)。当前配置使用挂载和网络命名空间：工作区与系统临时目录可写，其他主机路径只读，Shell 无网络；它没有启用 PID 命名空间，也仍可读取工作区外可访问的文件。`bwrap` 无需后台守护进程，但启动仍有开销，且必须在目标系统验证。
+若系统未安装或无法运行 `bwrap` 且未配置 Docker，模型提出的 Shell 命令在逐次人工批准后使用宿主 `/bin/sh` 执行。此时审批不提供操作系统隔离。
 若需强制在缺少内核沙箱时硬报错拒绝，可配置 `BRUIN_ENFORCE_SANDBOX=1`。
 
 ### Windows 模式
 
-在 Windows 上，默认通过宿主 `cmd.exe` 执行命令，全程依托人工审批门禁把关。若需强沙箱隔离，推荐配置 Docker 模式。
+在 Windows 上，模型提出的 Shell 命令经逐次人工审批后通过宿主 `cmd.exe` 执行；这不是沙箱隔离。若需强沙箱隔离，可配置 Docker 模式。
 
 ### Docker 模式
 
@@ -49,9 +49,9 @@ node dist/cli.js chat --workspace /path/to/project
 
 ## MCP、Hook 与编排边界
 
-MCP stdio 服务器是用户配置的外部可执行程序。Bruin 只传基础环境和显式列出的环境变量，但**目前没有把 MCP 服务器放进文件工具或 Shell 沙箱**；服务器本身拥有运行账户可访问的本机权限。HTTP MCP 服务器可能访问外部系统；调用结果为不可信内容，工具调用需要逐次审批。远端 URL 要求 HTTPS，本机 loopback 可用 HTTP。当前不支持交互式 OAuth 授权。
+MCP stdio 服务器是用户配置的外部可执行程序。macOS 上使用 `sandbox-exec` 限制写入；Linux 有可用 `bwrap` 时限制写入，但当前 MCP 配置未隔离网络。Windows 或缺少沙箱时直接运行。Bruin 只传基础环境和显式列出的环境变量；**不受沙箱约束的服务器仍拥有运行账户的本机权限，且可在工具调用之间继续运行**。模型发起的 MCP 工具请求逐次审批，审批不能限制已启动服务器自身的行为。HTTP MCP 服务器可能访问外部系统；调用结果为不可信内容。远端 URL 要求 HTTPS，本机 loopback 可用 HTTP。当前不支持交互式 OAuth 授权。
 
-Hook 是静态 Shell 命令，用户启用后按配置时机运行，不逐次弹窗；它复用 Shell 沙箱。规划模式未获批准时不运行 Hook。后台 Shell 同样复用 Shell 沙箱，但重启不保证继续执行，也无法撤销已产生的副作用。只读子 Agent 通过工具白名单限制；这不构成操作系统级进程隔离。
+Hook 是静态 Shell 命令，用户启用后按配置时机运行，不逐次弹窗；因此 Hook 必须使用可用的 Shell 沙箱，缺少沙箱时拒绝执行。规划模式未获批准时不运行 Hook。后台 Shell 由模型提出时需要审批，之后复用 Shell 执行模式；重启不保证继续执行，也无法撤销已产生的副作用。只读子 Agent 通过工具白名单限制；这不构成操作系统级进程隔离。
 
 工作树使用 `git worktree add --detach` 与不带 `--force` 的 `git worktree remove`；移除仅限 Bruin 管理目录下当前仓库的工作树。模型启动和移除都需审批；桌面直接操作由用户本人发起。
 

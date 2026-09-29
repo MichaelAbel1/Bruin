@@ -41,15 +41,22 @@ export function decisionFor(
     ].includes(call.name)
   )
     return { decision: 'deny', reason: '未知工具' };
-  if (call.name === 'shell') return { decision: 'ask', reason: 'Shell 命令可执行任意程序' };
+  if (call.name === 'shell')
+    return {
+      decision: 'ask',
+      reason: 'Shell 命令可执行任意程序；若系统缺少沙箱，批准后会直接在宿主机运行',
+    };
   if (call.name === 'create_task')
     return { decision: 'ask', reason: '创建任务会写入工作区 .tasks 目录' };
   if (call.name === 'update_task')
     return { decision: 'ask', reason: '修改任务会写入工作区 .tasks 目录' };
+  if (call.name === 'mcp_list_tools' || call.name === 'mcp_call')
+    return {
+      decision: 'ask',
+      reason: 'MCP 服务器可能作为本机进程运行；缺少沙箱时可访问运行账户有权限的资源',
+    };
   if (
     [
-      'mcp_call',
-      'mcp_list_tools',
       'create_worktree',
       'remove_worktree',
       'start_background',

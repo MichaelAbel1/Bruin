@@ -74,6 +74,7 @@ export class RuntimeServices {
           workspace: session.workspace,
           timeoutMs: 30_000,
           maxOutputBytes: 10_000,
+          requireSandbox: true,
         },
         signal,
       );

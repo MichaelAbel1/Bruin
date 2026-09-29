@@ -57,7 +57,11 @@ function resolveExecutable(command: string, workspace: string): string {
   if (command.includes('/') || (process.platform === 'win32' && command.includes('\\')))
     return fs.realpathSync(path.isAbsolute(command) ? command : path.join(workspace, command));
   const extensions =
-    process.platform === 'win32' ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';') : [''];
+    process.platform === 'win32'
+      ? path.extname(command)
+        ? ['']
+        : ['', ...(process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';')]
+      : [''];
   for (const directory of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
     for (const ext of extensions) {
       const candidate = path.join(directory, command + ext);

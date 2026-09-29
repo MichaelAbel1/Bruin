@@ -941,6 +941,19 @@ test('ProcessExecutor executes shell commands out of the box without docker', as
     });
     assert.equal(res.isError, false);
     assert.match(res.output, /hello_world/);
+    if (process.platform === 'win32' && process.env.BRUIN_SHELL_BACKEND !== 'docker') {
+      const unattended = await executor.execute({
+        requestId: 'shell-hook-test',
+        name: 'shell',
+        input: { command: 'echo should_not_run' },
+        workspace: dir,
+        timeoutMs: 5000,
+        maxOutputBytes: 1000,
+        requireSandbox: true,
+      });
+      assert.equal(unattended.isError, true);
+      assert.match(unattended.output, /Hook/);
+    }
   } finally {
     await executor.close();
     fs.rmSync(dir, { recursive: true, force: true });

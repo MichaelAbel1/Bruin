@@ -571,9 +571,9 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
           req,
         );
       }
-      if (process.env.BRUIN_ENFORCE_SANDBOX === '1') {
+      if (req.requireSandbox || process.env.BRUIN_ENFORCE_SANDBOX === '1') {
         throw new Error(
-          '当前平台缺少已配置的 Shell 内核沙箱，且设置了强制沙箱模式。请配置 Docker 或安装 bwrap。',
+          '当前平台缺少可用的 Shell 沙箱，自动执行的 Hook 或强制沙箱模式不能直接运行宿主命令。请配置 Docker 或安装 bwrap。',
         );
       }
       return command(

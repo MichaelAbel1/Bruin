@@ -165,9 +165,12 @@ test('agent task creation requires approval and writes a workspace snapshot', as
 test('worktree, hooks, background task and read-only subagent use durable events', async () => {
   const f = fixture();
   let runChild = 0;
+  let hookRequiresSandbox = false;
   const output: ToolResult = { output: 'done', isError: false };
   const executor: ToolExecutor = {
-    async execute() {
+    async execute(request) {
+      if (request.name === 'shell' && request.input.command === 'true')
+        hookRequiresSandbox = request.requireSandbox === true;
       return output;
     },
     async close() {},
@@ -189,6 +192,7 @@ test('worktree, hooks, background task and read-only subagent use durable events
     config.hooks.push({ name: 'before', event: 'before_tool', command: 'true', enabled: true });
     saveConfig(config);
     await services.runHooks('before_tool', f.session, new AbortController().signal);
+    assert.equal(hookRequiresSandbox, true);
     const worktree = await services.execute(
       { id: 'w', name: 'create_worktree', input: { name: 'research' } },
       f.session,
@@ -277,6 +281,23 @@ test('MCP stdio client lists and invokes a configured tool without inheriting se
     const result = await manager.callTool(server, 'echo', { text: 'hello' }, dir);
     assert.match(result.output, /hello/);
     assert.match(result.output, /inheritedSecret\\\":null/);
+
+    if (process.platform === 'win32') {
+      const previousPath = process.env.PATH;
+      const windowsManager = new McpManager();
+      try {
+        process.env.PATH = `${path.dirname(process.execPath)}${path.delimiter}${previousPath ?? ''}`;
+        const byFilename = await windowsManager.listTools(
+          { ...server, name: 'windows-filename', command: path.basename(process.execPath) },
+          dir,
+        );
+        assert.equal(byFilename[0].name, 'echo');
+      } finally {
+        await windowsManager.close();
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+      }
+    }
 
     // Verify BRUIN_ENFORCE_SANDBOX enforces sandbox on platforms without one
     const oldEnforce = process.env.BRUIN_ENFORCE_SANDBOX;

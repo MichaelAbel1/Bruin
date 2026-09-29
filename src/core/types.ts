@@ -93,6 +93,8 @@ export interface ToolRequest {
   workspace: string;
   timeoutMs: number;
   maxOutputBytes: number;
+  /** Unattended commands such as Hooks must not fall back to an unsandboxed host shell. */
+  requireSandbox?: boolean;
 }
 export interface ToolResponse {
   requestId: string;
