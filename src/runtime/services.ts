@@ -308,10 +308,17 @@ export class RuntimeServices {
           timeout: 10_000,
           maxBuffer: 100_000,
         });
+        const destinationStat = fs.statSync(destination);
         const belongsToRepository = stdout.split(/\r?\n/).some((line) => {
           if (!line.startsWith('worktree ')) return false;
           try {
-            return fs.realpathSync(line.slice('worktree '.length)) === destination;
+            const listedStat = fs.statSync(line.slice('worktree '.length));
+            return (
+              destinationStat.ino !== 0 &&
+              listedStat.isDirectory() &&
+              listedStat.dev === destinationStat.dev &&
+              listedStat.ino === destinationStat.ino
+            );
           } catch {
             return false;
           }
