@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { ProcessExecutor } from '../executor/client.js';
 import { decisionFor } from '../core/permissions.js';
 import { planBlocks } from '../runtime/plan.js';
@@ -68,6 +69,85 @@ test('search fallback reports omitted matches and preserves complete UTF-8 outpu
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('search fallback handles cancellation, timeouts and stream read errors', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-search-interruption-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'hello');
+    const worker = new URL('../executor/worker.js', import.meta.url).href;
+    for (const mode of ['cancel', 'timeout', 'read-error']) {
+      const script = `
+        import fs from 'node:fs';
+        import assert from 'node:assert/strict';
+        import { PassThrough } from 'node:stream';
+        process.env.PATH = ${JSON.stringify(dir)};
+        await import(${JSON.stringify(worker)});
+        let stream;
+        fs.createReadStream = (_path, options) => {
+          stream = new PassThrough();
+          if (options?.fd !== undefined) stream.once('close', () => fs.closeSync(options.fd));
+          if (${JSON.stringify(mode)} === 'cancel') setImmediate(() => process.emit('message', { type: 'cancel', requestId: 'search' }));
+          if (${JSON.stringify(mode)} === 'read-error') setImmediate(() => stream.destroy(new Error('模拟读取失败')));
+          return stream;
+        };
+        const guard = setTimeout(() => { throw new Error('搜索没有响应取消或超时'); }, 1000);
+        process.connected = true;
+        process.send = ({result}) => {
+          clearTimeout(guard);
+          assert.equal(result.isError, ${mode !== 'read-error'});
+          ${mode === 'read-error' ? "assert.equal(result.output, '');" : `assert.match(result.output, ${mode === 'cancel' ? '/取消/' : '/超时/'});`}
+          assert.equal(stream.destroyed, true);
+        };
+        process.emit('message', { requestId: 'search', name: 'search', input: { pattern: 'hello' }, workspace: ${JSON.stringify(dir)}, timeoutMs: 50, maxOutputBytes: 100 });
+      `;
+      execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 3000 });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test(
+  'search fallback reads the checked file descriptor instead of reopening a replaced path',
+  { skip: process.platform === 'win32' },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-search-race-'));
+    const root = path.join(dir, 'workspace');
+    fs.mkdirSync(root);
+    const file = path.join(root, 'sample.txt');
+    const outside = path.join(dir, 'outside.txt');
+    try {
+      fs.writeFileSync(file, 'hello original');
+      fs.writeFileSync(outside, 'hello outside secret');
+      const worker = new URL('../executor/worker.js', import.meta.url).href;
+      const script = `
+      import fs from 'node:fs';
+      import assert from 'node:assert/strict';
+      process.env.PATH = ${JSON.stringify(dir)};
+      await import(${JSON.stringify(worker)});
+      const create = fs.createReadStream;
+      fs.createReadStream = (...args) => {
+        fs.unlinkSync(${JSON.stringify(file)});
+        fs.symlinkSync(${JSON.stringify(outside)}, ${JSON.stringify(file)});
+        return create(...args);
+      };
+      let replied = false;
+      process.connected = true;
+      process.on('beforeExit', () => assert.equal(replied, true));
+      process.send = ({result}) => {
+        replied = true;
+        assert.equal(result.isError, false, result.output);
+        assert.match(result.output, /hello original/);
+        assert.equal(result.output.includes('outside secret'), false);
+      };
+      process.emit('message', { requestId: 'search', name: 'search', input: { pattern: 'hello' }, workspace: ${JSON.stringify(root)}, timeoutMs: 1000, maxOutputBytes: 100 });
+    `;
+      execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 3000 });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test('read_file pages preserve line endings and can reach content after the old byte limit', async () => {
   const f = fixture();

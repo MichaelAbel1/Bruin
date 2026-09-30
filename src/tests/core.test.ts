@@ -504,6 +504,26 @@ test('expired task requires explicit retry before another process can claim it',
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+test('releasing an expired task does not make it automatically runnable', (t) => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    const task = store.createTask(session.id, 'Potentially side effecting', []);
+    const now = Date.now();
+    const clock = t.mock.method(Date, 'now', () => now);
+    assert.equal(store.claimTask(session.id, 'first', 1000)?.id, task.id);
+    clock.mock.mockImplementation(() => now + 1100);
+    store.releaseTask(task.id, 'first');
+    assert.equal(store.getTask(session.id, task.id)?.status, 'unknown');
+    assert.equal(store.claimTask(session.id, 'second', 1000), undefined);
+    store.retryTask(session.id, task.id);
+    assert.equal(store.claimTask(session.id, 'second', 1000)?.id, task.id);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 test('legacy key values are redacted from persisted session events', () => {
   const dir = temp();
   const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));

@@ -4,6 +4,7 @@ import os from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
+import { finished } from 'node:stream/promises';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
 import { listWorkspaceEntries } from '../core/workspace-files.js';
 import { recordSnapshot, listSnapshots, restoreSnapshot } from '../core/snapshots.js';
@@ -479,6 +480,22 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
   const pattern = String(req.input.pattern ?? '');
   const glob = typeof req.input.glob === 'string' && req.input.glob ? req.input.glob : undefined;
   if (!pattern) return { output: '', isError: false, exitCode: 0 };
+  const deadline = Date.now() + req.timeoutMs;
+  let cancelled = false;
+  let timedOut = false;
+  let stopReading: (() => void) | undefined;
+  const checkStopped = () => {
+    if (cancelled) throw new Error('搜索已取消');
+    if (timedOut || Date.now() >= deadline) throw new Error('搜索超时');
+  };
+  active.set(req.requestId, async () => {
+    cancelled = true;
+    stopReading?.();
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stopReading?.();
+  }, req.timeoutMs);
   const chunks: Buffer[] = [];
   let size = 0;
   let truncated = false;
@@ -503,43 +520,58 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
     return true;
   };
   async function searchFile(fullPath: string, relPath: string): Promise<boolean> {
+    checkStopped();
     try {
-      const stat = fs.statSync(fullPath);
-      if (stat.size > 5_000_000) return true;
-      const fd = fs.openSync(fullPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const fd = fs.openSync(
+        fullPath,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      );
+      let streaming = false;
       try {
-        const header = Buffer.alloc(Math.min(512, stat.size));
-        const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
-        for (let j = 0; j < bytesRead; j++) {
-          if (header[j] === 0) return true;
-        }
-      } finally {
-        fs.closeSync(fd);
-      }
-      const stream = fs.createReadStream(fullPath, { encoding: 'utf8' });
-      const rl = readline.createInterface({
-        input: stream,
-        crlfDelay: Infinity,
-      });
-      let lineNum = 0;
-      try {
-        for await (const line of rl) {
-          lineNum++;
-          if (line.includes(pattern)) {
-            const formatted = `${relPath}:${lineNum}:${line}\n`;
-            if (!appendMatch(formatted)) {
-              return false;
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile() || stat.size > 5_000_000) return true;
+        if (readBytes(fd, 511).includes(0)) return true;
+        const stream = fs.createReadStream(fullPath, {
+          fd,
+          autoClose: false,
+          start: 0,
+          end: 4_999_999,
+          encoding: 'utf8',
+        });
+        streaming = true;
+        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+        stopReading = () => {
+          rl.close();
+          stream.destroy();
+        };
+        let lineNum = 0;
+        try {
+          for await (const line of rl) {
+            checkStopped();
+            lineNum++;
+            if (line.includes(pattern)) {
+              const formatted = `${relPath}:${lineNum}:${line}\n`;
+              if (!appendMatch(formatted)) return false;
             }
           }
+          checkStopped();
+          if (fs.fstatSync(fd).size > 5_000_000) truncated = true;
+        } finally {
+          stopReading();
+          await finished(stream, { cleanup: true }).catch(() => {});
+          stopReading = undefined;
         }
       } finally {
-        rl.close();
-        stream.destroy();
+        if (!streaming) fs.closeSync(fd);
       }
-    } catch {}
+    } catch {
+      checkStopped();
+    }
     return true;
   }
   async function walk(currentDir: string): Promise<boolean> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    checkStopped();
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(currentDir, { withFileTypes: true });
@@ -547,6 +579,7 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
       return true;
     }
     for (const entry of entries) {
+      checkStopped();
       if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.bruin')
         continue;
       const fullPath = path.join(currentDir, entry.name);
@@ -570,15 +603,21 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
     }
     return true;
   }
-  await walk(root);
-  return {
-    output:
-      new TextDecoder().decode(Buffer.concat(chunks), { stream: truncated }) +
-      (truncated ? '\n[输出已截断]' : ''),
-    truncated,
-    exitCode: matchesCount > 0 ? 0 : 1,
-    isError: false,
-  };
+  try {
+    await walk(root);
+    checkStopped();
+    return {
+      output:
+        new TextDecoder().decode(Buffer.concat(chunks), { stream: truncated }) +
+        (truncated ? '\n[输出已截断]' : ''),
+      truncated,
+      exitCode: matchesCount > 0 ? 0 : 1,
+      isError: false,
+    };
+  } finally {
+    clearTimeout(timer);
+    active.delete(req.requestId);
+  }
 }
 async function handle(req: ToolRequest): Promise<ToolResult> {
   if (Buffer.byteLength(JSON.stringify(req.input)) > 1_000_000) throw new Error('工具输入过大');

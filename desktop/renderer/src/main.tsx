@@ -603,7 +603,10 @@ function App() {
   const [modelRefresh, setModelRefresh] = useState(0);
   const [deletingSession, setDeletingSession] = useState<string | null>(null);
   const selected = useRef<string | null>(null);
+  const viewRevision = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
+  const isCurrentView = (revision: number, sessionId: string) =>
+    viewRevision.current === revision && selected.current === sessionId;
 
   const fail = (err: unknown) => {
     setError(err instanceof Error ? err.message : String(err));
@@ -618,6 +621,7 @@ function App() {
       setSessions(remaining);
       setDeletingSession(null);
       if (selected.current === id) {
+        viewRevision.current++;
         selected.current = null;
         setView(null);
         if (remaining[0]) await openSession(remaining[0].id);
@@ -626,29 +630,48 @@ function App() {
       fail(err);
     }
   }
+  function showSession(result: SessionView) {
+    selected.current = result.session.id;
+    setView(result);
+    setOpenFiles([]);
+    setActiveFile(null);
+    setAttachments([]);
+    setQuote(null);
+    setMaxModelCalls(24);
+    setAllowWorkspaceEdits(false);
+    setUnattended(false);
+    setStream('');
+    setSidebarOpen(false);
+    if (result.recoveredUnknown)
+      setNotice(`已发现 ${result.recoveredUnknown} 个结果未知的工具调用，请检查工作区。`);
+  }
   async function openSession(id: string) {
+    const revision = ++viewRevision.current;
     try {
       const result = await api<SessionView>('openSession', { sessionId: id });
-      selected.current = id;
-      setView(result);
-      setOpenFiles([]);
-      setActiveFile(null);
-      setAttachments([]);
-      setQuote(null);
-      setMaxModelCalls(24);
-      setAllowWorkspaceEdits(false);
-      setUnattended(false);
-      setStream('');
-      setSidebarOpen(false);
-      if (result.recoveredUnknown)
-        setNotice(`已发现 ${result.recoveredUnknown} 个结果未知的工具调用，请检查工作区。`);
+      if (viewRevision.current !== revision) return;
+      showSession(result);
     } catch (err) {
-      fail(err);
+      if (viewRevision.current === revision) fail(err);
+    }
+  }
+  async function refreshView(method: string, params: Record<string, unknown> = {}) {
+    if (!view) return false;
+    const revision = viewRevision.current;
+    try {
+      const next = await api<SessionView>(method, { ...params, sessionId: view.session.id });
+      if (!isCurrentView(revision, view.session.id)) return false;
+      setView(next);
+      return true;
+    } catch (error) {
+      if (!isCurrentView(revision, view.session.id)) return false;
+      throw error;
     }
   }
   const [savingFile, setSavingFile] = useState(false);
   async function openFile(path: string) {
     if (!view) return;
+    const revision = viewRevision.current;
     try {
       const file = await api<{
         path: string;
@@ -656,6 +679,7 @@ function App() {
         truncated: boolean;
         baselineContent?: string;
       }>('readWorkspaceFile', { sessionId: view.session.id, path });
+      if (!isCurrentView(revision, view.session.id)) return;
       setOpenFiles((current) => {
         const existing = current.find((item) => item.path === path);
         // Keep the original save precondition while the editor has unsaved changes.
@@ -672,12 +696,13 @@ function App() {
       });
       setActiveFile(path);
     } catch (err) {
-      fail(err);
+      if (isCurrentView(revision, view.session.id)) fail(err);
     }
   }
 
   async function saveFile(file: OpenFile) {
     if (!view || savingFile) return;
+    const revision = viewRevision.current;
     if (file.truncated) {
       setNotice('截断预览不能覆盖保存，请使用外部编辑器修改完整文件。');
       return;
@@ -690,14 +715,17 @@ function App() {
         content: file.content,
         expectedContent: file.originalContent,
       });
+      if (!isCurrentView(revision, view.session.id)) return;
       setOpenFiles((current) =>
         current.map((item) =>
-          item.path === file.path ? { ...item, originalContent: file.content } : item,
+          item.path === file.path && item.originalContent === file.originalContent
+            ? { ...item, originalContent: file.content }
+            : item,
         ),
       );
       setNotice(`已保存 ${short(file.path)}`);
     } catch (err) {
-      fail(err);
+      if (isCurrentView(revision, view.session.id)) fail(err);
     } finally {
       setSavingFile(false);
     }
@@ -724,13 +752,17 @@ function App() {
   }
   async function changeWorkspace() {
     if (!view || busy) return;
+    let revision = viewRevision.current;
     try {
       const workspace = await api<string | null>('chooseWorkspace');
-      if (!workspace) return;
+      if (!workspace || !isCurrentView(revision, view.session.id)) return;
+      revision = ++viewRevision.current;
       const next = await api<SessionView>('setWorkspace', {
         sessionId: view.session.id,
         workspace,
       });
+      if (!isCurrentView(revision, view.session.id)) return;
+      viewRevision.current++;
       setView(next);
       setOpenFiles([]);
       setActiveFile(null);
@@ -738,7 +770,7 @@ function App() {
       setQuote(null);
       await refreshSessions();
     } catch (err) {
-      fail(err);
+      if (isCurrentView(revision, view.session.id)) fail(err);
     }
   }
   useEffect(() => {
@@ -825,12 +857,14 @@ function App() {
               : previous,
           );
         void refreshSessions().catch(fail);
-        if (message.sessionId)
+        if (message.sessionId) {
+          const revision = viewRevision.current;
           void api<SessionView>('openSession', { sessionId: message.sessionId })
             .then((next) => {
-              if (selected.current === message.sessionId) setView(next);
+              if (isCurrentView(revision, message.sessionId!)) setView(next);
             })
             .catch(fail);
+        }
         if (message.type === 'runFailed') fail(new Error(message.message ?? '执行失败'));
       }
     });
@@ -917,14 +951,16 @@ function App() {
   }
   async function chooseAttachments(kind: 'file' | 'folder') {
     if (!view) return;
+    const revision = viewRevision.current;
     try {
-      const selected = await api<AttachmentRef[]>('chooseAttachments', {
+      const imported = await api<AttachmentRef[]>('chooseAttachments', {
         sessionId: view.session.id,
         kind,
       });
-      setAttachments((current) => [...current, ...selected].slice(0, 30));
+      if (isCurrentView(revision, view.session.id))
+        setAttachments((current) => [...current, ...imported].slice(0, 30));
     } catch (err) {
-      fail(err);
+      if (isCurrentView(revision, view.session.id)) fail(err);
     }
   }
   async function cancel() {
@@ -972,13 +1008,10 @@ function App() {
   async function switchModel(modelId: string, alias?: string) {
     if (!view) return;
     try {
-      setView(
-        await api<SessionView>('setSessionModel', {
-          sessionId: view.session.id,
-          alias: alias ?? view.session.profile.alias,
-          modelId,
-        }),
-      );
+      await refreshView('setSessionModel', {
+        alias: alias ?? view.session.profile.alias,
+        modelId,
+      });
       await refreshSessions();
     } catch (err) {
       fail(err);
@@ -1002,7 +1035,7 @@ function App() {
   async function finishPausedTurn() {
     if (!view || busy) return;
     try {
-      setView(await api<SessionView>('finishPausedTurn', { sessionId: view.session.id }));
+      await refreshView('finishPausedTurn');
     } catch (err) {
       fail(err);
     }
@@ -1010,8 +1043,7 @@ function App() {
   async function acknowledge() {
     if (!view) return;
     try {
-      setView(await api<SessionView>('reviewUnknown', { sessionId: view.session.id }));
-      setNotice('已确认检查工作区。可继续会话。');
+      if (await refreshView('reviewUnknown')) setNotice('已确认检查工作区。可继续会话。');
     } catch (err) {
       fail(err);
     }
@@ -1019,7 +1051,7 @@ function App() {
   async function planAction(method: string, params: Record<string, unknown>) {
     if (!view) return;
     try {
-      setView(await api<SessionView>(method, { sessionId: view.session.id, ...params }));
+      await refreshView(method, params);
     } catch (err) {
       fail(err);
     }
@@ -1833,10 +1865,8 @@ function App() {
           created={(result) => {
             setDialog(null);
             setSessions((previous) => [result.session, ...previous]);
-            selected.current = result.session.id;
-            setView(result);
-            setOpenFiles([]);
-            setActiveFile(null);
+            viewRevision.current++;
+            showSession(result);
           }}
           fail={fail}
           openModels={() => setDialog('model')}
@@ -1853,10 +1883,7 @@ function App() {
           changed={(next) => {
             setConfig(next);
             void refreshSessions().catch(fail);
-            if (view && !busy)
-              void api<SessionView>('openSession', { sessionId: view.session.id })
-                .then(setView)
-                .catch(fail);
+            if (view && !busy) void refreshView('openSession').catch(fail);
           }}
           fail={fail}
         />

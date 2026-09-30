@@ -571,10 +571,11 @@ export class SqliteEventStore implements EventStore {
       { workspace: string } | undefined;
     this.db
       .prepare(
-        `UPDATE workspace_tasks SET status = 'pending', owner = NULL, expires_at = NULL, updated_at = ?
+        `UPDATE workspace_tasks SET status = CASE WHEN expires_at < ? THEN 'unknown' ELSE 'pending' END,
+        owner = NULL, expires_at = NULL, updated_at = ?
       WHERE id = ? AND owner = ? AND status = 'running'`,
       )
-      .run(new Date().toISOString(), id, owner);
+      .run(Date.now(), new Date().toISOString(), id, owner);
     if (row) this.repairTaskFiles(row.workspace);
   }
   retryTask(sessionId: string, id: string): void {
