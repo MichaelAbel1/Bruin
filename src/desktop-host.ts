@@ -56,7 +56,13 @@ const event = (type: string, data: Record<string, unknown> = {}) => send({ type,
 const store = new SqliteEventStore(path.join(dataDir(), 'sessions.sqlite'));
 const executor = new ProcessExecutor();
 let active:
-  { sessionId: string; controller: AbortController; allowWorkspaceEdits: boolean } | undefined;
+  | {
+      sessionId: string;
+      controller: AbortController;
+      allowWorkspaceEdits: boolean;
+      unattended: boolean;
+    }
+  | undefined;
 let activeRun: Promise<unknown> | undefined;
 const approvals = new Map<
   string,
@@ -123,7 +129,7 @@ const runner = new AgentRunner(
         event('runCheckpoint', { sessionId, events: viewSession(getSession(sessionId)).events });
     },
     approve: (call: ToolCall, reason: string) =>
-      new Promise<boolean>((resolve) => {
+      new Promise<boolean | string>((resolve) => {
         const sessionId = active?.sessionId;
         if (!sessionId) return resolve(false);
         if (
@@ -145,6 +151,10 @@ const runner = new AgentRunner(
             (config.approvalMode === 'autoSafe' && isAutoSafeShell(command)))
         )
           return resolve(true);
+        if (active?.unattended)
+          return resolve(
+            '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。',
+          );
         const approvalId = randomUUID();
         approvals.set(approvalId, { resolve, sessionId, call });
         event('approval', { sessionId, approvalId, call, reason });
@@ -207,9 +217,10 @@ async function startRun(
   prompt?: string,
   attachments: AttachmentRef[] = [],
   quote?: { text: string; seq: number },
-  runSettings: { maxModelCalls: number; allowWorkspaceEdits: boolean } = {
+  runSettings: { maxModelCalls: number; allowWorkspaceEdits: boolean; unattended: boolean } = {
     maxModelCalls: 24,
     allowWorkspaceEdits: false,
+    unattended: false,
   },
 ): Promise<{ started: boolean }> {
   if (active) throw new Error('已有任务正在运行');
@@ -231,6 +242,7 @@ async function startRun(
     sessionId: session.id,
     controller,
     allowWorkspaceEdits: runSettings.allowWorkspaceEdits,
+    unattended: runSettings.unattended,
   };
   event('runStarted', { sessionId: session.id, longRun: runSettings.maxModelCalls > 24 });
   activeRun = runner
@@ -240,6 +252,7 @@ async function startRun(
             maxModelCalls: runSettings.maxModelCalls,
             maxDurationMs: 8 * 60 * 60 * 1000,
             checkpointEvery: 24,
+            unattended: runSettings.unattended,
           }
         : {}),
     })
@@ -266,10 +279,13 @@ async function startRun(
 function requestedRunSettings(p: Record<string, unknown>) {
   const maxModelCalls = p.maxModelCalls === undefined ? 24 : Number(p.maxModelCalls);
   const allowWorkspaceEdits = p.allowWorkspaceEdits === true;
-  if (![24, 96, 240].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
+  const unattended = p.unattended === true;
+  if (![24, 96, 240, 480].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
   if (allowWorkspaceEdits && maxModelCalls === 24)
     throw new Error('自动修改工作区文件只能在长任务模式下启用');
-  return { maxModelCalls, allowWorkspaceEdits };
+  if (unattended && maxModelCalls === 24) throw new Error('无人值守模式只能在长任务模式下启用');
+  if (maxModelCalls === 480 && !unattended) throw new Error('480 次模型调用需要启用无人值守模式');
+  return { maxModelCalls, allowWorkspaceEdits, unattended };
 }
 async function dispatch(method: string, p: Record<string, unknown>) {
   switch (method) {

@@ -37,6 +37,6 @@
 
 ## 恢复和限制
 
-会话操作按 `tool_requested` → `tool_approved` → `tool_started` → `tool_finished` 记录。长任务模式在同一运行中允许最多 240 次模型调用，每 24 次记录进度；可单独授权本段自动修改工作区文件。中断时无法确认外部副作用，恢复扫描会标记 `tool_unknown`，要求人工检查后继续。后台任务和子 Agent 的开始、结束也有单独事件；重启不自动继续这些进程。
+会话操作按 `tool_requested` → `tool_approved` → `tool_started` → `tool_finished` 记录。长任务模式在同一运行中允许最多 240 次模型调用；显式无人值守模式可选 480 次，未授权操作立即记为 `tool_denied`，每 24 次记录进度。可单独授权本段自动修改工作区文件。中断时无法确认外部副作用，恢复扫描会标记 `tool_unknown`，要求人工检查后继续。后台任务和子 Agent 的开始、结束也有单独事件；重启不自动继续这些进程。
 
 当前仍缺少跨进程会话租约、系统钥匙串、MCP OAuth 交互式登录、后台任务跨重启续跑、Docker 容器取消后的强制回收保证，以及面向敌对代码的强隔离。参见 [安全模型](SECURITY.md) 与 [生产化审查](PRODUCTION_REVIEW.md)。

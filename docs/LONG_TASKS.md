@@ -2,28 +2,29 @@
 
 本页基于 Bruin 当前实现，以及 2026 年 9 月查阅的官方资料。不同产品的运行环境和安全边界不同；下表只比较与长任务直接相关的机制。
 
-| 场景         | 其他 Agent 的公开机制                                                                                                                                                                             | Bruin 当前状态                                                                                                       |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| 多小时任务   | [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) 在远程隔离环境异步运行；[Codex 长任务实践](https://developers.openai.com/blog/run-long-horizon-tasks-with-codex)强调明确计划和持续验证 | 显式长任务模式允许单段 96 或 240 次模型调用，最长 8 小时；每 24 次记录检查点，达到预算时暂停并报告                   |
-| 上下文增长   | [Claude Code `/compact`](https://code.claude.com/docs/zh-CN/commands) 与 [Codex compaction 指南](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)都提供长期上下文压缩    | 接近窗口上限时保存持久摘要；原始事件保留在 SQLite，摘要仍可能遗漏细节                                                |
-| 无人值守权限 | [Gemini CLI 策略引擎](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/policy-engine.md)区分允许、拒绝和询问；无人值守时询问视为拒绝                                          | 长任务可由用户仅对本段授权工作区文件写入；Shell 仅按已保存的完整命令或固定只读白名单自动执行，其余操作仍会等待或拒绝 |
-| 崩溃与回滚   | [Cursor checkpoints](https://cursor.com/docs/agent/overview)保存 Agent 文件修改快照                                                                                                               | Bruin 保留事件和已完成工具结果；结果未知的操作要求人工检查。暂无文件快照回滚，也不会在崩溃后自动重启长任务           |
+| 场景         | 其他 Agent 的公开机制                                                                                                                                                                                                               | Bruin 当前状态                                                                                                          |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| 多小时任务   | [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) 在远程隔离环境异步运行；[Codex 长任务实践](https://developers.openai.com/blog/run-long-horizon-tasks-with-codex)强调明确计划和持续验证                                   | 显式长任务模式允许 96 或 240 次模型调用；无人值守模式可选 480 次。最多 8 小时，每 24 次记录检查点，达到预算时暂停并报告 |
+| 上下文增长   | [Claude Code `/compact`](https://code.claude.com/docs/zh-CN/commands) 与 [Codex compaction 指南](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)都提供长期上下文压缩                                      | 接近窗口上限时保存持久摘要；原始事件保留在 SQLite，摘要仍可能遗漏细节                                                   |
+| 无人值守权限 | [Claude Code 的 `dontAsk`](https://code.claude.com/docs/zh-CN/agent-sdk/permissions)和 [Gemini CLI 策略引擎](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/policy-engine.md)都支持将未预先允许的操作直接拒绝 | 可显式选择无人值守，未预先授权的操作立即拒绝并反馈给模型；已授权文件写入和完整 Shell 命令照常执行，不会扩展授权范围     |
+| 崩溃与回滚   | [Cursor checkpoints](https://cursor.com/docs/agent/overview)保存 Agent 文件修改快照                                                                                                                                                 | Bruin 保留事件和已完成工具结果；结果未知的操作要求人工检查。暂无文件快照回滚，也不会在崩溃后自动重启长任务              |
 
 ## 使用
 
-桌面端在输入框下展开「运行预算」，选择 96 或 240 次模型调用。只有明确勾选后，本段运行才会自动批准 `write_file` 和 `edit_file`；两者仍受工作区路径限制。长任务运行时，Electron 请求操作系统避免挂起应用，但机器睡眠、关机或应用退出仍会中断任务。审批弹窗出现时，任务会等待用户；因此“通宵跑”需要任务所需权限事先满足。
+桌面端在输入框下展开「运行预算」，选择 96 或 240 次模型调用。勾选「无人值守」后还可选择 480 次；未预先授权的操作会立即拒绝，模型得到拒绝原因，可改用已授权工具或说明需要用户批准。只有单独勾选文件写入授权，本段运行才会自动批准 `write_file` 和 `edit_file`；两者仍受工作区路径限制。Shell 仅可使用已保存的完整命令授权或固定只读白名单，MCP 等未授权操作会被拒绝。长任务运行时，Electron 请求操作系统避免挂起应用，但机器睡眠、关机或应用退出仍会中断任务。
 
 CLI 可使用：
 
 ```sh
-node dist/cli.js chat --model main --workspace /path/to/project --max-model-calls 240 --allow-workspace-edits '完成这次重构并验证'
+node dist/cli.js chat --model main --workspace /path/to/project --max-model-calls 480 --unattended --allow-workspace-edits '完成这次重构并验证'
 ```
 
-`--allow-workspace-edits` 只对这次 CLI 进程有效，并可能覆盖工作区文件。未启用它时写入仍需审批。非交互式 CLI 对未预先允许的操作拒绝授权；若预算用尽仍未完成，进程以状态码 2 退出，并保留会话供 `--resume` 继续。Shell 命令可先在桌面端授予同一工作区、完整命令的会话或永久授权。
+`--allow-workspace-edits` 和 `--unattended` 只对这次 CLI 进程有效。前者可能覆盖工作区文件；后者不授予新权限，只使未获授权的操作立即拒绝。非交互式 CLI 也会拒绝未预先允许的操作；若预算用尽仍未完成，进程以状态码 2 退出，并保留会话供 `--resume` 继续。恢复时若有结果未知的工具调用，无人值守与非交互式 CLI 会以状态码 3 停止，要求人工检查，避免重复副作用。Shell 命令可先在桌面端授予同一工作区、完整命令的会话或永久授权。
 
 ## 仍存在的边界
 
 - 模型调用次数和时长不是金额上限；不同 Provider 的价格和用量可能不同。
+- 无人值守模式不会替用户批准未授权操作。如果任务必须使用这类操作，模型只能说明阻碍或在预算内尝试其他方法。
 - 定时任务和任务图自动认领仍使用默认的 24 次模型调用预算，暂不能给单个定时作业配置长任务模式。
 - 8 小时时限在模型调用之间检查。等待人工审批、系统睡眠或一个耗时较长的工具调用可能使实际墙钟时间超过它。
 - 目前桌面端同一时间只运行一个主 Agent；子 Agent 只读，不能把复杂重构拆成并行写入的工作树任务。

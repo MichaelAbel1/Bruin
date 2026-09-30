@@ -1799,6 +1799,62 @@ test('resuming a paused turn does not rerun the turn-started hook', async () => 
   }
 });
 
+test('unattended run rejects unapproved tools without executing them or losing the turn', async () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const session = store.createSession(dir, profile);
+  let calls = 0;
+  let approvals = 0;
+  let executions = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      calls++;
+      return calls === 1
+        ? { text: '', calls: [{ id: 'shell-1', name: 'shell', input: { command: 'npm install' } }] }
+        : { text: 'Approval is required to install dependencies.', calls: [] };
+    },
+  };
+  const executor: ToolExecutor = {
+    async execute() {
+      executions++;
+      return { output: 'unexpected', isError: false };
+    },
+    async close() {},
+  };
+  try {
+    const runner = new AgentRunner(store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        approvals++;
+        return '无人值守模式：未预先授权';
+      },
+    });
+    await assert.rejects(
+      runner.run(session, 'install dependencies', undefined, [], undefined, { maxModelCalls: 480 }),
+      /需要显式启用无人值守模式/,
+    );
+    assert.deepEqual(store.events(session.id), []);
+    await runner.run(session, 'install dependencies', undefined, [], undefined, {
+      maxModelCalls: 480,
+      unattended: true,
+    });
+    assert.equal(calls, 2);
+    assert.equal(approvals, 1);
+    assert.equal(executions, 0);
+    assert.match(
+      String(
+        store.events(session.id).find((event) => event.type === 'tool_denied')?.payload.output,
+      ),
+      /未预先授权/,
+    );
+    assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('write_file automatically creates nested parent directories and permissions allow it', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-write-test-'));
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-write-outside-'));

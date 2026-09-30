@@ -566,8 +566,9 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState('');
   const [composer, setComposer] = useState('');
-  const [maxModelCalls, setMaxModelCalls] = useState<24 | 96 | 240>(24);
+  const [maxModelCalls, setMaxModelCalls] = useState<24 | 96 | 240 | 480>(24);
   const [allowWorkspaceEdits, setAllowWorkspaceEdits] = useState(false);
+  const [unattended, setUnattended] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const [quote, setQuote] = useState<{ seq: number; text: string } | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
@@ -625,6 +626,7 @@ function App() {
       setQuote(null);
       setMaxModelCalls(24);
       setAllowWorkspaceEdits(false);
+      setUnattended(false);
       setStream('');
       setSidebarOpen(false);
       if (result.recoveredUnknown)
@@ -771,6 +773,7 @@ function App() {
       if (message.type === 'runFinished' || message.type === 'runFailed') {
         setMaxModelCalls(24);
         setAllowWorkspaceEdits(false);
+        setUnattended(false);
       }
       if (message.sessionId !== selected.current) return;
       if (message.type === 'runStarted') {
@@ -883,6 +886,7 @@ function App() {
         quoteSeq: submittedQuote?.seq,
         maxModelCalls,
         allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+        unattended: maxModelCalls > 24 && unattended,
       });
     } catch (err) {
       setBusy(false);
@@ -970,6 +974,7 @@ function App() {
         sessionId: view.session.id,
         maxModelCalls,
         allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+        unattended: maxModelCalls > 24 && unattended,
       });
     } catch (err) {
       setBusy(false);
@@ -1435,7 +1440,7 @@ function App() {
                 <details className="long-run-settings">
                   <summary>
                     {maxModelCalls > 24
-                      ? `长任务：最多 ${maxModelCalls} 次模型调用 / 8 小时`
+                      ? `长任务：最多 ${maxModelCalls} 次模型调用 / 8 小时${unattended ? ' · 无人值守' : ''}`
                       : '运行预算：标准 24 次模型调用'}
                   </summary>
                   <div className="long-run-controls">
@@ -1444,29 +1449,48 @@ function App() {
                       <select
                         value={maxModelCalls}
                         disabled={busy}
-                        onChange={(event) =>
-                          setMaxModelCalls(Number(event.target.value) as 24 | 96 | 240)
-                        }
+                        onChange={(event) => {
+                          const next = Number(event.target.value) as 24 | 96 | 240 | 480;
+                          setMaxModelCalls(next);
+                          if (next === 24) setUnattended(false);
+                        }}
                       >
                         <option value={24}>标准 · 24 次</option>
                         <option value={96}>长任务 · 96 次</option>
                         <option value={240}>长任务 · 240 次</option>
+                        {unattended && <option value={480}>无人值守 · 480 次</option>}
                       </select>
                     </label>
                     {maxModelCalls > 24 && (
-                      <label className="long-run-write-choice">
-                        <input
-                          type="checkbox"
-                          checked={allowWorkspaceEdits}
-                          disabled={busy}
-                          onChange={(event) => setAllowWorkspaceEdits(event.target.checked)}
-                        />
-                        本段自动批准工作区内的文件写入和编辑
-                      </label>
+                      <>
+                        <label className="long-run-write-choice">
+                          <input
+                            type="checkbox"
+                            checked={allowWorkspaceEdits}
+                            disabled={busy}
+                            onChange={(event) => setAllowWorkspaceEdits(event.target.checked)}
+                          />
+                          本段自动批准工作区内的文件写入和编辑
+                        </label>
+                        <label className="long-run-write-choice">
+                          <input
+                            type="checkbox"
+                            checked={unattended}
+                            disabled={busy}
+                            onChange={(event) => {
+                              setUnattended(event.target.checked);
+                              if (!event.target.checked && maxModelCalls === 480)
+                                setMaxModelCalls(240);
+                            }}
+                          />
+                          无人值守：未预先授权的操作立即拒绝，不等待审批
+                        </label>
+                      </>
                     )}
                     <small>
-                      长任务每 24 次记录检查点；模型调用数不是费用上限。自动写入可覆盖工作区文件。
-                      Shell、MCP 等仍按审批规则执行，无人批准时会等待。
+                      每 24 次记录检查点，最多运行 8
+                      小时。模型调用数不是费用上限；自动写入可覆盖工作区文件。
+                      无人值守模式下，Shell、MCP 等仍需预先授权，否则会被拒绝。
                     </small>
                   </div>
                 </details>
@@ -2042,7 +2066,12 @@ function EventCard({
     return (
       <div className="pause-banner">
         <Sparkles size={16} /> 长任务已开启：最多 {String(event.payload.maxModelCalls)} 次模型调用；
-        {event.payload.allowWorkspaceEdits ? '本段允许自动修改工作区文件。' : '文件修改仍需审批。'}
+        {event.payload.allowWorkspaceEdits
+          ? '本段允许自动修改工作区文件。'
+          : event.payload.unattended
+            ? '未授权的文件修改会被拒绝。'
+            : '文件修改仍需审批。'}
+        {event.payload.unattended ? '未授权操作立即拒绝。' : ''}
       </div>
     );
   if (event.type === 'user')

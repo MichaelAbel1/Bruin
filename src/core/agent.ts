@@ -29,7 +29,7 @@ export interface AgentIO {
   text(delta: string): void;
   notice(message: string): void;
   checkpoint?(modelCalls: number): void;
-  approve(call: ToolCall, reason: string): Promise<boolean>;
+  approve(call: ToolCall, reason: string): Promise<boolean | string>;
 }
 export function formatModelError(err: unknown): string {
   const error = err as { message?: unknown; statusCode?: unknown; responseBody?: unknown } | null;
@@ -273,14 +273,21 @@ export class AgentRunner {
     signal = new AbortController().signal,
     attachments: AttachmentRef[] = [],
     quote?: { text: string; seq: number },
-    options: { maxModelCalls?: number; maxDurationMs?: number; checkpointEvery?: number } = {},
+    options: {
+      maxModelCalls?: number;
+      maxDurationMs?: number;
+      checkpointEvery?: number;
+      unattended?: boolean;
+    } = {},
   ): Promise<void> {
     const envSteps = Number(process.env.BRUIN_MAX_STEPS);
     const defaultSteps =
       Number.isFinite(envSteps) && envSteps > 0 ? Math.min(Math.floor(envSteps), 100) : 24;
     const maxSteps = options.maxModelCalls ?? defaultSteps;
-    if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 240)
-      throw new Error('模型调用预算必须在 1 到 240 之间');
+    if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 480)
+      throw new Error('模型调用预算必须在 1 到 480 之间');
+    if (maxSteps > 240 && !options.unattended)
+      throw new Error('超过 240 次模型调用需要显式启用无人值守模式');
     if (
       options.maxDurationMs !== undefined &&
       (!Number.isInteger(options.maxDurationMs) ||
@@ -389,6 +396,9 @@ export class AgentRunner {
         systemPrompt(session.workspace) +
         loadInstructions(session.workspace) +
         '\nRemember only explicit, lasting user preferences with remember_preference; never store secrets or infer preferences.' +
+        (options.unattended
+          ? '\nThis run is unattended. Unapproved actions are denied immediately. Do not repeat a denied tool request. Continue with authorized tools when possible; otherwise explain exactly what approval is needed and stop.'
+          : '') +
         (this.readOnly
           ? '\nYou are a read-only subagent. Research and report; never modify files or invoke external tools.'
           : '') +
@@ -603,11 +613,15 @@ export class AgentRunner {
                   session.workspace,
                   Boolean(session.managedWorkspace && !fs.existsSync(session.workspace)),
                 );
-        if (
-          policy.decision === 'deny' ||
-          (policy.decision === 'ask' && !(await this.io.approve(call, policy.reason)))
-        ) {
-          const reason = policy.decision === 'deny' ? policy.reason : '用户拒绝';
+        const approval =
+          policy.decision === 'ask' ? await this.io.approve(call, policy.reason) : true;
+        if (policy.decision === 'deny' || approval !== true) {
+          const reason =
+            policy.decision === 'deny'
+              ? policy.reason
+              : typeof approval === 'string'
+                ? approval
+                : '用户拒绝';
           this.store.append(session.id, 'tool_denied', {
             callId: call.id,
             name: call.name,

@@ -236,6 +236,14 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       request('send', { sessionId: created.session.id, prompt: 'test', allowWorkspaceEdits: true }),
       /只能在长任务模式下启用/,
     );
+    await assert.rejects(
+      request('send', { sessionId: created.session.id, prompt: 'test', unattended: true }),
+      /无人值守模式只能在长任务模式下启用/,
+    );
+    await assert.rejects(
+      request('send', { sessionId: created.session.id, prompt: 'test', maxModelCalls: 480 }),
+      /需要启用无人值守模式/,
+    );
     await request('send', { sessionId: created.session.id, prompt: '创建文件' });
     const events = await runDone;
     assert.equal(approvalSeen, 1);
@@ -272,6 +280,33 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       ),
     );
     await request('deleteSession', { sessionId: unattended.session.id });
+
+    modelCalls = 0;
+    const deniedDone = new Promise<any[]>((resolve, reject) => {
+      finishRun = resolve;
+      failRun = reject;
+    });
+    const deniedSession = await request('createSession', { workspace: dir });
+    await request('send', {
+      sessionId: deniedSession.session.id,
+      prompt: '尝试未授权写入',
+      maxModelCalls: 480,
+      unattended: true,
+    });
+    const deniedEvents = await deniedDone;
+    assert.equal(approvalSeen, 1);
+    assert.equal(modelCalls, 2);
+    assert.equal(deniedEvents.at(-1).type, 'turn_completed');
+    assert.match(
+      String(deniedEvents.find((event) => event.type === 'tool_denied')?.payload.output),
+      /无人值守模式/,
+    );
+    assert.ok(
+      deniedEvents.some(
+        (event) => event.type === 'run_configured' && event.payload.unattended === true,
+      ),
+    );
+    await request('deleteSession', { sessionId: deniedSession.session.id });
 
     const externalStore = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
     try {
