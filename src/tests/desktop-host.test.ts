@@ -255,6 +255,19 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     );
     assert.doesNotMatch(JSON.stringify(events), /sk-test-key/);
     assert.equal(fs.readFileSync(path.join(dir, 'result.txt'), 'utf8'), 'created');
+    assert.deepEqual(await request('listWorkspaceChanges', { sessionId: created.session.id }), [
+      { path: 'result.txt', source: 'agent', status: 'added' },
+    ]);
+    const review = await request('readWorkspaceReview', {
+      sessionId: created.session.id,
+      path: 'result.txt',
+    });
+    assert.equal(review.content, 'created');
+    assert.equal(review.baselineContent, '');
+    await assert.rejects(
+      request('readWorkspaceReview', { sessionId: created.session.id, path: '../outside' }),
+      /变更列表/,
+    );
     assert.ok(events.some((event) => event.type === 'tool_approved'));
     assert.equal(events.at(-1).type, 'turn_completed');
 

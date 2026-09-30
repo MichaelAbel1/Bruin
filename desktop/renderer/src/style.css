@@ -2882,3 +2882,148 @@ pre {
 :root[data-theme='light'] .composer-hint {
   color: #8c959f;
 }
+
+/* Shared surfaces keep overlays and activity cards in the current theme. */
+:root {
+  --review-surface: #1b201e;
+  --review-border: #3c453e;
+  --review-text: #e8e9e8;
+  --review-muted: #9ca69f;
+  --review-hover: #28312b;
+  --review-shadow: 0 8px 28px #0005;
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  --review-surface: #fff;
+  --review-border: #e0e3e5;
+  --review-text: #202124;
+  --review-muted: #687078;
+  --review-hover: #f3f5f6;
+  --review-shadow: 0 8px 28px #00000014;
+  color-scheme: light;
+}
+.tool-activity,
+.modal,
+.approval-modal {
+  background: var(--review-surface);
+  border-color: var(--review-border);
+  color: var(--review-text);
+}
+.tool-activity > summary,
+.tool-activity-list small {
+  color: var(--review-muted);
+}
+.new-task,
+:root[data-theme='light'] .new-task {
+  background: var(--review-surface);
+  color: var(--review-text);
+  border-color: var(--review-border);
+}
+.new-task:hover,
+:root[data-theme='light'] .new-task:hover {
+  background: var(--review-hover);
+}
+.conversation-frame {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.conversation-frame .conversation {
+  padding-bottom: 285px;
+}
+.conversation-frame:has(.workspace-review-dock:not(.expanded)) .conversation {
+  padding-bottom: 85px;
+}
+.workspace-review-dock {
+  position: absolute;
+  bottom: 16px;
+  right: max(24px, calc((100% - 810px) / 2));
+  width: min(360px, calc(100% - 48px));
+  z-index: 3;
+  background: var(--review-surface);
+  color: var(--review-text);
+  border: 1px solid var(--review-border);
+  border-radius: 12px;
+  box-shadow: var(--review-shadow);
+  overflow: hidden;
+}
+.workspace-review-heading {
+  display: flex;
+  align-items: center;
+  padding-right: 8px;
+}
+.workspace-review-toggle {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  padding: 12px;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  text-align: left;
+}
+.workspace-review-toggle span {
+  color: var(--review-muted);
+  font-size: 12px;
+}
+.workspace-review-toggle svg:last-child {
+  margin-left: auto;
+  transform: rotate(-90deg);
+}
+.expanded .workspace-review-toggle svg:last-child {
+  transform: none;
+}
+.workspace-review-body {
+  border-top: 1px solid var(--review-border);
+  max-height: min(220px, 30vh);
+  overflow: auto;
+}
+.workspace-review-body p,
+.workspace-review-empty {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--review-muted);
+  font-size: 11px;
+}
+.workspace-review-body ul {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px 6px;
+}
+.workspace-review-body li button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 9px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font-size: 12px;
+}
+.workspace-review-body li button:hover {
+  background: var(--review-hover);
+}
+.workspace-review-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-review-status,
+.workspace-review-body small {
+  flex: none;
+  color: var(--review-muted);
+  font-size: 10px;
+}
+.workspace-review-status.added {
+  color: #3c8421;
+}
+.workspace-review-status.deleted {
+  color: #cc5353;
+}

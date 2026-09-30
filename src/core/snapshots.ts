@@ -155,6 +155,12 @@ function readSnapshot(workspace: string, id: string): Snapshot {
     fs.closeSync(fd);
   }
 }
+export function previewSnapshot(workspace: string, id: string): string {
+  const snapshot = readSnapshot(workspace, id);
+  const bytes = snapshot.before === null ? Buffer.alloc(0) : Buffer.from(snapshot.before, 'base64');
+  if (bytes.length > 256_000 || bytes.includes(0)) throw new Error('快照不支持文本预览');
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+}
 export function listSnapshots(workspace: string) {
   const { directory } = location(workspace);
   if (!fs.existsSync(directory)) return [];

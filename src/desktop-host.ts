@@ -42,6 +42,7 @@ import {
   writeWorkspaceFile,
 } from './core/workspace-files.js';
 import { importAttachments, loadAttachment, type AttachmentRef } from './core/attachments.js';
+import { listWorkspaceChanges, readWorkspaceReview } from './core/workspace-review.js';
 import {
   approvePlan,
   planBlocks,
@@ -318,6 +319,14 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const relative = String(p.path ?? '');
       if (!fs.existsSync(session.workspace)) return [];
       return listWorkspaceEntries(session.workspace, relative);
+    }
+    case 'listWorkspaceChanges': {
+      const session = getSession(p.sessionId);
+      return listWorkspaceChanges(session.workspace, store.events(session.id));
+    }
+    case 'readWorkspaceReview': {
+      const session = getSession(p.sessionId);
+      return readWorkspaceReview(session.workspace, String(p.path ?? ''), store.events(session.id));
     }
     case 'readWorkspaceFile': {
       const session = getSession(p.sessionId);

@@ -146,6 +146,7 @@ type OpenFile = {
   baselineContent?: string;
   truncated: boolean;
   mode?: 'edit' | 'diff';
+  readOnlyReason?: string;
 };
 
 type DiffLine = {
@@ -394,10 +395,10 @@ function FileEditorViewer({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
       e.preventDefault();
-      if (isDirty && !file.truncated) onSave();
+      if (isDirty && !file.truncated && !file.readOnlyReason) onSave();
       return;
     }
-    if (file.truncated) return;
+    if (file.truncated || file.readOnlyReason) return;
     if (e.key === 'Tab') {
       e.preventDefault();
       const ta = e.currentTarget;
@@ -427,7 +428,9 @@ function FileEditorViewer({
               ● 未保存
             </span>
           ) : (
-            <span className="file-status-badge clean">已保存</span>
+            <span className="file-status-badge clean">
+              {file.readOnlyReason ? '只读' : '已保存'}
+            </span>
           )}
           {(diffResult.additions > 0 || diffResult.deletions > 0) && (
             <div
@@ -478,7 +481,7 @@ function FileEditorViewer({
           )}
           <button
             className={`file-action-btn save ${isDirty ? 'primary' : ''}`}
-            disabled={!isDirty || saving || file.truncated}
+            disabled={!isDirty || saving || file.truncated || Boolean(file.readOnlyReason)}
             onClick={onSave}
             title="保存文件 (⌘S / Ctrl+S)"
           >
@@ -492,6 +495,7 @@ function FileEditorViewer({
           文件过大，仅显示前 256 KB 内容；预览只读，请使用外部编辑器修改。
         </div>
       )}
+      {file.readOnlyReason && <div className="file-warning-banner">{file.readOnlyReason}</div>}
       {mode === 'edit' ? (
         <div className="code-editor-layout">
           <div className="code-gutter" ref={gutterRef}>
@@ -522,7 +526,7 @@ function FileEditorViewer({
               ref={textareaRef}
               className="code-editor-textarea"
               value={file.content}
-              readOnly={file.truncated}
+              readOnly={file.truncated || Boolean(file.readOnlyReason)}
               onChange={(e) => onContentChange(e.target.value)}
               onKeyDown={handleKeyDown}
               onScroll={handleScroll}
@@ -669,7 +673,7 @@ function App() {
     }
   }
   const [savingFile, setSavingFile] = useState(false);
-  async function openFile(path: string) {
+  async function openFile(path: string, review = false) {
     if (!view) return;
     const revision = viewRevision.current;
     try {
@@ -678,19 +682,27 @@ function App() {
         content: string;
         truncated: boolean;
         baselineContent?: string;
-      }>('readWorkspaceFile', { sessionId: view.session.id, path });
+        readOnlyReason?: string;
+      }>(review ? 'readWorkspaceReview' : 'readWorkspaceFile', {
+        sessionId: view.session.id,
+        path,
+      });
       if (!isCurrentView(revision, view.session.id)) return;
       setOpenFiles((current) => {
         const existing = current.find((item) => item.path === path);
         // Keep the original save precondition while the editor has unsaved changes.
-        if (existing && existing.content !== existing.originalContent) return current;
+        if (existing && existing.content !== existing.originalContent)
+          return review
+            ? current.map((item) => (item.path === path ? { ...item, mode: 'diff' } : item))
+            : current;
         const openItem: OpenFile = {
           path: file.path,
           content: file.content,
           originalContent: file.content,
           baselineContent: file.baselineContent ?? file.content,
           truncated: file.truncated,
-          mode: existing?.mode ?? 'edit',
+          mode: review ? 'diff' : (existing?.mode ?? 'edit'),
+          readOnlyReason: file.readOnlyReason,
         };
         return [...current.filter((item) => item.path !== path), openItem];
       });
@@ -702,6 +714,7 @@ function App() {
 
   async function saveFile(file: OpenFile) {
     if (!view || savingFile) return;
+    if (file.readOnlyReason) return;
     const revision = viewRevision.current;
     if (file.truncated) {
       setNotice('截断预览不能覆盖保存，请使用外部编辑器修改完整文件。');
@@ -1306,158 +1319,175 @@ function App() {
           />
         ) : (
           <>
-            <div className="conversation" key={view.session.id}>
-              <div className="conversation-intro">
-                <div className="project-monogram">
-                  {short(view.session.workspace).slice(0, 1).toUpperCase()}
-                </div>
-                <h1>{short(view.session.workspace)}</h1>
-                <p>{view.session.workspace}</p>
-                <span>
-                  模型 {view.session.profile.alias} · 会话 {view.session.id.slice(0, 8)}
-                </span>
-                {usage.responses > 0 && (
-                  <details className="session-usage">
-                    <summary>
-                      已记录 Token · 输入{' '}
-                      {recordedTokenLabel(usage.inputTokens, usage.inputReports, usage.responses)} ·
-                      输出{' '}
-                      {recordedTokenLabel(usage.outputTokens, usage.outputReports, usage.responses)}
-                    </summary>
-                    <p>
-                      累计 {usage.responses} 次模型响应；其中 {usage.inputReports} 次提供输入用量、
-                      {usage.outputReports} 次提供输出用量。≥ 表示仅统计已提供的部分。
-                      不含上下文摘要、失败或中断请求及子 Agent
-                      的用量；不是当前上下文占用或费用账单。
-                    </p>
-                  </details>
-                )}
-              </div>
-              {view.needsReview && (
-                <div className="review-banner">
-                  <CircleAlert size={19} />
-                  <div>
-                    <strong>有工具操作的结果未知</strong>
-                    <p>上次运行可能在工具执行中中断。请检查项目文件，再继续执行。</p>
+            <div
+              className="conversation-frame"
+              key={`${view.session.id}:${view.session.workspace}`}
+            >
+              <div className="conversation">
+                <div className="conversation-intro">
+                  <div className="project-monogram">
+                    {short(view.session.workspace).slice(0, 1).toUpperCase()}
                   </div>
-                  <button onClick={() => void acknowledge()}>我已检查</button>
+                  <h1>{short(view.session.workspace)}</h1>
+                  <p>{view.session.workspace}</p>
+                  <span>
+                    模型 {view.session.profile.alias} · 会话 {view.session.id.slice(0, 8)}
+                  </span>
+                  {usage.responses > 0 && (
+                    <details className="session-usage">
+                      <summary>
+                        已记录 Token · 输入{' '}
+                        {recordedTokenLabel(usage.inputTokens, usage.inputReports, usage.responses)}{' '}
+                        · 输出{' '}
+                        {recordedTokenLabel(
+                          usage.outputTokens,
+                          usage.outputReports,
+                          usage.responses,
+                        )}
+                      </summary>
+                      <p>
+                        累计 {usage.responses} 次模型响应；其中 {usage.inputReports}{' '}
+                        次提供输入用量、
+                        {usage.outputReports} 次提供输出用量。≥ 表示仅统计已提供的部分。
+                        不含上下文摘要、失败或中断请求及子 Agent
+                        的用量；不是当前上下文占用或费用账单。
+                      </p>
+                    </details>
+                  )}
                 </div>
-              )}
-              {(view.plan.enabled || view.plan.steps.length > 0) && (
-                <div className="plan-panel">
-                  <div className="plan-heading">
-                    <div className="plan-title-wrap">
-                      <strong>规划模式</strong>
-                      <span className={`plan-badge ${view.plan.approved ? 'approved' : 'pending'}`}>
-                        {view.plan.approved ? '已批准' : '待批准'}
-                      </span>
+                {view.needsReview && (
+                  <div className="review-banner">
+                    <CircleAlert size={19} />
+                    <div>
+                      <strong>有工具操作的结果未知</strong>
+                      <p>上次运行可能在工具执行中中断。请检查项目文件，再继续执行。</p>
                     </div>
-                    {view.plan.enabled && (
+                    <button onClick={() => void acknowledge()}>我已检查</button>
+                  </div>
+                )}
+                {(view.plan.enabled || view.plan.steps.length > 0) && (
+                  <div className="plan-panel">
+                    <div className="plan-heading">
+                      <div className="plan-title-wrap">
+                        <strong>规划模式</strong>
+                        <span
+                          className={`plan-badge ${view.plan.approved ? 'approved' : 'pending'}`}
+                        >
+                          {view.plan.approved ? '已批准' : '待批准'}
+                        </span>
+                      </div>
+                      {view.plan.enabled && (
+                        <button
+                          className="secondary plan-close-btn"
+                          disabled={busy}
+                          onClick={() => void planAction('setPlanMode', { enabled: false })}
+                          title="关闭规划模式"
+                        >
+                          关闭
+                        </button>
+                      )}
+                    </div>
+                    {view.plan.steps.length ? (
+                      <ol>
+                        {view.plan.steps.map((step, index) => (
+                          <li key={`${index}-${step}`}>
+                            <span>{step}</span>
+                            {view.plan.approved && (
+                              <select
+                                value={view.plan.progress[index] ?? 'pending'}
+                                onChange={(e) =>
+                                  void planAction('setPlanProgress', {
+                                    index,
+                                    status: e.target.value,
+                                  })
+                                }
+                              >
+                                <option value="pending">待处理</option>
+                                <option value="in_progress">进行中</option>
+                                <option value="completed">已完成</option>
+                              </select>
+                            )}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <p>规划模式已开启。请在对话框发送任务，Bruin 将先制定详细计划供您审批。</p>
+                    )}
+                    {view.plan.steps.length > 0 && !view.plan.approved && (
                       <button
-                        className="secondary plan-close-btn"
+                        className="primary"
                         disabled={busy}
-                        onClick={() => void planAction('setPlanMode', { enabled: false })}
-                        title="关闭规划模式"
+                        onClick={() => void planAction('approvePlan', {})}
                       >
-                        关闭
+                        批准计划并允许执行
+                      </button>
+                    )}
+                    {view.plan.approved && <small>计划已批准。工具仍遵循当前审批设置。</small>}
+                  </div>
+                )}
+                {groupConversationEvents(view.events).map((item) =>
+                  item.kind === 'tools' ? (
+                    <ToolActivity key={`tools-${item.events[0].seq}`} events={item.events} />
+                  ) : (
+                    <EventCard
+                      key={item.event.seq}
+                      event={item.event}
+                      onQuote={(selected) =>
+                        setQuote({
+                          seq: selected.seq,
+                          text: String(selected.payload.text ?? '').slice(0, 4000),
+                        })
+                      }
+                    />
+                  ),
+                )}
+                {stream && (
+                  <div className="message assistant">
+                    <div className="message-icon">
+                      <Bot size={17} />
+                    </div>
+                    <div className="message-body">
+                      <div className="message-author">
+                        Bruin <span className="live-dot" />
+                      </div>
+                      <MarkdownMessage text={stream} />
+                    </div>
+                  </div>
+                )}
+                {busy && !stream && (
+                  <div className="working">
+                    <LoaderCircle className="spin" size={16} /> Bruin 正在处理…
+                  </div>
+                )}
+                {notice && (
+                  <div className="inline-notice">
+                    <Terminal size={15} />
+                    <span>{notice}</span>
+                    <button onClick={() => setNotice('')} aria-label="关闭">
+                      <X size={14} />
+                    </button>
+                  </div>
+                )}
+                {canResume && !view.needsReview && (
+                  <div className="resume-actions">
+                    <button className="resume-button" onClick={() => void resume()}>
+                      <Sparkles size={16} />{' '}
+                      {lastEvent?.type === 'turn_paused' ? '继续任务' : '继续未完成的运行'}
+                    </button>
+                    {lastEvent?.type === 'turn_paused' && (
+                      <button className="secondary" onClick={() => void finishPausedTurn()}>
+                        结束任务
                       </button>
                     )}
                   </div>
-                  {view.plan.steps.length ? (
-                    <ol>
-                      {view.plan.steps.map((step, index) => (
-                        <li key={`${index}-${step}`}>
-                          <span>{step}</span>
-                          {view.plan.approved && (
-                            <select
-                              value={view.plan.progress[index] ?? 'pending'}
-                              onChange={(e) =>
-                                void planAction('setPlanProgress', {
-                                  index,
-                                  status: e.target.value,
-                                })
-                              }
-                            >
-                              <option value="pending">待处理</option>
-                              <option value="in_progress">进行中</option>
-                              <option value="completed">已完成</option>
-                            </select>
-                          )}
-                        </li>
-                      ))}
-                    </ol>
-                  ) : (
-                    <p>规划模式已开启。请在对话框发送任务，Bruin 将先制定详细计划供您审批。</p>
-                  )}
-                  {view.plan.steps.length > 0 && !view.plan.approved && (
-                    <button
-                      className="primary"
-                      disabled={busy}
-                      onClick={() => void planAction('approvePlan', {})}
-                    >
-                      批准计划并允许执行
-                    </button>
-                  )}
-                  {view.plan.approved && <small>计划已批准。工具仍遵循当前审批设置。</small>}
-                </div>
-              )}
-              {groupConversationEvents(view.events).map((item) =>
-                item.kind === 'tools' ? (
-                  <ToolActivity key={`tools-${item.events[0].seq}`} events={item.events} />
-                ) : (
-                  <EventCard
-                    key={item.event.seq}
-                    event={item.event}
-                    onQuote={(selected) =>
-                      setQuote({
-                        seq: selected.seq,
-                        text: String(selected.payload.text ?? '').slice(0, 4000),
-                      })
-                    }
-                  />
-                ),
-              )}
-              {stream && (
-                <div className="message assistant">
-                  <div className="message-icon">
-                    <Bot size={17} />
-                  </div>
-                  <div className="message-body">
-                    <div className="message-author">
-                      Bruin <span className="live-dot" />
-                    </div>
-                    <MarkdownMessage text={stream} />
-                  </div>
-                </div>
-              )}
-              {busy && !stream && (
-                <div className="working">
-                  <LoaderCircle className="spin" size={16} /> Bruin 正在处理…
-                </div>
-              )}
-              {notice && (
-                <div className="inline-notice">
-                  <Terminal size={15} />
-                  <span>{notice}</span>
-                  <button onClick={() => setNotice('')} aria-label="关闭">
-                    <X size={14} />
-                  </button>
-                </div>
-              )}
-              {canResume && !view.needsReview && (
-                <div className="resume-actions">
-                  <button className="resume-button" onClick={() => void resume()}>
-                    <Sparkles size={16} />{' '}
-                    {lastEvent?.type === 'turn_paused' ? '继续任务' : '继续未完成的运行'}
-                  </button>
-                  {lastEvent?.type === 'turn_paused' && (
-                    <button className="secondary" onClick={() => void finishPausedTurn()}>
-                      结束任务
-                    </button>
-                  )}
-                </div>
-              )}
-              <div ref={bottom} />
+                )}
+                <div ref={bottom} />
+              </div>
+              <WorkspaceReviewDock
+                sessionId={view.session.id}
+                refreshKey={`${view.events.length}:${notice}:${busy}`}
+                openFile={(path) => openFile(path, true)}
+              />
             </div>
             <div className="composer-wrap">
               <div className="composer">
@@ -1998,6 +2028,95 @@ function WorkspaceFolder({
         </React.Fragment>
       ))}
     </div>
+  );
+}
+
+function WorkspaceReviewDock({
+  sessionId,
+  refreshKey,
+  openFile,
+}: {
+  sessionId: string;
+  refreshKey: string;
+  openFile: (path: string) => Promise<void>;
+}) {
+  const [changes, setChanges] = useState<
+    { path: string; source: 'agent' | 'workspace'; status: 'added' | 'modified' | 'deleted' }[]
+  >([]);
+  const [expanded, setExpanded] = useState(true);
+  const [error, setError] = useState('');
+  const [refresh, setRefresh] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    void api<typeof changes>('listWorkspaceChanges', { sessionId })
+      .then((next) => {
+        if (!cancelled) {
+          setChanges(next);
+          setError('');
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, refreshKey, refresh]);
+  return (
+    <aside
+      className={`workspace-review-dock ${expanded ? 'expanded' : ''}`}
+      aria-label="文件变更审核"
+    >
+      <div className="workspace-review-heading">
+        <button
+          className="workspace-review-toggle"
+          aria-expanded={expanded}
+          aria-controls="workspace-review-files"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <GitCompare size={16} />
+          <strong>文件变更</strong>
+          <span>{changes.length}</span>
+          <ChevronDown size={14} />
+        </button>
+        <button
+          className="icon-button"
+          aria-label="刷新文件变更"
+          onClick={() => setRefresh((value) => value + 1)}
+        >
+          <RotateCcw size={14} />
+        </button>
+      </div>
+      {expanded && (
+        <div id="workspace-review-files" className="workspace-review-body">
+          <p>本会话写入与工作区未提交修改 · 点击审核</p>
+          {error ? (
+            <p role="alert">{error}</p>
+          ) : changes.length ? (
+            <ul>
+              {changes.map((file) => (
+                <li key={file.path}>
+                  <button onClick={() => void openFile(file.path)} title={file.path}>
+                    <FileCode size={14} />
+                    <span className="workspace-review-path">{file.path}</span>
+                    <span className={`workspace-review-status ${file.status}`}>
+                      {file.status === 'added'
+                        ? '新增'
+                        : file.status === 'deleted'
+                          ? '删除'
+                          : '修改'}
+                    </span>
+                    <small>{file.source === 'agent' ? 'Agent' : '工作区'}</small>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="workspace-review-empty">暂无文件变更</div>
+          )}
+        </div>
+      )}
+    </aside>
   );
 }
 
