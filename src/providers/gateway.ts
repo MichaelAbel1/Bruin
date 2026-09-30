@@ -268,7 +268,8 @@ export class AiSdkGateway implements ModelGateway {
                 shell: toolSchemas.shell,
               },
       abortSignal: signal,
-      maxRetries: 2,
+      // AgentRunner owns retries, notices and cancellation. Avoid multiplying attempts.
+      maxRetries: 0,
     });
     let text = '';
     let hidden = false;

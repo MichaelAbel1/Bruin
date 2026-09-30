@@ -45,6 +45,146 @@ function fixture() {
   };
 }
 
+test('paused subagent is reported as incomplete and its error survives host recreation', async () => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('unused');
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async (child) => {
+    f.store.append(child.id, 'assistant', { text: 'unfinished research', calls: [] });
+    f.store.append(child.id, 'turn_paused', { reason: 'step_limit' });
+  });
+  let restored: RuntimeServices | undefined;
+  try {
+    const result = await services.execute(
+      { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+      f.session,
+      new AbortController().signal,
+    );
+    const id = result.output.split(': ')[1];
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const service of [
+      services,
+      (restored = new RuntimeServices(f.store, executor, async () => {})),
+    ]) {
+      const status = JSON.parse(
+        (
+          await service.execute(
+            { id: 'status', name: 'subagent_status', input: { id } },
+            f.session,
+            new AbortController().signal,
+          )
+        ).output,
+      );
+      assert.equal(status.status, 'failed');
+      assert.match(status.error, /任务尚未完成/);
+      assert.equal(status.answer, 'unfinished research');
+    }
+    assert.equal(
+      f.store.events(f.session.id).find((event) => event.type === 'subagent_finished')?.payload
+        .status,
+      'failed',
+    );
+  } finally {
+    await restored?.close();
+    await services.close();
+    f.close();
+  }
+});
+
+test('cancelled runtime operations do not save memory or spawn a child', async () => {
+  const f = fixture();
+  let spawned = false;
+  const services = new RuntimeServices(
+    f.store,
+    {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    },
+    async () => {
+      spawned = true;
+    },
+  );
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(
+      services.execute(
+        {
+          id: 'memory',
+          name: 'save_memory',
+          input: { key: 'note', content: 'should not be saved' },
+        },
+        f.session,
+        controller.signal,
+      ),
+      /已取消/,
+    );
+    await assert.rejects(
+      services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+        f.session,
+        controller.signal,
+      ),
+      /已取消/,
+    );
+    assert.deepEqual(f.store.listMemory(f.session.workspace), []);
+    assert.equal(spawned, false);
+    assert.equal(
+      f.store.events(f.session.id).some((event) => event.type === 'subagent_started'),
+      false,
+    );
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
+
+test('a final reply with unfinished approved plan steps reports the outstanding work', async () => {
+  const f = fixture();
+  const notices: string[] = [];
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        return { text: 'Please clarify the expected output.', calls: [] };
+      },
+    },
+    {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice(message) {
+        notices.push(message);
+      },
+      async approve() {
+        return false;
+      },
+    },
+  );
+  try {
+    setPlanMode(f.store, f.session.id, true);
+    f.store.append(f.session.id, 'plan_updated', { steps: ['Inspect', 'Verify'] });
+    approvePlan(f.store, f.session.id);
+    setPlanProgress(f.store, f.session.id, 0, 'completed');
+    await runner.run(f.session, 'continue');
+    assert.ok(notices.some((message) => message.includes('1 个步骤未标记完成')));
+    assert.equal(f.store.events(f.session.id).at(-1)?.type, 'turn_completed');
+    assert.equal(planState(f.store.events(f.session.id)).progress[1], undefined);
+  } finally {
+    f.close();
+  }
+});
+
 test('planning mode persists approval and blocks mutations before approval', async () => {
   const f = fixture();
   const calls: ToolCall[][] = [

@@ -63,9 +63,11 @@ export class RuntimeServices {
   }
 
   async runHooks(event: HookConfig['event'], session: Session, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) throw new Error('已取消');
     if (session.managedWorkspace && !fs.existsSync(session.workspace)) return;
     if (!fs.existsSync(session.workspace)) throw new Error('工作区目录不存在');
     for (const hook of loadConfig().hooks.filter((item) => item.enabled && item.event === event)) {
+      if (signal.aborted) throw new Error('已取消');
       const result = await this.executor.execute(
         {
           requestId: randomUUID(),
@@ -90,6 +92,7 @@ export class RuntimeServices {
   }
 
   async execute(call: ToolCall, session: Session, signal: AbortSignal): Promise<ToolResult> {
+    if (signal.aborted) throw new Error('已取消');
     const input = call.input;
     switch (call.name) {
       case 'list_memory':
@@ -358,6 +361,11 @@ export class RuntimeServices {
         this.store.append(session.id, 'subagent_started', { childId: child.id, prompt, workspace });
         const running = this.runSubagent(child, prompt, controller.signal)
           .then(() => {
+            const terminal = [...this.store.events(child.id)]
+              .reverse()
+              .find((event) => ['turn_paused', 'turn_completed'].includes(event.type));
+            if (terminal?.type === 'turn_paused')
+              throw new Error('子 Agent 已达到运行预算并暂停，任务尚未完成；请检查子会话后继续');
             const task = this.subagents.get(child.id);
             if (task) task.status = 'completed';
             this.store.append(session.id, 'subagent_finished', {
@@ -404,7 +412,7 @@ export class RuntimeServices {
             id,
             status: state,
             answer: String(lastAnswer?.payload.text ?? '').slice(0, 20_000),
-            error: child?.error,
+            error: child?.error ?? ended?.payload.error,
           }),
           isError: false,
         };

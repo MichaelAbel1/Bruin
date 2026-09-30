@@ -92,6 +92,42 @@ function historyLine(event: SessionEvent): string {
   return '';
 }
 
+function repeatedFailedTools(events: SessionEvent[]): string[] {
+  const boundary =
+    [...events].reverse().find((event) => event.type === 'user' || event.type === 'turn_completed')
+      ?.seq ?? 0;
+  const requests = new Map<string, SessionEvent[]>();
+  const failures = new Map<string, { name: string; count: number }>();
+  for (const event of events.filter((item) => item.seq > boundary).slice(-200)) {
+    const id = String(event.payload.callId);
+    if (event.type === 'tool_requested') {
+      const queue = requests.get(id) ?? [];
+      queue.push(event);
+      requests.set(id, queue);
+    } else if (['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type)) {
+      const request = requests.get(id)?.shift();
+      if (!request || event.type === 'tool_unknown') continue;
+      const name = String(request.payload.name);
+      // Polling can legitimately repeat while a child or background process runs.
+      if (
+        ['background_status', 'subagent_status'].includes(name) ||
+        !Object.hasOwn(toolSchemas, name)
+      )
+        continue;
+      const key = JSON.stringify([name, request.payload.input], (_key, value: unknown) =>
+        value && typeof value === 'object' && !Array.isArray(value)
+          ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
+          : value,
+      );
+      if (event.type === 'tool_finished' && !event.payload.isError) failures.delete(key);
+      else failures.set(key, { name, count: (failures.get(key)?.count ?? 0) + 1 });
+    }
+  }
+  return [
+    ...new Set([...failures.values()].filter((item) => item.count >= 3).map((item) => item.name)),
+  ];
+}
+
 function stepLimitReport(
   events: SessionEvent[],
   maxSteps: number,
@@ -323,6 +359,7 @@ export class AgentRunner {
     )
       await this.services.runHooks('turn_started', session, signal);
     const deadline = options.maxDurationMs ? Date.now() + options.maxDurationMs : undefined;
+    const warnedTools = new Set<string>();
     const pause = (reason: 'step_limit' | 'time_limit') => {
       const report = stepLimitReport(this.store.events(session.id), maxSteps, reason);
       this.store.append(session.id, 'assistant', { text: report.text, calls: [] });
@@ -342,6 +379,15 @@ export class AgentRunner {
         return;
       }
       const events = this.store.events(session.id);
+      const repeated = repeatedFailedTools(events);
+      for (const name of repeated)
+        if (!warnedTools.has(name)) {
+          warnedTools.add(name);
+          this.io.notice(`工具 ${name} 的相同请求已多次失败或被拒绝，正在提示模型调整方法。`);
+        }
+      const failureInstruction = repeated.length
+        ? `\nRepeated tool failures detected for: ${repeated.join(', ')}. Inspect the recorded errors and change the approach or arguments before retrying. Do not repeat an unchanged denied request. If approval or missing information is required, explain the blocker to the user. Never claim these operations succeeded.`
+        : '';
       const latestPause = [...events].reverse().find((event) => event.type === 'turn_paused');
       const latestCompletion = [...events]
         .reverse()
@@ -407,7 +453,8 @@ export class AgentRunner {
         mcpInstruction +
         taskInstruction +
         memoryInstruction +
-        preferenceInstruction;
+        preferenceInstruction +
+        failureInstruction;
       const contextWindow = Math.min(session.profile.contextWindowTokens ?? 32_768, 1_048_576);
       const inputBudget = Math.floor(contextWindow * 0.75);
       let promptEvents = events;
@@ -520,7 +567,7 @@ export class AgentRunner {
             continue;
           }
           const isTransient =
-            (status !== undefined && [429, 500, 502, 503, 529].includes(status)) ||
+            (status !== undefined && [408, 429, 500, 502, 503, 504, 529].includes(status)) ||
             (code !== undefined &&
               ['ECONNRESET', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED'].includes(
                 code,
@@ -569,7 +616,29 @@ export class AgentRunner {
         protocol: modelProtocol(session.profile),
         providerMessages: reply!.providerMessages,
       });
+      const checkCancelledCalls = (index: number) => {
+        if (!signal.aborted) return;
+        for (const pending of reply!.calls.slice(index))
+          this.store.append(session.id, 'tool_denied', {
+            callId: pending.id,
+            name: pending.name,
+            output: '运行已取消，此工具尚未开始执行',
+          });
+        throw new Error('已取消');
+      };
+      checkCancelledCalls(0);
       if (!reply!.calls.length) {
+        const currentPlan = planState(this.store.events(session.id));
+        const remaining =
+          currentPlan.enabled && currentPlan.approved
+            ? currentPlan.steps.filter(
+                (_step, index) => currentPlan.progress[index] !== 'completed',
+              ).length
+            : 0;
+        if (remaining)
+          this.io.notice(
+            `本轮对话已结束，但批准的计划仍有 ${remaining} 个步骤未标记完成；请检查进度与验证结果。`,
+          );
         this.store.append(session.id, 'turn_completed', {});
         if (
           this.services &&
@@ -579,13 +648,14 @@ export class AgentRunner {
           await this.services.runHooks('turn_finished', session, signal);
         return;
       }
-      for (const call of reply!.calls) {
+      for (const [index, call] of reply!.calls.entries()) {
+        checkCancelledCalls(index);
         this.store.append(session.id, 'tool_requested', {
           callId: call.id,
           name: call.name,
           input: call.input,
         });
-        const schema = toolSchemas[call.name];
+        const schema = Object.hasOwn(toolSchemas, call.name) ? toolSchemas[call.name] : undefined;
         const parsed = schema?.inputSchema.safeParse(call.input);
         if (!parsed?.success) {
           const detail = parsed?.error
@@ -615,6 +685,7 @@ export class AgentRunner {
                 );
         const approval =
           policy.decision === 'ask' ? await this.io.approve(call, policy.reason) : true;
+        checkCancelledCalls(index);
         if (policy.decision === 'deny' || approval !== true) {
           const reason =
             policy.decision === 'deny'
@@ -651,6 +722,7 @@ export class AgentRunner {
               planState(this.store.events(session.id)).approved)
           )
             await this.services.runHooks('before_tool', session, signal);
+          if (signal.aborted) throw new Error('已取消');
           if (call.name === 'load_skill') {
             const skillName = String(call.input.name ?? '');
             const previous = this.store

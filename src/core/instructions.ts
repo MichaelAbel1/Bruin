@@ -4,8 +4,13 @@ import { dataDir } from '../config.js';
 
 function readInstruction(file: string): string {
   try {
-    if (fs.lstatSync(file).isSymbolicLink()) throw new Error(`指令文件不允许符号链接: ${file}`);
-    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink()) throw new Error(`指令文件不允许符号链接: ${file}`);
+    if (!stat.isFile()) throw new Error(`指令文件不是普通文件: ${file}`);
+    const fd = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
     try {
       const size = fs.fstatSync(fd);
       if (!size.isFile() || size.size > 32_000)

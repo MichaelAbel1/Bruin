@@ -4,6 +4,36 @@ import http from 'node:http';
 import { AiSdkGateway, modelProtocol, resolveApiKey } from '../providers/gateway.js';
 import { setRuntimeApiKey } from '../config.js';
 
+test('gateway leaves transient HTTP retries to AgentRunner', async () => {
+  let requests = 0;
+  const server = http.createServer((_req, res) => {
+    requests++;
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'temporary overload' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('no address');
+    await assert.rejects(
+      new AiSdkGateway().complete(
+        {
+          alias: 'retry-test',
+          provider: 'openai-compatible',
+          model: 'mock',
+          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        },
+        [{ role: 'user', content: 'hello' }],
+        new AbortController().signal,
+        () => {},
+      ),
+    );
+    assert.equal(requests, 1);
+  } finally {
+    server.close();
+  }
+});
+
 test('custom OpenAI base URL uses chat completions', async () => {
   let requestPath = '';
   const server = http.createServer((req, res) => {
