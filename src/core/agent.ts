@@ -689,7 +689,7 @@ export class AgentRunner {
         }
         call.input = parsed.data as Record<string, unknown>;
         const policy =
-          this.readOnly && !['read_file', 'search', 'load_skill'].includes(call.name)
+          this.readOnly && !['read_file', 'list_files', 'search', 'load_skill'].includes(call.name)
             ? { decision: 'deny' as const, reason: '子 Agent 只能使用只读工具' }
             : planBlocks(call, planState(this.store.events(session.id)))
               ? { decision: 'deny' as const, reason: '规划模式等待用户批准计划' }
@@ -763,7 +763,9 @@ export class AgentRunner {
               }
             }
           } else if (
-            !['read_file', 'write_file', 'edit_file', 'search', 'shell'].includes(call.name)
+            !['read_file', 'list_files', 'write_file', 'edit_file', 'search', 'shell'].includes(
+              call.name,
+            )
           ) {
             result = this.services
               ? await this.services.execute(call, session, signal)
@@ -772,11 +774,10 @@ export class AgentRunner {
             if (!fs.existsSync(session.workspace)) {
               result = session.managedWorkspace
                 ? {
-                    output:
-                      call.name === 'search'
-                        ? '默认工作区尚未创建，没有可搜索的文件'
-                        : '默认工作区尚未创建，请先创建文件',
-                    isError: call.name !== 'search',
+                    output: ['search', 'list_files'].includes(call.name)
+                      ? '默认工作区尚未创建，没有可浏览或搜索的文件'
+                      : '默认工作区尚未创建，请先创建文件',
+                    isError: !['search', 'list_files'].includes(call.name),
                   }
                 : {
                     output: '工作区目录不存在',

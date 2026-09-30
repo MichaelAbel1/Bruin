@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { ProcessExecutor } from '../executor/client.js';
 import { readWorkspaceFile, writeWorkspaceFile } from '../core/workspace-files.js';
 
@@ -83,6 +84,70 @@ test('desktop text previews reject invalid UTF-8 and omit partial boundary chara
     assert.equal(preview.content, 'x'.repeat(255_999));
     fs.writeFileSync(target, Buffer.from([0x61, 0xff]));
     assert.throws(() => readWorkspaceFile(dir, 'sample.txt'), /有效的 UTF-8/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('file tools continue after short reads rather than returning an incomplete file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-short-read-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'sample.txt'), '甲🙂乙');
+    const worker = new URL('../executor/worker.js', import.meta.url).href;
+    const script = `
+      import fs from 'node:fs';
+      import assert from 'node:assert/strict';
+      await import(${JSON.stringify(worker)});
+      const read = fs.readSync;
+      fs.readSync = (fd, buffer, offset, length, position) => read(fd, buffer, offset, Math.min(2, length), position);
+      process.connected = true;
+      let replied = false;
+      process.on('beforeExit', () => assert.equal(replied, true));
+      process.send = ({ result }) => {
+        replied = true;
+        assert.equal(result.isError, false);
+        assert.equal(result.output, '甲🙂乙');
+        assert.equal(result.truncated, false);
+      };
+      process.emit('message', { requestId: 'short-read', name: 'read_file', input: { path: 'sample.txt' }, workspace: ${JSON.stringify(dir)}, timeoutMs: 5000, maxOutputBytes: 100 });
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 5000 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('edit_file enforces the actual read limit when a file grows after stat', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-growing-edit-'));
+  const file = path.join(dir, 'growing.txt');
+  try {
+    fs.writeFileSync(file, 'old');
+    const worker = new URL('../executor/worker.js', import.meta.url).href;
+    const script = `
+      import fs from 'node:fs';
+      import assert from 'node:assert/strict';
+      await import(${JSON.stringify(worker)});
+      const file = ${JSON.stringify(file)};
+      const read = fs.readSync;
+      let grown = false;
+      fs.readSync = (...args) => {
+        if (!grown) { grown = true; fs.writeFileSync(file, 'old' + 'x'.repeat(5_000_000)); }
+        return read(...args);
+      };
+      process.connected = true;
+      let replied = false;
+      process.on('beforeExit', () => assert.equal(replied, true));
+      process.send = ({ result }) => {
+        replied = true;
+        assert.equal(grown, true);
+        assert.equal(result.isError, true);
+        assert.match(result.output, /文件过大/);
+        assert.equal(fs.statSync(file).size, 5_000_003);
+        assert.equal(fs.readFileSync(file, 'utf8').startsWith('old'), true);
+      };
+      process.emit('message', { requestId: 'grow', name: 'edit_file', input: { path: 'growing.txt', oldText: 'old', newText: 'new' }, workspace: ${JSON.stringify(dir)}, timeoutMs: 5000, maxOutputBytes: 100 });
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 5000 });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

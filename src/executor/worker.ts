@@ -5,6 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
+import { listWorkspaceEntries } from '../core/workspace-files.js';
 
 let macSandboxAvailable: boolean | undefined;
 function isMacSandboxAvailable(): boolean {
@@ -73,6 +74,22 @@ function checkedPath(workspace: string, input: unknown, creating = false): strin
   if (!creating && !fs.existsSync(target)) throw new Error('文件不存在');
   return target;
 }
+function readBytes(fd: number, max: number): Buffer {
+  let buffer = Buffer.alloc(Math.min(max + 1, Math.max(64_000, fs.fstatSync(fd).size + 1)));
+  let count = 0;
+  while (true) {
+    if (count === buffer.length) {
+      if (count === max + 1) break;
+      const grown = Buffer.alloc(Math.min(max + 1, buffer.length * 2));
+      buffer.copy(grown, 0, 0, count);
+      buffer = grown;
+    }
+    const read = fs.readSync(fd, buffer, count, buffer.length - count, count);
+    if (!read) break;
+    count += read;
+  }
+  return buffer.subarray(0, count);
+}
 function readBounded(file: string, max: number): ToolResult {
   const fd = fs.openSync(
     file,
@@ -80,15 +97,14 @@ function readBounded(file: string, max: number): ToolResult {
   );
   try {
     if (!fs.fstatSync(fd).isFile()) throw new Error('只能读取普通文件');
-    const buffer = Buffer.alloc(Math.max(1, max + 1));
-    const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
-    const truncated = count > max;
+    const buffer = readBytes(fd, max);
+    const truncated = buffer.length > max;
     let text: string;
     try {
       // A bounded preview may end inside a valid UTF-8 character. Keep it pending,
       // rather than sending a replacement character as if it belonged to the file.
       text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
-        buffer.subarray(0, Math.min(count, max)),
+        buffer.subarray(0, max),
         { stream: truncated },
       );
     } catch (error) {
@@ -102,6 +118,110 @@ function readBounded(file: string, max: number): ToolResult {
     };
   } finally {
     fs.closeSync(fd);
+  }
+}
+function integerOption(value: unknown, fallback: number, min: number, max: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max)
+    throw new Error(`分页参数必须是 ${min} 到 ${max} 之间的整数`);
+  return value;
+}
+function readFilePage(file: string, req: ToolRequest): ToolResult {
+  const start = integerOption(req.input.startLine, 1, 1, 1_000_000);
+  const lines = integerOption(req.input.lineCount, 200, 1, 10_000);
+  const end = start + lines - 1;
+  const fd = fs.openSync(
+    file,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+  );
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('只能读取普通文件');
+    const buffer = Buffer.alloc(64_000);
+    const chunks: Buffer[] = [];
+    const deadline = Date.now() + req.timeoutMs;
+    let position = 0;
+    let line = 1;
+    let last = 0;
+    let size = 0;
+    let more = false;
+    let byteTruncated = false;
+    reading: while (true) {
+      if (Date.now() >= deadline) throw new Error('文件分页读取超时，请缩小起始行或范围');
+      const count = fs.readSync(fd, buffer, 0, buffer.length, position);
+      if (!count) break;
+      position += count;
+      let offset = 0;
+      while (offset < count) {
+        const newline = buffer.subarray(0, count).indexOf(10, offset);
+        const next = newline < 0 ? count : newline + 1;
+        if (line > end) {
+          more = true;
+          break reading;
+        }
+        if (line >= start) {
+          const remaining = Math.max(0, req.maxOutputBytes - size);
+          const length = Math.min(next - offset, remaining);
+          if (length) {
+            chunks.push(Buffer.from(buffer.subarray(offset, offset + length)));
+            size += length;
+            last = line;
+          }
+          if (length < next - offset) {
+            byteTruncated = true;
+            break reading;
+          }
+        }
+        if (newline >= 0) line++;
+        offset = next;
+      }
+    }
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+        Buffer.concat(chunks),
+        { stream: byteTruncated },
+      );
+    } catch (error) {
+      if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
+      throw error;
+    }
+    const status = byteTruncated
+      ? `输出已截断，第 ${line} 行未完整输出`
+      : more
+        ? `后续内容请使用 startLine=${end + 1}`
+        : '已到文件末尾';
+    return {
+      output: last
+        ? `${text}\n[行范围：${start}-${last}；${status}]`
+        : `[起始行 ${start} 超出文件范围或文件为空]`,
+      isError: false,
+      truncated: byteTruncated || more,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+function listFiles(req: ToolRequest): ToolResult {
+  const relative = req.input.path === undefined ? '.' : req.input.path;
+  if (typeof relative !== 'string' || !relative) throw new Error('无效目录路径');
+  const offset = integerOption(req.input.offset, 0, 0, 1_000_000);
+  const limit = integerOption(req.input.limit, 100, 1, 300);
+  const found = listWorkspaceEntries(req.workspace, relative, offset, limit + 1);
+  const entries = found.slice(0, limit);
+  let more = found.length > limit;
+  while (true) {
+    const output = JSON.stringify({
+      path: relative,
+      entries,
+      hasMore: more,
+      nextOffset: more ? offset + entries.length : null,
+    });
+    if (Buffer.byteLength(output) <= req.maxOutputBytes)
+      return { output, isError: false, truncated: more };
+    if (!entries.length) throw new Error('输出预算过小，无法显示目录条目');
+    entries.pop();
+    more = true;
+    if (!entries.length) throw new Error('输出预算过小，无法显示目录条目');
   }
 }
 function replaceFile(
@@ -458,8 +578,12 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
     case 'read_file': {
       const file = checkedPath(req.workspace, req.input.path);
       if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
+      if (req.input.startLine !== undefined || req.input.lineCount !== undefined)
+        return readFilePage(file, req);
       return readBounded(file, req.maxOutputBytes);
     }
+    case 'list_files':
+      return listFiles(req);
     case 'write_file': {
       const file = checkedPath(req.workspace, req.input.path, true);
       if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
@@ -509,11 +633,11 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         const stat = fs.fstatSync(fd);
         if (!stat.isFile()) throw new Error('只能编辑普通文件');
         if (stat.size > 5_000_000) throw new Error('文件过大，无法使用 edit_file 编辑');
+        const buffer = readBytes(fd, 5_000_000);
+        if (buffer.length > 5_000_000) throw new Error('文件过大，无法使用 edit_file 编辑');
         let source: string;
         try {
-          source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
-            fs.readFileSync(fd),
-          );
+          source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer);
         } catch (error) {
           if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
           throw error;

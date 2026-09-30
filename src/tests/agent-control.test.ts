@@ -7,6 +7,7 @@ import { AgentRunner } from '../core/agent.js';
 import { SqliteEventStore } from '../storage/event-store.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolCall, ToolResult } from '../core/types.js';
+import { ProcessExecutor } from '../executor/client.js';
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-control-'));
@@ -30,6 +31,81 @@ function fixture() {
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+for (const mode of ['planning', 'read-only'] as const) {
+  test(`${mode} agents route directory discovery and paged reads to the executor without approval`, async () => {
+    const f = fixture();
+    const executor = new ProcessExecutor();
+    fs.writeFileSync(path.join(f.dir, 'source.txt'), 'first\nTARGET\n');
+    if (mode === 'planning') f.store.append(f.session.id, 'plan_mode', { enabled: true });
+    let calls = 0;
+    const gateway: ModelGateway = {
+      async complete() {
+        calls++;
+        return calls === 1
+          ? {
+              text: '',
+              calls: [
+                { id: 'list', name: 'list_files', input: {} },
+                {
+                  id: 'read',
+                  name: 'read_file',
+                  input: { path: 'source.txt', startLine: 2, lineCount: 1 },
+                },
+                {
+                  id: 'write',
+                  name: 'write_file',
+                  input: { path: 'forbidden.txt', content: 'no' },
+                },
+              ],
+            }
+          : { text: 'Inspected the repository.', calls: [] };
+      },
+    };
+    const runner = new AgentRunner(
+      f.store,
+      gateway,
+      executor,
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          throw new Error('read-only exploration must not prompt for approval');
+        },
+      },
+      undefined,
+      mode === 'read-only',
+    );
+    try {
+      await runner.run(f.session, 'inspect the repository', new AbortController().signal);
+      const results = f.store
+        .events(f.session.id)
+        .filter((event) => event.type === 'tool_finished');
+      assert.equal(results.length, 2);
+      assert.equal(
+        results.every((event) => event.payload.isError === false),
+        true,
+      );
+      assert.equal(
+        JSON.parse(String(results[0].payload.output)).entries.some(
+          (entry: { name: string }) => entry.name === 'source.txt',
+        ),
+        true,
+      );
+      assert.match(String(results[1].payload.output), /^TARGET\n/);
+      assert.equal(
+        f.store
+          .events(f.session.id)
+          .some((event) => event.type === 'tool_denied' && event.payload.callId === 'write'),
+        true,
+      );
+      assert.equal(fs.existsSync(path.join(f.dir, 'forbidden.txt')), false);
+    } finally {
+      await executor.close();
+      f.close();
+    }
+  });
 }
 
 for (const cancelAt of ['model', 'approval', 'between-tools'] as const) {

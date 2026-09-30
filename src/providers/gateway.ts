@@ -29,8 +29,22 @@ export interface ModelGateway {
 }
 export const toolSchemas = {
   read_file: {
-    description: 'Read a UTF-8 file inside the workspace',
-    inputSchema: z.object({ path: z.string() }),
+    description:
+      'Read a UTF-8 workspace file. Optional startLine (1-based) and lineCount select a page; with either option, lineCount defaults to 200. Output is still byte-limited.',
+    inputSchema: z.object({
+      path: z.string(),
+      startLine: z.number().int().min(1).max(1_000_000).optional(),
+      lineCount: z.number().int().min(1).max(10_000).optional(),
+    }),
+  },
+  list_files: {
+    description:
+      'List one workspace directory, sorted with directories first. Skips symlinks and special files. Use path for subdirectories and nextOffset to page through entries; does not apply gitignore.',
+    inputSchema: z.object({
+      path: z.string().min(1).optional(),
+      offset: z.number().int().min(0).max(1_000_000).optional(),
+      limit: z.number().int().min(1).max(300).optional(),
+    }),
   },
   write_file: {
     description: 'Create or replace a UTF-8 file inside the workspace',
@@ -256,11 +270,13 @@ export class AiSdkGateway implements ModelGateway {
           : this.mode === 'read-only'
             ? {
                 read_file: toolSchemas.read_file,
+                list_files: toolSchemas.list_files,
                 search: toolSchemas.search,
                 load_skill: toolSchemas.load_skill,
               }
             : {
                 read_file: toolSchemas.read_file,
+                list_files: toolSchemas.list_files,
                 write_file: toolSchemas.write_file,
                 edit_file: toolSchemas.edit_file,
                 search: toolSchemas.search,

@@ -1,6 +1,7 @@
 export type ProviderKind = 'openai' | 'anthropic' | 'google' | 'openai-compatible';
 export type ToolName =
   | 'read_file'
+  | 'list_files'
   | 'write_file'
   | 'edit_file'
   | 'search'

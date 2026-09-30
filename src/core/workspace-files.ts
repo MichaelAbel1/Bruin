@@ -33,7 +33,12 @@ export interface WorkspaceEntry {
   path: string;
   kind: 'file' | 'directory';
 }
-export function listWorkspaceEntries(workspace: string, relative = ''): WorkspaceEntry[] {
+export function listWorkspaceEntries(
+  workspace: string,
+  relative = '',
+  offset = 0,
+  limit = 300,
+): WorkspaceEntry[] {
   const target = checkedWorkspacePath(workspace, relative);
   if (!fs.statSync(target).isDirectory()) throw new Error('只能展开文件夹');
   const entries = fs.readdirSync(target, { withFileTypes: true });
@@ -42,7 +47,7 @@ export function listWorkspaceEntries(workspace: string, relative = ''): Workspac
     .sort(
       (a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name),
     )
-    .slice(0, 300)
+    .slice(offset, offset + limit)
     .map((entry) => ({
       name: entry.name,
       path: path.join(relative, entry.name),

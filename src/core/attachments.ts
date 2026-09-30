@@ -28,8 +28,17 @@ function xmlText(value: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .slice(0, 60_000);
+    .replace(/&#39;/g, "'");
+}
+function extractedText(text: string, note?: string): { text: string; note?: string } {
+  if (text.length <= 60_000) return { text, ...(note ? { note } : {}) };
+  let end = 60_000;
+  // Do not split a UTF-16 surrogate pair at the extraction boundary.
+  if (/^[\uDC00-\uDFFF]$/.test(text[end]) && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+  return {
+    text: text.slice(0, end),
+    note: [note, '文本超过提取上限，已截断；模型无法读取未提取部分'].filter(Boolean).join('；'),
+  };
 }
 function zipEntry(file: string, entry: string): string {
   return execFileSync('unzip', ['-p', file, entry], {
@@ -41,7 +50,7 @@ function zipEntry(file: string, entry: string): string {
 function extractText(file: string, name: string): { text: string; note?: string } {
   const ext = path.extname(name).toLowerCase();
   try {
-    if (ext === '.docx') return { text: xmlText(zipEntry(file, 'word/document.xml')) };
+    if (ext === '.docx') return extractedText(xmlText(zipEntry(file, 'word/document.xml')));
     if (ext === '.xlsx') {
       let shared = '';
       try {
@@ -61,18 +70,18 @@ function extractText(file: string, name: string): { text: string; note?: string 
           })
           .join('\t'),
       );
-      return { text: rows.join('\n').slice(0, 60_000), note: '仅提取第一个工作表' };
+      return extractedText(rows.join('\n'), '仅提取第一个工作表');
     }
     if (ext === '.pdf')
-      return {
-        text: execFileSync('pdftotext', ['-layout', file, '-'], {
+      return extractedText(
+        execFileSync('pdftotext', ['-layout', file, '-'], {
           encoding: 'utf8',
           maxBuffer: 1_000_000,
           timeout: 5000,
-        }).slice(0, 60_000),
-      };
+        }),
+      );
     const bytes = fs.readFileSync(file);
-    return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes).slice(0, 60_000) };
+    return extractedText(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } catch {
     return { text: '', note: '无法提取文本；该文件已保存在本机，但模型尚不能读取其内容' };
   }
@@ -126,6 +135,7 @@ export function importAttachments(sessionId: string, selected: string[]): Attach
   const root = attachmentDir(sessionId);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const created: string[] = [];
+  let copiedBytes = 0;
   try {
     return files.map((file) => {
       const id = randomUUID();
@@ -137,13 +147,19 @@ export function importAttachments(sessionId: string, selected: string[]): Attach
           ? 'document'
           : 'file';
       const target = path.join(root, id);
-      const source = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const source = fs.openSync(
+        file,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      );
       try {
         const stat = fs.fstatSync(source);
         if (!stat.isFile() || stat.size > maxFileBytes)
           throw new Error(`附件不是普通文件或超过 5 MB: ${name}`);
+        const bytes = readAttachmentBytes(source, name);
+        copiedBytes += bytes.length;
+        if (copiedBytes > maxSelectionBytes) throw new Error('一次上传总量不能超过 20 MB');
         created.push(target);
-        fs.writeFileSync(target, readAttachmentBytes(source, name), { mode: 0o600, flag: 'wx' });
+        fs.writeFileSync(target, bytes, { mode: 0o600, flag: 'wx' });
       } finally {
         fs.closeSync(source);
       }
@@ -196,7 +212,10 @@ export function loadAttachment(
   };
   let image: { data: Buffer; mimeType: string } | undefined;
   if (metadata.kind === 'image' && includeImage) {
-    const fd = fs.openSync(path.join(root, id), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const fd = fs.openSync(
+      path.join(root, id),
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
     try {
       if (!fs.fstatSync(fd).isFile()) throw new Error('附件不是普通文件');
       image = { data: readAttachmentBytes(fd, metadata.name), mimeType: metadata.mimeType };

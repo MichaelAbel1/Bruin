@@ -32,6 +32,7 @@ export function planBlocks(call: ToolCall, state: PlanState): boolean {
     !state.approved &&
     ![
       'read_file',
+      'list_files',
       'search',
       'load_skill',
       'update_plan',

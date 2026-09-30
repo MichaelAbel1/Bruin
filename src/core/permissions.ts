@@ -12,6 +12,7 @@ export function decisionFor(
   if (
     ![
       'read_file',
+      'list_files',
       'write_file',
       'edit_file',
       'search',
@@ -86,13 +87,16 @@ export function decisionFor(
   if (call.name === 'search') return { decision: 'allow', reason: '只读工作区搜索' };
   try {
     const root = managedPending ? path.resolve(workspace) : fs.realpathSync(workspace);
-    if (typeof call.input.path !== 'string' || !call.input.path) throw new Error('无效路径');
-    const p = call.input.path;
+    const p = call.name === 'list_files' && call.input.path === undefined ? '.' : call.input.path;
+    if (typeof p !== 'string' || !p) throw new Error('无效路径');
     const target = path.resolve(root, p);
-    if (target === root || !target.startsWith(root + path.sep))
+    if (
+      (target === root && call.name !== 'list_files') ||
+      (target !== root && !target.startsWith(root + path.sep))
+    )
       return { decision: 'deny', reason: '路径超出工作区' };
     let current = root;
-    for (const segment of path.relative(root, target).split(path.sep)) {
+    for (const segment of path.relative(root, target).split(path.sep).filter(Boolean)) {
       current = path.join(current, segment);
       try {
         if (fs.lstatSync(current).isSymbolicLink())
@@ -100,6 +104,11 @@ export function decisionFor(
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
+    }
+    if (call.name === 'list_files') {
+      if (managedPending && target === root) return { decision: 'allow', reason: '只读目录浏览' };
+      if (!fs.statSync(target).isDirectory()) throw new Error('只能浏览目录');
+      return { decision: 'allow', reason: '只读目录浏览' };
     }
     if (call.name === 'write_file') {
       if (managedPending && path.dirname(target) === root)
