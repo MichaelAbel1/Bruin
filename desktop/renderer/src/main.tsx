@@ -387,9 +387,10 @@ function FileEditorViewer({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
       e.preventDefault();
-      if (isDirty) onSave();
+      if (isDirty && !file.truncated) onSave();
       return;
     }
+    if (file.truncated) return;
     if (e.key === 'Tab') {
       e.preventDefault();
       const ta = e.currentTarget;
@@ -470,7 +471,7 @@ function FileEditorViewer({
           )}
           <button
             className={`file-action-btn save ${isDirty ? 'primary' : ''}`}
-            disabled={!isDirty || saving}
+            disabled={!isDirty || saving || file.truncated}
             onClick={onSave}
             title="保存文件 (⌘S / Ctrl+S)"
           >
@@ -480,7 +481,9 @@ function FileEditorViewer({
         </div>
       </div>
       {file.truncated && (
-        <div className="file-warning-banner">文件过大，仅显示前 256 KB 内容。</div>
+        <div className="file-warning-banner">
+          文件过大，仅显示前 256 KB 内容；预览只读，请使用外部编辑器修改。
+        </div>
       )}
       {mode === 'edit' ? (
         <div className="code-editor-layout">
@@ -512,6 +515,7 @@ function FileEditorViewer({
               ref={textareaRef}
               className="code-editor-textarea"
               value={file.content}
+              readOnly={file.truncated}
               onChange={(e) => onContentChange(e.target.value)}
               onKeyDown={handleKeyDown}
               onScroll={handleScroll}
@@ -665,6 +669,10 @@ function App() {
 
   async function saveFile(file: OpenFile) {
     if (!view || savingFile) return;
+    if (file.truncated) {
+      setNotice('截断预览不能覆盖保存，请使用外部编辑器修改完整文件。');
+      return;
+    }
     try {
       setSavingFile(true);
       await api('writeWorkspaceFile', {

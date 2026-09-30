@@ -15,7 +15,20 @@ function readInstruction(file: string): string {
       const size = fs.fstatSync(fd);
       if (!size.isFile() || size.size > 32_000)
         throw new Error(`指令文件过大或不是普通文件: ${file}`);
-      return fs.readFileSync(fd, 'utf8').trim();
+      const buffer = Buffer.alloc(32_001);
+      let count = 0;
+      while (count < buffer.length) {
+        const read = fs.readSync(fd, buffer, count, buffer.length - count, count);
+        if (!read) break;
+        count += read;
+      }
+      if (count > 32_000) throw new Error(`指令文件过大: ${file}`);
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, count)).trim();
+      } catch (error) {
+        if (error instanceof TypeError) throw new Error(`指令文件不是有效的 UTF-8 文本: ${file}`);
+        throw error;
+      }
     } finally {
       fs.closeSync(fd);
     }

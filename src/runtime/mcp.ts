@@ -85,7 +85,19 @@ function sandboxProfile(workspace: string, _executable: string): string {
 export class McpManager {
   private clients = new Map<string, { client: Client; signature: string }>();
   private connecting = new Map<string, Promise<Client>>();
+  private operations = new Map<string, Promise<unknown>>();
   private closing = false;
+
+  private async serialize<T>(name: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.operations.get(name);
+    const pending = (previous?.catch(() => {}) ?? Promise.resolve()).then(operation);
+    this.operations.set(name, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.operations.get(name) === pending) this.operations.delete(name);
+    }
+  }
 
   private async connect(server: McpServerConfig, workspace?: string): Promise<Client> {
     if (this.closing) throw new Error('MCP 管理器已关闭');
@@ -210,13 +222,18 @@ export class McpManager {
     server: McpServerConfig,
     workspace?: string,
   ): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
-    const client = await this.connect(server, workspace);
-    const result = await client.listTools(undefined, { timeout: 10_000, maxTotalTimeout: 10_000 });
-    return result.tools.map(({ name, description, inputSchema }) => ({
-      name,
-      description,
-      ...(inputSchema ? { inputSchema } : {}),
-    }));
+    return this.serialize(server.name, async () => {
+      const client = await this.connect(server, workspace);
+      const result = await client.listTools(undefined, {
+        timeout: 10_000,
+        maxTotalTimeout: 10_000,
+      });
+      return result.tools.map(({ name, description, inputSchema }) => ({
+        name,
+        description,
+        ...(inputSchema ? { inputSchema } : {}),
+      }));
+    });
   }
 
   async callTool(
@@ -225,29 +242,33 @@ export class McpManager {
     args: Record<string, unknown>,
     workspace?: string,
   ): Promise<{ output: string; isError: boolean; truncated?: boolean }> {
-    const client = await this.connect(server, workspace);
-    const available = await client.listTools(undefined, {
-      timeout: 10_000,
-      maxTotalTimeout: 10_000,
+    return this.serialize(server.name, async () => {
+      const client = await this.connect(server, workspace);
+      const available = await client.listTools(undefined, {
+        timeout: 10_000,
+        maxTotalTimeout: 10_000,
+      });
+      if (!available.tools.some((tool) => tool.name === name))
+        return { output: `MCP 工具不存在: ${name}`, isError: true };
+      const result = await client.callTool(
+        { name, arguments: args },
+        { timeout: 30_000, maxTotalTimeout: 30_000 },
+      );
+      const serialized = JSON.stringify(result);
+      const limit = 100_000;
+      return {
+        output: serialized.slice(0, limit),
+        isError: Boolean(result.isError),
+        truncated: serialized.length > limit,
+      };
     });
-    if (!available.tools.some((tool) => tool.name === name))
-      return { output: `MCP 工具不存在: ${name}`, isError: true };
-    const result = await client.callTool(
-      { name, arguments: args },
-      { timeout: 30_000, maxTotalTimeout: 30_000 },
-    );
-    const serialized = JSON.stringify(result);
-    const limit = 100_000;
-    return {
-      output: serialized.slice(0, limit),
-      isError: Boolean(result.isError),
-      truncated: serialized.length > limit,
-    };
   }
 
   async disconnect(name: string): Promise<void> {
-    await this.connecting.get(name)?.catch(() => {});
-    await this.disconnectConnected(name);
+    await this.serialize(name, async () => {
+      await this.connecting.get(name)?.catch(() => {});
+      await this.disconnectConnected(name);
+    });
   }
   private async disconnectConnected(name: string): Promise<void> {
     const existing = this.clients.get(name);
@@ -256,6 +277,7 @@ export class McpManager {
   }
   async close(): Promise<void> {
     this.closing = true;
+    await Promise.allSettled([...this.operations.values()]);
     await Promise.allSettled([...this.connecting.values()]);
     await Promise.allSettled([...this.clients.keys()].map((name) => this.disconnect(name)));
   }

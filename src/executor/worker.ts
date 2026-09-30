@@ -83,10 +83,20 @@ function readBounded(file: string, max: number): ToolResult {
     const buffer = Buffer.alloc(Math.max(1, max + 1));
     const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
     const truncated = count > max;
+    let text: string;
+    try {
+      // A bounded preview may end inside a valid UTF-8 character. Keep it pending,
+      // rather than sending a replacement character as if it belonged to the file.
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+        buffer.subarray(0, Math.min(count, max)),
+        { stream: truncated },
+      );
+    } catch (error) {
+      if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
+      throw error;
+    }
     return {
-      output:
-        buffer.subarray(0, Math.min(count, max)).toString('utf8') +
-        (truncated ? '\n[输出已截断]' : ''),
+      output: text + (truncated ? '\n[输出已截断]' : ''),
       isError: false,
       truncated,
     };
@@ -501,7 +511,9 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         if (stat.size > 5_000_000) throw new Error('文件过大，无法使用 edit_file 编辑');
         let source: string;
         try {
-          source = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(fd));
+          source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+            fs.readFileSync(fd),
+          );
         } catch (error) {
           if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
           throw error;

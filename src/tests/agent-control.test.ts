@@ -315,3 +315,41 @@ test('prototype property tool names are denied as unknown without reaching appro
     f.close();
   }
 });
+
+test('compaction keeps a reminder to restore loaded skill snapshots', async () => {
+  const f = fixture();
+  f.store.append(f.session.id, 'user', { text: 'debug the application' });
+  f.store.append(f.session.id, 'skill_loaded', { name: 'debug', content: 'Saved debug workflow.' });
+  f.store.append(f.session.id, 'summary', {
+    throughSeq: 2,
+    text: 'Investigating a bug; workflow details omitted.',
+  });
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete(_profile, messages) {
+        assert.match(String(messages[0].content), /Previously loaded skill snapshots: debug/);
+        assert.match(String(messages[0].content), /load_skill to restore the saved version/);
+        return { text: 'continue', calls: [] };
+      },
+    },
+    {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return false;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'continue debugging');
+  } finally {
+    f.close();
+  }
+});

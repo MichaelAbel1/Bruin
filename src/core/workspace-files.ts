@@ -3,6 +3,8 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
+const previewBytes = 256_000;
+
 function checkedWorkspacePath(workspace: string, relative: string, allowMissing = false): string {
   const root = fs.realpathSync(workspace);
   const target = path.resolve(root, relative);
@@ -61,12 +63,20 @@ export function readWorkspaceFile(
   );
   try {
     if (!fs.fstatSync(fd).isFile()) throw new Error('只能浏览普通文件');
-    const limit = 256_000;
+    const limit = previewBytes;
     const buffer = Buffer.alloc(limit + 1);
     const size = fs.readSync(fd, buffer, 0, buffer.length, 0);
     const bytes = buffer.subarray(0, Math.min(size, limit));
     if (bytes.includes(0)) throw new Error('二进制文件暂不支持预览');
-    const content = bytes.toString('utf8');
+    let content: string;
+    try {
+      content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes, {
+        stream: size > limit,
+      });
+    } catch (error) {
+      if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
+      throw error;
+    }
     let baselineContent: string | undefined;
     try {
       const normRelative = path.relative(root, target).split(path.sep).join('/');
@@ -118,6 +128,8 @@ export function writeWorkspaceFile(
     if (stat.isSymbolicLink()) throw new Error('不允许修改符号链接');
     if (stat.isDirectory()) throw new Error('目标路径是一个目录');
     if (!stat.isFile()) throw new Error('只能写入普通文件');
+    if (stat.size > previewBytes)
+      throw new Error('文件超过 256 KB 预览上限，不能通过截断预览覆盖保存；请使用外部编辑器');
     mode = stat.mode & 0o777;
     expected = stat;
   } catch (err) {

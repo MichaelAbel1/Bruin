@@ -11,6 +11,8 @@
 
 「测试工具」执行握手及 `tools/list`。模型通过 `mcp_list_tools(server)` 发现工具，再以 `mcp_call(server, tool, arguments)` 调用。**每次 MCP 调用都需审批**，参数与结果记录在事件日志。连接、列表与调用分别有 10 秒、10 秒、30 秒超时；单条 stdio 消息限制为 1 MB，返回给模型的调用结果限制为 100 KB。远程服务仍可能产生外部副作用，超时或断线后的结果可能不确定；Bruin 会标记 `tool_unknown`，不会自动重试。
 
+同名服务器的连接、列表、调用和断开操作按顺序完成，避免切换工作区或关闭连接时中断另一项请求；不同服务器保持独立。同一服务器的慢请求会延迟后续操作，仍受各请求超时限制。工具列表分页由当前 SDK 自动处理，Bruin 复用它的实现。
+
 ## 子 Agent
 
 模型或桌面界面可启动子 Agent，最多同时两个。子 Agent 拥有独立 SQLite 会话，使用父会话的模型配置，并且只暴露 `read_file`、`search`、`load_skill`。父会话记录 `subagent_started` 和 `subagent_finished`，通过 ID 查询状态与最后一条回答。当前不允许子 Agent 再创建子 Agent，也不能调用 MCP、Shell 或修改文件。关闭桌面后台时，运行中的子 Agent 会收到取消信号；重启后未完成任务显示为未知，必须由用户决定是否重新发起。
