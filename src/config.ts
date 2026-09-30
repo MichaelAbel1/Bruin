@@ -82,7 +82,7 @@ const configSchema = z.object({
   marketplaces: z.array(z.object({ name: z.string(), source: z.string() })).default([]),
   mcpServers: z.array(mcpServerSchema).default([]),
   hooks: z.array(hookSchema).default([]),
-  approvalMode: z.enum(['ask', 'autoSafe']).default('ask'),
+  approvalMode: z.enum(['ask', 'autoSafe', 'auto']).default('ask'),
   approvedCommands: z
     .array(
       z.object({ workspace: z.string(), command: z.string(), sessionId: z.string().optional() }),

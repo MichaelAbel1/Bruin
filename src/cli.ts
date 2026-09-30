@@ -19,7 +19,7 @@ import { SqliteEventStore } from './storage/event-store.js';
 import { AiSdkGateway } from './providers/gateway.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
-import { isAutoSafeShell } from './core/approval-policy.js';
+import { isAutoSafeShell, isMaliciousShell } from './core/approval-policy.js';
 import {
   addMarket,
   installFromMarket,
@@ -239,9 +239,17 @@ async function main(): Promise<void> {
       notice: (message: string) => console.log(`\n[工具] ${message}`),
       approve: async (call: ToolCall, reason: string) => {
         if (allowWorkspaceEdits && ['write_file', 'edit_file'].includes(call.name)) return true;
-        if (call.name === 'shell' && typeof call.input.command === 'string') {
-          const config = loadConfig();
-          const command = call.input.command;
+        const config = loadConfig();
+        const command =
+          call.name === 'shell' && typeof call.input.command === 'string' ? call.input.command : '';
+        if (config.approvalMode === 'auto') {
+          if (call.name === 'shell') {
+            if (!isMaliciousShell(command)) return true;
+          } else {
+            return true;
+          }
+        }
+        if (call.name === 'shell' && command) {
           if (
             config.approvedCommands.some(
               (rule) =>

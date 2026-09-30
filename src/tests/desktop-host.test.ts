@@ -92,6 +92,7 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     assert.deepEqual(initial.sessions, []);
     assert.equal(initial.config.approvalMode, 'ask');
     assert.equal((await request('setApprovalMode', { mode: 'autoSafe' })).approvalMode, 'autoSafe');
+    assert.equal((await request('setApprovalMode', { mode: 'auto' })).approvalMode, 'auto');
     await assert.rejects(request('setApprovalMode', { mode: 'unsafe' }), /无效的审批模式/);
     const key = 'sk-test-key-used-only-in-memory';
     const config = await request('saveProfile', {

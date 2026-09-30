@@ -125,7 +125,7 @@ type Config = {
   marketplaces: Market[];
   mcpServers: McpServer[];
   hooks: Hook[];
-  approvalMode: 'ask' | 'autoSafe';
+  approvalMode: 'ask' | 'autoSafe' | 'auto';
   approvedCommands: { workspace: string; command: string; sessionId?: string }[];
 };
 type HostEvent = {
@@ -609,6 +609,8 @@ function App() {
   const selected = useRef<string | null>(null);
   const viewRevision = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
   const isCurrentView = (revision: number, sessionId: string) =>
     viewRevision.current === revision && selected.current === sessionId;
 
@@ -635,6 +637,7 @@ function App() {
     }
   }
   function showSession(result: SessionView) {
+    autoScrollRef.current = true;
     selected.current = result.session.id;
     setView(result);
     setOpenFiles([]);
@@ -648,6 +651,28 @@ function App() {
     setSidebarOpen(false);
     if (result.recoveredUnknown)
       setNotice(`已发现 ${result.recoveredUnknown} 个结果未知的工具调用，请检查工作区。`);
+  }
+  async function createNewSession(customWorkspace?: string) {
+    if (!config.profiles.length) {
+      setDialog('model');
+      return;
+    }
+    try {
+      setBusy(false);
+      const alias = config.defaultProfile ?? config.profiles[0]?.alias ?? '';
+      const workspace =
+        customWorkspace !== undefined
+          ? customWorkspace
+          : view?.session.workspace && !view.session.managedWorkspace
+            ? view.session.workspace
+            : '';
+      const result = await api<SessionView>('createSession', { workspace, profileAlias: alias });
+      setSessions((previous) => [result.session, ...previous]);
+      viewRevision.current++;
+      showSession(result);
+    } catch (err) {
+      fail(err);
+    }
   }
   async function openSession(id: string) {
     const revision = ++viewRevision.current;
@@ -913,13 +938,28 @@ function App() {
       cancelled = true;
     };
   }, [view?.session.profile.alias, config, modelRefresh]);
+  const handleConversationScroll = () => {
+    const el = conversationRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    autoScrollRef.current = distanceToBottom <= 80;
+  };
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: 'smooth' });
+    if (!autoScrollRef.current) return;
+    const el = conversationRef.current;
+    if (stream) {
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+      }
+    } else {
+      bottom.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [view?.events.length, stream, notice, approval]);
 
   async function send() {
     if (!view || (!composer.trim() && !attachments.length && !quote) || busy || view.needsReview)
       return;
+    autoScrollRef.current = true;
     const text = composer.trim();
     const submittedAttachments = attachments;
     const submittedQuote = quote;
@@ -1091,7 +1131,7 @@ function App() {
         <button
           className="new-task"
           onClick={() => {
-            setDialog('new');
+            void createNewSession();
             setSidebarOpen(false);
           }}
         >
@@ -1159,7 +1199,7 @@ function App() {
         )}
         <div className="sidebar-footer">
           <button onClick={() => void openApprovalSettings()}>
-            <ShieldCheck size={17} /> 免审批命令
+            <ShieldCheck size={17} /> 审批设置 {config.approvalMode === 'auto' ? '(自动)' : ''}
           </button>
           <button onClick={() => setDialog('appearance')}>
             <Palette size={17} /> 外观
@@ -1289,10 +1329,7 @@ function App() {
               连接你熟悉的模型，新建会话后即可开始协作。Bruin
               会记录会话、展示工具操作，并在修改文件前征求许可。
             </p>
-            <button
-              className="primary"
-              onClick={() => setDialog(config.profiles.length ? 'new' : 'model')}
-            >
+            <button className="primary" onClick={() => void createNewSession()}>
               <Plus size={17} />
               {config.profiles.length ? '新建会话' : '先配置一个模型'}
             </button>
@@ -1323,7 +1360,11 @@ function App() {
               className="conversation-frame"
               key={`${view.session.id}:${view.session.workspace}`}
             >
-              <div className="conversation">
+              <div
+                className="conversation"
+                ref={conversationRef}
+                onScroll={handleConversationScroll}
+              >
                 <div className="conversation-intro">
                   <div className="project-monogram">
                     {short(view.session.workspace).slice(0, 1).toUpperCase()}
@@ -1613,6 +1654,29 @@ function App() {
                     >
                       <FolderOpen size={16} />
                     </button>
+                    <button
+                      type="button"
+                      className={`composer-action-btn composer-mode-toggle ${config.approvalMode === 'auto' ? 'active' : ''}`}
+                      title={
+                        config.approvalMode === 'auto'
+                          ? '当前为【自动执行】模式（除恶意操作全自动，点击切换为每次询问）'
+                          : config.approvalMode === 'autoSafe'
+                            ? '当前为【只读免审】模式（点击切换为自动执行）'
+                            : '当前为【每次询问】模式（点击切换为自动执行）'
+                      }
+                      aria-label="切换审批模式"
+                      onClick={() => {
+                        const nextMode = config.approvalMode === 'auto' ? 'ask' : 'auto';
+                        void api<Config>('setApprovalMode', { mode: nextMode })
+                          .then(setConfig)
+                          .catch(fail);
+                      }}
+                    >
+                      <ShieldCheck size={15} />
+                      <span className="composer-mode-badge">
+                        {config.approvalMode === 'auto' ? '自动审批' : '手动审核'}
+                      </span>
+                    </button>
                   </div>
                   <div className="composer-right">
                     <div
@@ -1825,10 +1889,14 @@ function App() {
             >
               <option value="ask">每次询问</option>
               <option value="autoSafe">自动执行固定只读命令</option>
+              <option value="auto">自动执行（除高危与恶意操作）</option>
             </select>
             <p className="form-help">
-              自主模式仅自动允许 pwd、git status、git diff --stat、git diff --name-only 和 git
-              branch --show-current。其他 Shell 命令、写入及外部工具仍需审批。
+              {config.approvalMode === 'auto'
+                ? '自动审批模式（类似 Codex）：常规读写、构建测试及工具调用均自动执行，仅对高危或恶意命令（如破坏性删除、磁盘覆写等）进行拦截确认。'
+                : config.approvalMode === 'autoSafe'
+                  ? '只读免审模式仅自动允许 pwd、git status、git diff 等只读检查。其他修改和外部工具仍需审批。'
+                  : '每次执行文件修改、Shell 命令或外部工具时均弹出提示由您审批。'}
             </p>
             <h3>永久允许的命令</h3>
             {config.approvedCommands.filter((rule) => !rule.sessionId).length ? (

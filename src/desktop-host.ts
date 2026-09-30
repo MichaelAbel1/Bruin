@@ -21,7 +21,7 @@ import { AiSdkGateway, toolSchemas } from './providers/gateway.js';
 import { discoverModels } from './providers/catalog.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
-import { isAutoSafeShell } from './core/approval-policy.js';
+import { isAutoSafeShell, isMaliciousShell } from './core/approval-policy.js';
 import {
   addMarket,
   installFromMarket,
@@ -141,6 +141,13 @@ const runner = new AgentRunner(
         const command = call.name === 'shell' ? String(call.input.command ?? '') : '';
         const workspace = getSession(sessionId).workspace;
         const config = loadConfig();
+        if (config.approvalMode === 'auto') {
+          if (call.name === 'shell') {
+            if (!isMaliciousShell(command)) return resolve(true);
+          } else {
+            return resolve(true);
+          }
+        }
         if (
           command &&
           (config.approvedCommands.some(
@@ -556,7 +563,8 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     }
     case 'setApprovalMode': {
       const mode = String(p.mode ?? '');
-      if (mode !== 'ask' && mode !== 'autoSafe') throw new Error('无效的审批模式');
+      if (mode !== 'ask' && mode !== 'autoSafe' && mode !== 'auto')
+        throw new Error('无效的审批模式');
       return updateConfig((config) => ({ ...config, approvalMode: mode }));
     }
     case 'removeApprovedCommand': {

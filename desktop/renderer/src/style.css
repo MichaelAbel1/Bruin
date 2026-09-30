@@ -1552,6 +1552,32 @@ pre {
   opacity: 0.35;
   cursor: default;
 }
+.composer-mode-toggle {
+  width: auto;
+  padding: 0 8px;
+  gap: 4px;
+}
+.composer-mode-badge {
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.composer-mode-toggle.active {
+  color: #72d572;
+  background: rgba(72, 187, 120, 0.15);
+}
+.composer-mode-toggle.active:hover:not(:disabled) {
+  color: #8ce68c;
+  background: rgba(72, 187, 120, 0.22);
+}
+:root[data-theme='light'] .composer-mode-toggle.active {
+  color: #27793d;
+  background: rgba(39, 121, 61, 0.12);
+}
+:root[data-theme='light'] .composer-mode-toggle.active:hover:not(:disabled) {
+  color: #1e6330;
+  background: rgba(39, 121, 61, 0.18);
+}
 
 .composer-right {
   display: flex;
