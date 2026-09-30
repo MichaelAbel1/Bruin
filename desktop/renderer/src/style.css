@@ -298,6 +298,7 @@ pre {
   font-size: 10px;
 }
 .main-area {
+  position: relative;
   min-width: 0;
   flex: 1;
   display: flex;
@@ -1817,21 +1818,26 @@ pre {
   padding: 24px;
 }
 .approval-dock {
-  position: fixed;
+  position: absolute;
   z-index: 19;
-  right: 24px;
-  bottom: 24px;
-  width: min(500px, calc(100vw - 48px));
+  inset: 62px 0 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  min-height: 0;
   pointer-events: none;
 }
 .approval-panel {
   pointer-events: auto;
-  max-height: min(520px, 75vh);
+  width: min(560px, 100%);
+  max-height: 100%;
+  min-height: 0;
   overflow: auto;
-  background: #1b201e;
-  border: 1px solid #6a785f;
+  background: var(--review-surface);
+  color: var(--review-text);
+  border: 1px solid var(--review-border);
   border-radius: 14px;
-  box-shadow: 0 20px 65px #0009;
+  box-shadow: var(--review-shadow);
   padding: 20px;
 }
 .approval-panel h2 {
@@ -3026,4 +3032,20 @@ pre {
 }
 .workspace-review-status.deleted {
   color: #cc5353;
+}
+
+.approval-panel .approval-icon {
+  background: var(--review-hover);
+  color: var(--review-text);
+}
+.approval-panel .approval-scope label {
+  color: var(--review-muted);
+}
+.approval-panel .approval-scope select {
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--review-border);
+  background: var(--review-surface);
+  color: var(--review-text);
 }

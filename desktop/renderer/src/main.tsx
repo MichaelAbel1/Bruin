@@ -1753,6 +1753,54 @@ function App() {
             </div>
           </>
         )}
+        {approval && (
+          <div className="approval-dock" role="region" aria-label="工具操作审批">
+            <div className="approval-panel">
+              <div className="approval-head">
+                <div className="approval-icon">
+                  <ShieldCheck size={22} />
+                </div>
+                <div>
+                  <span className="eyebrow">TOOL APPROVAL</span>
+                  <h2>允许 Bruin 执行此操作？</h2>
+                </div>
+              </div>
+              <p>{approval.reason}</p>
+              <div className="approval-name">
+                <Terminal size={15} />
+                {approval.call.name}
+              </div>
+              <pre>{JSON.stringify(approval.call.input, null, 2)}</pre>
+              {approval.call.name === 'shell' && (
+                <div className="approval-scope">
+                  <label htmlFor="approval-scope">授权范围（仅对相同工作区中的完整命令生效）</label>
+                  <select
+                    id="approval-scope"
+                    value={approvalScope}
+                    onChange={(e) => setApprovalScope(e.target.value as ApprovalScope)}
+                  >
+                    <option value="once">仅本次</option>
+                    <option value="session">本会话</option>
+                    <option value="always">永久允许</option>
+                  </select>
+                </div>
+              )}
+              <div className="modal-actions">
+                <button className="secondary" onClick={() => void decide(false)}>
+                  拒绝
+                </button>
+                <button className="primary" onClick={() => void decide(true)}>
+                  <Check size={16} /> 允许
+                  {approvalScope === 'session' && approval.call.name === 'shell'
+                    ? '本会话'
+                    : approvalScope === 'always' && approval.call.name === 'shell'
+                      ? '并记住'
+                      : '本次操作'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
       {error && (
         <div className="toast error">
@@ -1761,54 +1809,6 @@ function App() {
           <button onClick={() => setError('')}>
             <X size={14} />
           </button>
-        </div>
-      )}
-      {approval && (
-        <div className="approval-dock" role="region" aria-label="工具操作审批">
-          <div className="approval-panel">
-            <div className="approval-head">
-              <div className="approval-icon">
-                <ShieldCheck size={22} />
-              </div>
-              <div>
-                <span className="eyebrow">TOOL APPROVAL</span>
-                <h2>允许 Bruin 执行此操作？</h2>
-              </div>
-            </div>
-            <p>{approval.reason}</p>
-            <div className="approval-name">
-              <Terminal size={15} />
-              {approval.call.name}
-            </div>
-            <pre>{JSON.stringify(approval.call.input, null, 2)}</pre>
-            {approval.call.name === 'shell' && (
-              <div className="approval-scope">
-                <label htmlFor="approval-scope">授权范围（仅对相同工作区中的完整命令生效）</label>
-                <select
-                  id="approval-scope"
-                  value={approvalScope}
-                  onChange={(e) => setApprovalScope(e.target.value as ApprovalScope)}
-                >
-                  <option value="once">仅本次</option>
-                  <option value="session">本会话</option>
-                  <option value="always">永久允许</option>
-                </select>
-              </div>
-            )}
-            <div className="modal-actions">
-              <button className="secondary" onClick={() => void decide(false)}>
-                拒绝
-              </button>
-              <button className="primary" onClick={() => void decide(true)}>
-                <Check size={16} /> 允许
-                {approvalScope === 'session' && approval.call.name === 'shell'
-                  ? '本会话'
-                  : approvalScope === 'always' && approval.call.name === 'shell'
-                    ? '并记住'
-                    : '本次操作'}
-              </button>
-            </div>
-          </div>
         </div>
       )}
       {dialog === 'approvals' && (
