@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -32,6 +32,7 @@ import {
   X,
 } from 'lucide-react';
 import './style.css';
+import { recordedUsage, recordedTokenLabel } from '../../../src/core/usage.js';
 import bearWhite from '../../assets/icon-white.png';
 import bearBlack from '../../assets/icon-black.png';
 import bearSage from '../../assets/icon-sage.png';
@@ -1014,6 +1015,7 @@ function App() {
       fail(err);
     }
   }
+  const usage = useMemo(() => recordedUsage(view?.events ?? []), [view?.events]);
   const lastEvent = view?.events.at(-1);
   const canResume = Boolean(
     view &&
@@ -1273,6 +1275,22 @@ function App() {
                 <span>
                   模型 {view.session.profile.alias} · 会话 {view.session.id.slice(0, 8)}
                 </span>
+                {usage.responses > 0 && (
+                  <details className="session-usage">
+                    <summary>
+                      已记录 Token · 输入{' '}
+                      {recordedTokenLabel(usage.inputTokens, usage.inputReports, usage.responses)} ·
+                      输出{' '}
+                      {recordedTokenLabel(usage.outputTokens, usage.outputReports, usage.responses)}
+                    </summary>
+                    <p>
+                      累计 {usage.responses} 次模型响应；其中 {usage.inputReports} 次提供输入用量、
+                      {usage.outputReports} 次提供输出用量。≥ 表示仅统计已提供的部分。
+                      不含上下文摘要、失败或中断请求及子 Agent
+                      的用量；不是当前上下文占用或费用账单。
+                    </p>
+                  </details>
+                )}
               </div>
               {view.needsReview && (
                 <div className="review-banner">

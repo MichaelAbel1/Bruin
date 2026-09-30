@@ -981,6 +981,26 @@ pre {
   font-size: 10px;
   color: #5f6e63;
 }
+.session-usage {
+  margin-top: 12px;
+  font-size: 11px;
+  color: #808b84;
+}
+.session-usage summary {
+  cursor: pointer;
+  line-height: 1.7;
+}
+.session-usage summary:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+.conversation-intro .session-usage p {
+  margin: 8px 0 0;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.7;
+  word-break: normal;
+}
 .message {
   display: flex;
   gap: 13px;
