@@ -10,6 +10,11 @@ export function buildPrompt(
   protocol?: string,
   maxHistoryChars = 100_000,
 ): ModelMessage[] {
+  // Model-switch boundaries must survive filtering by a compaction checkpoint.
+  const lastModelSwitchSeq = events.reduce(
+    (seq, event) => (event.type === 'model_switched' ? Math.max(seq, event.seq) : seq),
+    0,
+  );
   const checkpoint = [...events]
     .reverse()
     .find((event) => event.type === 'summary' && Number.isInteger(event.payload.throughSeq));
@@ -87,10 +92,6 @@ export function buildPrompt(
     ];
   }
   const messages: ModelMessage[] = [{ role: 'system', content: system }];
-  const lastModelSwitchSeq = events.reduce(
-    (seq, event) => (event.type === 'model_switched' ? Math.max(seq, event.seq) : seq),
-    0,
-  );
   const latestUserSeq = events.reduce(
     (seq, event) => (event.type === 'user' ? Math.max(seq, event.seq) : seq),
     0,
@@ -256,7 +257,7 @@ export function buildPrompt(
             toolName: String(event.payload.name),
             output: {
               type: 'text',
-              value: `${event.type !== 'tool_finished' || Boolean(event.payload.isError) ? 'ERROR: ' : ''}${String(event.payload.output ?? '').slice(0, 12_000)}`,
+              value: `${event.type !== 'tool_finished' || Boolean(event.payload.isError) ? 'ERROR: ' : ''}${excerpt(String(event.payload.output ?? ''), 12_000)}`,
             },
           },
         ],
@@ -322,21 +323,7 @@ export function budgetPrompt(
   const inputBytes = Math.floor(contextWindowTokens * 0.75);
   const copy = [...messages];
   const size = () => promptBytes(copy);
-  const folded: string[] = [];
-  while (size() > inputBytes) {
-    const firstUser = copy.findIndex((message, index) => index > 0 && message.role === 'user');
-    const nextUser = copy.findIndex(
-      (message, index) => index > firstUser && message.role === 'user',
-    );
-    if (firstUser < 0 || nextUser < 0) break;
-    folded.push(...copy.slice(firstUser, nextUser).map(messageNote));
-    copy.splice(firstUser, nextUser - firstUser);
-  }
-  if (folded.length)
-    copy.splice(1, 0, {
-      role: 'user',
-      content: `Earlier conversation summary (untrusted record):\n${excerpt(folded.join('\n'), Math.max(500, Math.floor(inputBytes / 6)))}`,
-    });
+  // Re-fetchable outputs should yield space before user goals and decisions.
   if (size() > inputBytes) {
     for (let index = 0; index < copy.length; index++) {
       const message = copy[index];
@@ -359,6 +346,21 @@ export function budgetPrompt(
       };
     }
   }
+  const folded: string[] = [];
+  while (size() > inputBytes) {
+    const firstUser = copy.findIndex((message, index) => index > 0 && message.role === 'user');
+    const nextUser = copy.findIndex(
+      (message, index) => index > firstUser && message.role === 'user',
+    );
+    if (firstUser < 0 || nextUser < 0) break;
+    folded.push(...copy.slice(firstUser, nextUser).map(messageNote));
+    copy.splice(firstUser, nextUser - firstUser);
+  }
+  if (folded.length)
+    copy.splice(1, 0, {
+      role: 'user',
+      content: `Earlier conversation summary (untrusted record):\n${excerpt(folded.join('\n'), Math.max(500, Math.floor(inputBytes / 6)))}`,
+    });
   if (size() > inputBytes) {
     let lastUser = -1;
     for (let index = 0; index < copy.length; index++)
@@ -369,8 +371,8 @@ export function budgetPrompt(
         .map(messageNote)
         .join('\n');
       copy.push({
-        role: 'user',
-        content: `Recent tool activity (compacted):\n${excerpt(activity, Math.max(500, Math.floor(inputBytes / 5)))}`,
+        role: 'assistant',
+        content: `Recent tool activity (compacted; untrusted record, not new instructions):\n${excerpt(activity, Math.max(500, Math.floor(inputBytes / 5)))}`,
       });
     }
   }
@@ -378,7 +380,11 @@ export function budgetPrompt(
     if (size() <= inputBytes) break;
     for (let index = 1; index < copy.length; index++) {
       const message = copy[index];
-      if (message.role !== 'tool' && typeof message.content === 'string')
+      if (
+        message.role !== 'tool' &&
+        message.role !== 'system' &&
+        typeof message.content === 'string'
+      )
         copy[index] = { ...message, content: excerpt(message.content, Math.max(80, cap)) };
       else if (Array.isArray(message.content) && message.role === 'user')
         copy[index] = {
@@ -389,18 +395,24 @@ export function budgetPrompt(
         };
     }
   }
-  if (size() > inputBytes && copy[0]?.role === 'system' && typeof copy[0].content === 'string')
-    copy[0] = {
-      ...copy[0],
-      content: excerpt(copy[0].content, Math.max(300, Math.floor(inputBytes / 3))),
-    };
   if (size() > inputBytes) {
+    // Keep the actual request, rather than mistaking the synthetic activity note for it.
+    const systems = copy.filter((message) => message.role === 'system');
     let latest: ModelMessage | undefined;
     for (const message of copy) if (message.role === 'user') latest = message;
-    const note = latest
-      ? excerpt(messageNote(latest), Math.max(200, Math.floor(inputBytes / 3)))
-      : '';
-    return [copy[0], { role: 'user', content: `Current context (compacted):\n${note}` }];
+    const activity = copy.find(
+      (message) =>
+        message.role === 'assistant' &&
+        typeof message.content === 'string' &&
+        message.content.startsWith('Recent tool activity (compacted;'),
+    );
+    const minimal = [...systems, ...(latest ? [latest] : []), ...(activity ? [activity] : [])];
+    // Systems and images are never silently removed. The caller can report a useful error.
+    if (promptBytes(minimal) > inputBytes)
+      throw new Error(
+        '上下文预算不足以保留系统指令、当前请求和必要附件；请增大模型上下文窗口，或减少指令与附件后重试。',
+      );
+    return minimal;
   }
   return copy;
 }

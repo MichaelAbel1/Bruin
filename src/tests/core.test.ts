@@ -1373,8 +1373,9 @@ test('budgetPrompt compresses old and oversized current input without aborting',
   assert.equal(budgeted[2], messages[3]);
   assert.equal(messages.length, 4);
   assert.equal(budgetPrompt(messages, 65_536).length, 4);
-  assert.ok(
-    promptBytes(budgetPrompt([{ role: 'system', content: 'x'.repeat(30_000) }], 32_768)) <= 24_576,
+  assert.throws(
+    () => budgetPrompt([{ role: 'system', content: 'x'.repeat(30_000) }], 32_768),
+    /上下文预算不足/,
   );
   const huge = budgetPrompt(
     [
