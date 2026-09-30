@@ -53,6 +53,13 @@ for (const mode of ['planning', 'read-only'] as const) {
                   name: 'read_file',
                   input: { path: 'source.txt', startLine: 2, lineCount: 1 },
                 },
+                { id: 'index', name: 'search_repository', input: { query: 'source' } },
+                { id: 'snapshots', name: 'list_snapshots', input: {} },
+                {
+                  id: 'restore',
+                  name: 'restore_snapshot',
+                  input: { id: '00000000-0000-4000-8000-000000000000' },
+                },
                 {
                   id: 'write',
                   name: 'write_file',
@@ -82,7 +89,7 @@ for (const mode of ['planning', 'read-only'] as const) {
       const results = f.store
         .events(f.session.id)
         .filter((event) => event.type === 'tool_finished');
-      assert.equal(results.length, 2);
+      assert.equal(results.length, 4);
       assert.equal(
         results.every((event) => event.payload.isError === false),
         true,
@@ -94,6 +101,14 @@ for (const mode of ['planning', 'read-only'] as const) {
         true,
       );
       assert.match(String(results[1].payload.output), /^TARGET\n/);
+      assert.equal(JSON.parse(String(results[2].payload.output)).results[0].path, 'source.txt');
+      assert.deepEqual(JSON.parse(String(results[3].payload.output)).snapshots, []);
+      assert.equal(
+        f.store
+          .events(f.session.id)
+          .some((event) => event.type === 'tool_denied' && event.payload.callId === 'restore'),
+        true,
+      );
       assert.equal(
         f.store
           .events(f.session.id)

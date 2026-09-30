@@ -4,6 +4,7 @@ import type { McpServerConfig } from '../config.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { McpOAuthSession } from './mcp-oauth.js';
 
 let macSandboxAvailable: boolean | undefined;
 function isMacSandboxAvailable(): boolean {
@@ -83,6 +84,8 @@ function sandboxProfile(workspace: string, _executable: string): string {
 
 /** Connections are owned by the host. No MCP process inherits model credentials by default. */
 export class McpManager {
+  private oauth = new Map<string, { signature: string; session: McpOAuthSession }>();
+  private loggingIn = new Map<string, McpOAuthSession>();
   private clients = new Map<string, { client: Client; signature: string }>();
   private connecting = new Map<string, Promise<Client>>();
   private operations = new Map<string, Promise<unknown>>();
@@ -195,6 +198,14 @@ export class McpManager {
       });
     } else {
       transport = new StreamableHTTPClientTransport(new URL(server.url), {
+        fetch: (input, init) =>
+          fetch(input, {
+            ...init,
+            signal: init?.signal
+              ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)])
+              : AbortSignal.timeout(30_000),
+          }),
+        ...(server.oauth ? { authProvider: this.oauthProvider(server) } : {}),
         ...(server.tokenEnv
           ? {
               authProvider: {
@@ -216,6 +227,44 @@ export class McpManager {
       await client.close().catch(() => {});
       throw error;
     }
+  }
+
+  private oauthProvider(server: McpServerConfig): McpOAuthSession {
+    const entry = this.oauth.get(server.name);
+    if (!entry || entry.signature !== JSON.stringify(server))
+      throw new Error('MCP 需要 OAuth 登录，请在设置中点击登录');
+    return entry.session;
+  }
+  async login(server: McpServerConfig, open: (url: string) => Promise<void>): Promise<void> {
+    return this.serialize(server.name, async () => {
+      if (this.closing) throw new Error('MCP 管理器已关闭');
+      if (server.transport !== 'http' || !server.oauth) throw new Error('服务器未启用 OAuth');
+      await this.disconnectConnected(server.name);
+      const session = new McpOAuthSession(server.oauth.clientId);
+      this.loggingIn.set(server.name, session);
+      try {
+        await session.login(server.url, open, server.oauth.callbackPort);
+      } finally {
+        this.loggingIn.delete(server.name);
+      }
+      if (this.closing) {
+        session.invalidateCredentials('all');
+        throw new Error('MCP 管理器已关闭');
+      }
+      this.oauth.get(server.name)?.session.invalidateCredentials('all');
+      this.oauth.set(server.name, { signature: JSON.stringify(server), session });
+    });
+  }
+  async logout(name: string): Promise<void> {
+    this.cancelLogin(name);
+    await this.serialize(name, async () => {
+      await this.disconnectConnected(name);
+      this.oauth.get(name)?.session.invalidateCredentials('all');
+      this.oauth.delete(name);
+    });
+  }
+  cancelLogin(name: string) {
+    this.loggingIn.get(name)?.cancelLogin();
   }
 
   async listTools(
@@ -277,8 +326,11 @@ export class McpManager {
   }
   async close(): Promise<void> {
     this.closing = true;
+    for (const session of this.loggingIn.values()) session.cancelLogin();
     await Promise.allSettled([...this.operations.values()]);
     await Promise.allSettled([...this.connecting.values()]);
     await Promise.allSettled([...this.clients.keys()].map((name) => this.disconnect(name)));
+    for (const entry of this.oauth.values()) entry.session.invalidateCredentials('all');
+    this.oauth.clear();
   }
 }

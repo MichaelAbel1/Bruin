@@ -166,6 +166,15 @@ function startHost() {
       if (message.error) entry.reject(new Error(message.error));
       else entry.resolve(message.result);
     } else {
+      if (message.type === 'openOAuthBrowser') {
+        const url = new URL(message.url);
+        if (
+          url.protocol === 'https:' ||
+          (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
+        )
+          void shell.openExternal(url.href).catch(() => {});
+        return;
+      }
       if (message.type === 'runStarted' && message.longRun && longRunPowerBlocker === undefined)
         longRunPowerBlocker = powerSaveBlocker.start('prevent-app-suspension');
       if (message.type === 'runFinished' || message.type === 'runFailed') stopLongRunPowerBlocker();

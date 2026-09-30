@@ -32,6 +32,7 @@ export class ProcessExecutor implements ToolExecutor {
         PATH: process.env.PATH,
         TMPDIR: process.env.TMPDIR,
         LANG: process.env.LANG,
+        BRUIN_HOME: process.env.BRUIN_HOME,
         BRUIN_ALLOW_UNSANDBOXED_SHELL: process.env.BRUIN_ALLOW_UNSANDBOXED_SHELL,
         BRUIN_ENFORCE_SANDBOX: process.env.BRUIN_ENFORCE_SANDBOX,
         BRUIN_SHELL_BACKEND: process.env.BRUIN_SHELL_BACKEND,

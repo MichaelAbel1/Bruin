@@ -18,6 +18,8 @@ CLI、桌面 Agent 和只读子 Agent 都可使用：
 
 两项工具均可在未批准计划阶段使用，不新增写入能力，也不能浏览工作区外或符号链接指向的路径。工具可读不意味着模型已经完整读取文件；应结合分页或截断标记判断。
 
+索引、文件快照回滚与 MCP OAuth 的使用方法和限制见 [仓库索引、文件回滚与 MCP OAuth](REPOSITORY_RECOVERY_AUTH.md)。
+
 ## MCP
 
 在侧边栏「MCP 与自动化」中添加服务器。支持两种传输：
@@ -31,7 +33,7 @@ CLI、桌面 Agent 和只读子 Agent 都可使用：
 
 ## 子 Agent
 
-模型或桌面界面可启动子 Agent，最多同时两个。子 Agent 拥有独立 SQLite 会话，使用父会话的模型配置，并且只暴露 `read_file`、`list_files`、`search`、`load_skill`。父会话记录 `subagent_started` 和 `subagent_finished`，通过 ID 查询状态与最后一条回答。当前不允许子 Agent 再创建子 Agent，也不能调用 MCP、Shell 或修改文件。关闭桌面后台时，运行中的子 Agent 会收到取消信号；重启后未完成任务显示为未知，必须由用户决定是否重新发起。
+模型或桌面界面可启动子 Agent，最多同时两个。子 Agent 拥有独立 SQLite 会话，使用父会话的模型配置，并且只暴露 `read_file`、`list_files`、`search_repository`、`list_snapshots`、`search`、`load_skill`。父会话记录 `subagent_started` 和 `subagent_finished`，通过 ID 查询状态与最后一条回答。当前不允许子 Agent 再创建子 Agent，也不能调用 MCP、Shell 或修改文件。关闭桌面后台时，运行中的子 Agent 会收到取消信号；重启后未完成任务显示为未知，必须由用户决定是否重新发起。
 
 子 Agent 达到预算暂停时，父会话会报告 `failed` 并明确说明任务未完成；不会把预算报告当作完成结果。已经记录的失败原因可在后台重建后查询。
 
@@ -65,4 +67,4 @@ CLI、桌面 Agent 和只读子 Agent 都可使用：
 
 主模型请求由 `AgentRunner` 统一重试，最多三次尝试；已向用户输出部分正文的请求不重试。历史摘要调用独立保留一次 SDK 重试。当前轮次最近 200 条事件中，相同工具与参数累计失败或被拒绝三次会提示模型调整方法；相同请求成功、新用户输入和回合完成会重置相应计数。后台及子 Agent 状态轮询不计入。提示不自动暂停或提高权限。
 
-当前已有跨进程会话租约和 Electron `safeStorage` 密钥加密。仍缺少 MCP OAuth 交互式登录、后台任务跨重启续跑、崩溃后 Docker 容器回收保证，以及面向敌对代码的强隔离。参见 [安全模型](SECURITY.md)、[生产化审查](PRODUCTION_REVIEW.md)与[机制对比](AGENT_COMPARISON.md)。
+当前已有跨进程会话租约和 Electron `safeStorage` 密钥加密。仍缺少 OAuth 凭证跨重启安全持久化、后台任务跨重启续跑、崩溃后 Docker 容器回收保证，以及面向敌对代码的强隔离。参见 [安全模型](SECURITY.md)、[生产化审查](PRODUCTION_REVIEW.md)与[机制对比](AGENT_COMPARISON.md)。

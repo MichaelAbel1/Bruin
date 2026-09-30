@@ -13,6 +13,9 @@ export function decisionFor(
     ![
       'read_file',
       'list_files',
+      'search_repository',
+      'list_snapshots',
+      'restore_snapshot',
       'write_file',
       'edit_file',
       'search',
@@ -47,6 +50,13 @@ export function decisionFor(
       decision: 'ask',
       reason: 'Shell 命令可执行任意程序；若系统缺少沙箱，批准后会直接在宿主机运行',
     };
+  if (call.name === 'restore_snapshot')
+    return {
+      decision: 'ask',
+      reason: '回滚会覆盖文件；撤销新建文件会删除它。若文件已有后续修改则拒绝回滚',
+    };
+  if (call.name === 'search_repository' || call.name === 'list_snapshots')
+    return { decision: 'allow', reason: '读取工作区索引或快照记录' };
   if (call.name === 'create_task')
     return { decision: 'ask', reason: '创建任务会写入工作区 .tasks 目录' };
   if (call.name === 'update_task')

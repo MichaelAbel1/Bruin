@@ -33,30 +33,41 @@ const profileSchema = z.object({
   apiKeyEnv: z.string().regex(envNamePattern).optional(),
   contextWindowTokens: z.number().int().min(8192).max(1_048_576).optional(),
 });
-export const mcpServerSchema = z.discriminatedUnion('transport', [
-  z.object({
-    name: z.string().min(1).max(80),
-    transport: z.literal('stdio'),
-    command: z.string().min(1),
-    args: z.array(z.string()).default([]),
-    envNames: z.array(z.string().regex(envNamePattern)).default([]),
-  }),
-  z.object({
-    name: z.string().min(1).max(80),
-    transport: z.literal('http'),
-    url: z
-      .string()
-      .url()
-      .refine((value) => {
-        const url = new URL(value);
-        return (
-          url.protocol === 'https:' ||
-          (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
-        );
-      }, '远程 MCP 服务器必须使用 HTTPS'),
-    tokenEnv: z.string().regex(envNamePattern).optional(),
-  }),
-]);
+export const mcpServerSchema = z
+  .discriminatedUnion('transport', [
+    z.object({
+      name: z.string().min(1).max(80),
+      transport: z.literal('stdio'),
+      command: z.string().min(1),
+      args: z.array(z.string()).default([]),
+      envNames: z.array(z.string().regex(envNamePattern)).default([]),
+    }),
+    z.object({
+      name: z.string().min(1).max(80),
+      transport: z.literal('http'),
+      url: z
+        .string()
+        .url()
+        .refine((value) => {
+          const url = new URL(value);
+          return (
+            url.protocol === 'https:' ||
+            (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+          );
+        }, '远程 MCP 服务器必须使用 HTTPS'),
+      tokenEnv: z.string().regex(envNamePattern).optional(),
+      oauth: z
+        .object({
+          clientId: z.string().min(1).optional(),
+          callbackPort: z.number().int().min(1024).max(65535).optional(),
+        })
+        .optional(),
+    }),
+  ])
+  .refine(
+    (server) => server.transport !== 'http' || !(server.oauth && server.tokenEnv),
+    'OAuth 和 Bearer Token 不能同时配置',
+  );
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;
 export const hookSchema = z.object({
   name: z.string().min(1).max(80),

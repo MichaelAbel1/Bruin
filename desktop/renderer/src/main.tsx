@@ -106,7 +106,13 @@ type Approval = {
 type ApprovalScope = 'once' | 'session' | 'always';
 type McpServer =
   | { name: string; transport: 'stdio'; command: string; args: string[]; envNames: string[] }
-  | { name: string; transport: 'http'; url: string; tokenEnv?: string };
+  | {
+      name: string;
+      transport: 'http';
+      url: string;
+      tokenEnv?: string;
+      oauth?: { clientId?: string; callbackPort?: number };
+    };
 type Hook = {
   name: string;
   event: 'before_tool' | 'after_tool' | 'turn_started' | 'turn_finished';
@@ -680,6 +686,7 @@ function App() {
         sessionId: view.session.id,
         path: file.path,
         content: file.content,
+        expectedContent: file.originalContent,
       });
       setOpenFiles((current) =>
         current.map((item) =>
@@ -2233,6 +2240,15 @@ function RuntimeDialog({
   const [endpoint, setEndpoint] = useState('');
   const [args, setArgs] = useState('');
   const [envName, setEnvName] = useState('');
+  const [oauthEnabled, setOauthEnabled] = useState(false);
+  const [oauthClientId, setOauthClientId] = useState('');
+  const [oauthPort, setOauthPort] = useState('');
+  const [indexQuery, setIndexQuery] = useState('');
+  const [snapshots, setSnapshots] = useState<
+    Array<{ id: string; path: string; at: string; action: string }>
+  >([]);
+  const [snapshotConfirm, setSnapshotConfirm] = useState('');
+  const [snapshotOffset, setSnapshotOffset] = useState<number | null>(null);
   const [hookName, setHookName] = useState('');
   const [hookEvent, setHookEvent] = useState<Hook['event']>('before_tool');
   const [hookCommand, setHookCommand] = useState('');
@@ -2285,6 +2301,15 @@ function RuntimeDialog({
         input,
       });
       setOutput(result.output);
+      if (name === 'list_snapshots') {
+        const page = JSON.parse(result.output);
+        setSnapshots((old) => (input.offset ? [...old, ...page.snapshots] : page.snapshots));
+        setSnapshotOffset(page.nextOffset);
+      }
+      if (name === 'restore_snapshot') {
+        setSnapshots([]);
+        setSnapshotConfirm('');
+      }
       if (name.endsWith('_task') || name === 'list_tasks')
         setGraphTasks(await api<TaskNode[]>('listTasks', { sessionId: session.id }));
     } catch (error) {
@@ -2340,6 +2365,57 @@ function RuntimeDialog({
   return (
     <Modal title="MCP 与自动化" eyebrow="AGENT CAPABILITIES" close={close}>
       <div className="runtime-settings form-stack">
+        <h3>仓库索引与文件快照</h3>
+        <input
+          value={indexQuery}
+          onChange={(e) => setIndexQuery(e.target.value)}
+          placeholder="文件路径或符号名称"
+          maxLength={500}
+          aria-label="仓库索引查询"
+        />
+        <button
+          disabled={working || !session}
+          onClick={() => void runtime('search_repository', { query: indexQuery })}
+        >
+          查询并更新索引
+        </button>
+        <button disabled={working || !session} onClick={() => void runtime('list_snapshots')}>
+          列出文件快照
+        </button>
+        {snapshotOffset !== null && (
+          <button
+            disabled={working || !session}
+            onClick={() => void runtime('list_snapshots', { offset: snapshotOffset })}
+          >
+            更多快照
+          </button>
+        )}
+        {snapshots.map((snapshot) => (
+          <div className="runtime-row" key={snapshot.id}>
+            <span>
+              {snapshot.path} · {snapshot.at} ·{' '}
+              {snapshot.action === 'delete_created_file'
+                ? '回滚将删除新建文件'
+                : '回滚将恢复修改前内容'}
+            </span>
+            <button
+              disabled={working}
+              onClick={() => {
+                if (snapshotConfirm !== snapshot.id) {
+                  setSnapshotConfirm(snapshot.id);
+                  return;
+                }
+                void runtime('restore_snapshot', { id: snapshot.id });
+              }}
+            >
+              {snapshotConfirm === snapshot.id ? '确认回滚此文件' : '回滚'}
+            </button>
+          </div>
+        ))}
+        <small>
+          仅覆盖 Bruin
+          文件工具和桌面保存；Shell/MCP/外部编辑不自动生成快照。文件已有后续修改时拒绝回滚。
+        </small>
         <h3>MCP 服务器</h3>
         {config.mcpServers.map((server) => (
           <div className="runtime-row" key={server.name}>
@@ -2347,6 +2423,28 @@ function RuntimeDialog({
               <strong>{server.name}</strong> ·{' '}
               {server.transport === 'stdio' ? server.command : server.url}
             </span>
+            {server.transport === 'http' && server.oauth && (
+              <>
+                <button
+                  disabled={working}
+                  onClick={() => void manage('loginMcpServer', { name: server.name })}
+                >
+                  OAuth 登录
+                </button>
+                <button
+                  disabled={!working}
+                  onClick={() => void api('cancelMcpLogin', { name: server.name }).catch(fail)}
+                >
+                  取消登录
+                </button>
+                <button
+                  disabled={working}
+                  onClick={() => void manage('logoutMcpServer', { name: server.name })}
+                >
+                  退出登录
+                </button>
+              </>
+            )}
             <button
               disabled={working || (server.transport === 'stdio' && !session)}
               onClick={() =>
@@ -2399,16 +2497,47 @@ function RuntimeDialog({
             />
           </label>
         )}
-        <label>
-          {transport === 'stdio'
-            ? '允许传给服务器的环境变量名（逗号分隔）'
-            : 'Bearer Token 环境变量名'}
-          <input
-            value={envName}
-            onChange={(e) => setEnvName(e.target.value)}
-            placeholder="MCP_TOKEN"
-          />
-        </label>
+        {transport === 'http' && (
+          <>
+            <label>
+              <input
+                type="checkbox"
+                checked={oauthEnabled}
+                onChange={(e) => setOauthEnabled(e.target.checked)}
+              />
+              使用 OAuth 浏览器登录
+            </label>
+            {oauthEnabled && (
+              <>
+                <input
+                  value={oauthClientId}
+                  onChange={(e) => setOauthClientId(e.target.value)}
+                  placeholder="预注册 Client ID（留空使用动态注册）"
+                  aria-label="OAuth Client ID"
+                />
+                <input
+                  value={oauthPort}
+                  onChange={(e) => setOauthPort(e.target.value)}
+                  placeholder="固定回调端口（留空使用随机端口）"
+                  aria-label="OAuth 回调端口"
+                />
+                <small>令牌仅保存在后台内存，退出或重启后需重新登录；不写入配置和会话日志。</small>
+              </>
+            )}
+          </>
+        )}
+        {!(transport === 'http' && oauthEnabled) && (
+          <label>
+            {transport === 'stdio'
+              ? '允许传给服务器的环境变量名（逗号分隔）'
+              : 'Bearer Token 环境变量名'}
+            <input
+              value={envName}
+              onChange={(e) => setEnvName(e.target.value)}
+              placeholder="MCP_TOKEN"
+            />
+          </label>
+        )}
         <button
           className="secondary"
           disabled={working || !serverName.trim() || !endpoint.trim()}
@@ -2433,7 +2562,16 @@ function RuntimeDialog({
                     name: serverName.trim(),
                     transport,
                     url: endpoint.trim(),
-                    ...(envName.trim() ? { tokenEnv: envName.trim() } : {}),
+                    ...(oauthEnabled
+                      ? {
+                          oauth: {
+                            ...(oauthClientId.trim() ? { clientId: oauthClientId.trim() } : {}),
+                            ...(oauthPort.trim() ? { callbackPort: Number(oauthPort) } : {}),
+                          },
+                        }
+                      : envName.trim()
+                        ? { tokenEnv: envName.trim() }
+                        : {}),
                   },
             )
           }

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { recordSnapshot } from './snapshots.js';
 
 const previewBytes = 256_000;
 
@@ -105,6 +106,7 @@ export function writeWorkspaceFile(
   workspace: string,
   relative: string,
   content: string,
+  expectedContent?: string,
 ): { path: string; size: number } {
   if (!relative) throw new Error('请选择文件');
   if (Buffer.byteLength(content) > 10_000_000) throw new Error('单次写入文件大小不能超过 10MB');
@@ -140,6 +142,27 @@ export function writeWorkspaceFile(
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
+  if (expectedContent !== undefined) {
+    if (!expected) throw new Error('文件已删除，请重新打开后再保存');
+    const source = fs.openSync(
+      target,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
+    try {
+      if (!fs.fstatSync(source).isFile()) throw new Error('只能写入普通文件');
+      const bytes = Buffer.alloc(previewBytes + 1);
+      let size = 0;
+      while (size < bytes.length) {
+        const read = fs.readSync(source, bytes, size, bytes.length - size, size);
+        if (!read) break;
+        size += read;
+      }
+      if (!bytes.subarray(0, size).equals(Buffer.from(expectedContent)))
+        throw new Error('文件已有后续修改或已回滚，请重新打开后再保存');
+    } finally {
+      fs.closeSync(source);
+    }
+  }
   const temp = path.join(parent, `.${path.basename(target)}.${randomUUID()}.tmp`);
   let fd: number | undefined;
   const buffer = Buffer.from(content, 'utf8');
@@ -158,6 +181,7 @@ export function writeWorkspaceFile(
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
+    recordSnapshot(root, target, buffer);
     checkedWorkspacePath(workspace, target, true);
     const currentParent = fs.lstatSync(parent);
     if (

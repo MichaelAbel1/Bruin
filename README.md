@@ -98,7 +98,7 @@ React 渲染进程 → Electron 主进程 → JSON Lines 核心进程
 | 上下文       | 事件可完整追溯；接近窗口上限时压缩较早的对话并保存摘要；按模型配置的窗口限制输入大小 | UTF-8 字节预算是保守估算，仍无跨模型精确 tokenizer                                      |
 | 后台与 Cron  | Shell 后台任务；SQLite 保存五段 Cron 表达式和提示词，桌面运行时调度                  | 审批后缺少沙箱时可在宿主运行；重启不续跑；无人值守的审批会等待用户                      |
 | 工作树       | 创建、列出、移除 Bruin 管理的 Git worktree；子 Agent 可选工作树                      | 子 Agent 当前只读；不自动合并冲突                                                       |
-| MCP          | stdio 与 Streamable HTTP、逐次审批、能力列表审计                                     | 缺少沙箱时 stdio 进程可访问运行账户有权限的资源；交互式 OAuth 未实现                    |
+| MCP          | stdio 与 Streamable HTTP、逐次审批、能力列表审计                                     | 缺少沙箱时 stdio 进程可访问运行账户有权限的资源；OAuth 凭证仅在后台内存保存             |
 
 实现时参考了 `learn-claude-code` 各章节及其「深入 CC 源码」分析，按 Bruin 的桌面端和 SQLite 架构取舍：
 
@@ -110,7 +110,7 @@ React 渲染进程 → Electron 主进程 → JSON Lines 核心进程
 | s07 / s09 / s10 Skills、记忆、提示词 | Skill 元数据索引与按需加载、工作区记忆、动态提示词；Skill 索引限制在 8000 字符 | 记忆相关性模型筛选、Provider 级 prompt cache、forked Skill   |
 | s08 / s11 压缩与恢复                 | 工具结果预算、持久摘要、步数上限暂停续跑、未知副作用人工复核                   | 精确 token 预算、摘要无损保证、自动 fallback                 |
 | s13 / s14 后台与 Cron                | 后台 Shell、五段 Cron、SQLite 原子派发、每会话最多 50 个作业                   | 长期进程续跑、触发抖动、到期自动删除                         |
-| s18 / s19 Worktree 与 MCP            | Bruin 管理工作树；MCP stdio/HTTP、审批与能力审计                               | 工作树合并协议、MCP 交互式 OAuth 与动态工具池                |
+| s18 / s19 Worktree 与 MCP            | Bruin 管理工作树；MCP stdio/HTTP、审批与能力审计                               | 工作树合并协议、OAuth 凭证持久化与动态工具池                 |
 
 桌面「MCP 与自动化」页面配置 MCP、Hooks、Cron、任务图、工作区记忆、工作树与后台任务。Cron 调度和自动认领只在桌面进程运行时执行；运行中的时间点若进程退出，状态可能停在 `dispatched`，请检查会话事件后再处理。任务图认领由 SQLite 事务协调多个本机 Bruin 桌面进程；它不是跨机器分布式队列，也不会让多个 Agent 同时修改同一个会话。
 
@@ -137,4 +137,6 @@ npm test
 npm run desktop:dist -- --mac zip
 ```
 
-GitHub Actions 在 macOS、Linux、Windows 上运行检查和测试，并分别构建未签名的桌面包；macOS ZIP 另做完整性检查。Apple Developer ID 签名、公证、自动更新、Linux/Windows 桌面端到端验收、MCP OAuth、崩溃后 Docker 容器清理、精确 token 预算以及长期 Shell/子 Agent 自动续跑尚未完成。需要这些机制时应先完成目标平台验证，再用于无人值守或公开分发。
+GitHub Actions 在 macOS、Linux、Windows 上运行检查和测试，并分别构建未签名的桌面包；macOS ZIP 另做完整性检查。Apple Developer ID 签名、公证、自动更新、Linux/Windows 桌面端到端验收、OAuth 凭证持久化、崩溃后 Docker 容器清理、精确 token 预算以及长期 Shell/子 Agent 自动续跑尚未完成。需要这些机制时应先完成目标平台验证，再用于无人值守或公开分发。
+
+仓库符号索引、文件快照回滚与 MCP OAuth 登录现已提供；使用方式、范围和限制见 [功能说明](docs/REPOSITORY_RECOVERY_AUTH.md)。

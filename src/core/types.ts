@@ -2,6 +2,9 @@ export type ProviderKind = 'openai' | 'anthropic' | 'google' | 'openai-compatibl
 export type ToolName =
   | 'read_file'
   | 'list_files'
+  | 'search_repository'
+  | 'list_snapshots'
+  | 'restore_snapshot'
   | 'write_file'
   | 'edit_file'
   | 'search'

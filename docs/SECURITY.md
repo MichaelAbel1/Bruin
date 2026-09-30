@@ -74,3 +74,7 @@ Hook 是静态 Shell 命令，用户启用后按配置时机运行，不逐次�
 5. 对支持的操作系统、Provider、模型与故障注入场景完成端到端验收。
 
 这些是明确的当前边界；本项目已实现基础机制，但不应宣称达到了跨平台、对敌对代码安全的生产隔离等级。
+
+## 快照与 OAuth
+
+`search_repository`、`list_snapshots` 是只读工作区查询（会写入本机索引缓存）；`restore_snapshot` 必须审批，回滚新建文件会删除它，存在后续修改时拒绝回滚。快照含原始源码，保存在 BRUIN_HOME 的私有目录，不应提交到仓库。OAuth 凭证只保存在后台内存，state/PKCE/issuer 校验沿用 SDK 和本机回调保护；退出清除本机凭证，不代表撤销服务端授权。详见 [实现边界](REPOSITORY_RECOVERY_AUTH.md)。

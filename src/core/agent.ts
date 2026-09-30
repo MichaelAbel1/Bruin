@@ -184,6 +184,7 @@ function stepLimitReport(
         'create_task',
         'update_task',
         'save_memory',
+        'restore_snapshot',
       ].includes(String(event.payload.name)),
     )
     .map(
@@ -689,7 +690,15 @@ export class AgentRunner {
         }
         call.input = parsed.data as Record<string, unknown>;
         const policy =
-          this.readOnly && !['read_file', 'list_files', 'search', 'load_skill'].includes(call.name)
+          this.readOnly &&
+          ![
+            'read_file',
+            'list_files',
+            'search_repository',
+            'list_snapshots',
+            'search',
+            'load_skill',
+          ].includes(call.name)
             ? { decision: 'deny' as const, reason: '子 Agent 只能使用只读工具' }
             : planBlocks(call, planState(this.store.events(session.id)))
               ? { decision: 'deny' as const, reason: '规划模式等待用户批准计划' }
@@ -763,9 +772,17 @@ export class AgentRunner {
               }
             }
           } else if (
-            !['read_file', 'list_files', 'write_file', 'edit_file', 'search', 'shell'].includes(
-              call.name,
-            )
+            ![
+              'read_file',
+              'list_files',
+              'search_repository',
+              'list_snapshots',
+              'restore_snapshot',
+              'write_file',
+              'edit_file',
+              'search',
+              'shell',
+            ].includes(call.name)
           ) {
             result = this.services
               ? await this.services.execute(call, session, signal)

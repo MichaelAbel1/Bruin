@@ -33,6 +33,8 @@ export function planBlocks(call: ToolCall, state: PlanState): boolean {
     ![
       'read_file',
       'list_files',
+      'search_repository',
+      'list_snapshots',
       'search',
       'load_skill',
       'update_plan',

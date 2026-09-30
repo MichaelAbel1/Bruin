@@ -95,6 +95,20 @@ export class RuntimeServices {
     if (signal.aborted) throw new Error('已取消');
     const input = call.input;
     switch (call.name) {
+      case 'search_repository':
+      case 'list_snapshots':
+      case 'restore_snapshot':
+        return this.executor.execute(
+          {
+            requestId: randomUUID(),
+            name: call.name,
+            input: call.input,
+            workspace: session.workspace,
+            timeoutMs: 30_000,
+            maxOutputBytes: 100_000,
+          },
+          signal,
+        );
       case 'list_memory':
         return { output: JSON.stringify(this.store.listMemory(session.workspace)), isError: false };
       case 'remember_preference': {

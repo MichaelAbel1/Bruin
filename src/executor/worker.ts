@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
 import { listWorkspaceEntries } from '../core/workspace-files.js';
+import { recordSnapshot, listSnapshots, restoreSnapshot } from '../core/snapshots.js';
+import { searchRepository } from '../core/repository-index.js';
 
 let macSandboxAvailable: boolean | undefined;
 function isMacSandboxAvailable(): boolean {
@@ -250,6 +252,7 @@ function replaceFile(
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
+    recordSnapshot(root, file, content);
     checkedPath(root, file, true);
     const currentParent = fs.lstatSync(parent);
     if (
@@ -575,6 +578,53 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
   if (Buffer.byteLength(JSON.stringify(req.input)) > 1_000_000) throw new Error('工具输入过大');
   if (!fs.statSync(req.workspace).isDirectory()) throw new Error('工作区不是目录');
   switch (req.name) {
+    case 'search_repository': {
+      const result = searchRepository(
+        req.workspace,
+        String(req.input.query ?? ''),
+        integerOption(req.input.limit, 20, 1, 100),
+      );
+      while (Buffer.byteLength(JSON.stringify(result)) > req.maxOutputBytes) {
+        if (!result.results.length) throw new Error('输出预算过小，无法显示索引结果');
+        result.results.pop();
+        result.hasMore = true;
+      }
+      return {
+        output: JSON.stringify(result),
+        isError: false,
+        truncated: result.truncated || result.hasMore,
+      };
+    }
+    case 'list_snapshots': {
+      const offset = integerOption(req.input.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+      const limit = integerOption(req.input.limit, 20, 1, 100);
+      const all = listSnapshots(req.workspace);
+      const snapshots = all.slice(offset, offset + limit);
+      while (true) {
+        const more = offset + snapshots.length < all.length;
+        const output = JSON.stringify({
+          snapshots,
+          nextOffset: more ? offset + snapshots.length : null,
+        });
+        if (Buffer.byteLength(output) <= req.maxOutputBytes)
+          return { output, isError: false, truncated: more };
+        if (!snapshots.length) throw new Error('输出预算过小，无法显示快照');
+        snapshots.pop();
+        if (!snapshots.length) throw new Error('输出预算过小，无法显示快照');
+      }
+    }
+    case 'restore_snapshot':
+      return {
+        output: JSON.stringify(
+          restoreSnapshot(
+            req.workspace,
+            String(req.input.id ?? ''),
+            (file, bytes, mode, expected) =>
+              replaceFile(fs.realpathSync(req.workspace), file, bytes, mode, expected),
+          ),
+        ),
+        isError: false,
+      };
     case 'read_file': {
       const file = checkedPath(req.workspace, req.input.path);
       if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');

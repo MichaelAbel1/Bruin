@@ -28,6 +28,26 @@ export interface ModelGateway {
   ): Promise<ModelReply>;
 }
 export const toolSchemas = {
+  search_repository: {
+    description:
+      'Search a local file/symbol index. Revalidates content hashes; supports common declaration forms, not a full semantic graph. Returns source lines for paged reading.',
+    inputSchema: z.object({
+      query: z.string().max(500),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+  },
+  list_snapshots: {
+    description: 'List automatic snapshots of Bruin file changes in this workspace.',
+    inputSchema: z.object({
+      offset: z.number().int().min(0).optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+  },
+  restore_snapshot: {
+    description:
+      'Restore one file snapshot. Requires approval; rejects subsequent changes. Reverting a newly created file deletes it.',
+    inputSchema: z.object({ id: z.string().uuid() }),
+  },
   read_file: {
     description:
       'Read a UTF-8 workspace file. Optional startLine (1-based) and lineCount select a page; with either option, lineCount defaults to 200. Output is still byte-limited.',
@@ -271,12 +291,17 @@ export class AiSdkGateway implements ModelGateway {
             ? {
                 read_file: toolSchemas.read_file,
                 list_files: toolSchemas.list_files,
+                search_repository: toolSchemas.search_repository,
+                list_snapshots: toolSchemas.list_snapshots,
                 search: toolSchemas.search,
                 load_skill: toolSchemas.load_skill,
               }
             : {
                 read_file: toolSchemas.read_file,
                 list_files: toolSchemas.list_files,
+                search_repository: toolSchemas.search_repository,
+                list_snapshots: toolSchemas.list_snapshots,
+                restore_snapshot: toolSchemas.restore_snapshot,
                 write_file: toolSchemas.write_file,
                 edit_file: toolSchemas.edit_file,
                 search: toolSchemas.search,

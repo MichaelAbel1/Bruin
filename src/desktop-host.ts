@@ -336,7 +336,12 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         if (session.managedWorkspace && !fs.existsSync(session.workspace)) {
           store.materializeWorkspace(session.id);
         }
-        return writeWorkspaceFile(session.workspace, String(p.path ?? ''), String(p.content ?? ''));
+        return writeWorkspaceFile(
+          session.workspace,
+          String(p.path ?? ''),
+          String(p.content ?? ''),
+          typeof p.expectedContent === 'string' ? p.expectedContent : undefined,
+        );
       } finally {
         store.releaseLease(session.id, leaseOwner);
       }
@@ -596,7 +601,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'saveMcpServer': {
       if (active) throw new Error('请等待当前任务完成后再修改 MCP 服务器');
       const server = mcpServerSchema.parse(p);
-      await services.mcp.disconnect(server.name);
+      await services.mcp.logout(server.name);
       const config = updateConfig((current) => {
         current.mcpServers = current.mcpServers.filter((item) => item.name !== server.name);
         current.mcpServers.push(server);
@@ -607,7 +612,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'removeMcpServer': {
       if (active) throw new Error('请等待当前任务完成后再修改 MCP 服务器');
       const name = String(p.name ?? '');
-      await services.mcp.disconnect(name);
+      await services.mcp.logout(name);
       const config = updateConfig((current) => {
         current.mcpServers = current.mcpServers.filter((item) => item.name !== name);
         return current;
@@ -620,6 +625,24 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const workspace =
         server.transport === 'stdio' ? getSession(p.sessionId).workspace : undefined;
       return services.mcp.listTools(server, workspace);
+    }
+    case 'loginMcpServer': {
+      if (active) throw new Error('请等待当前任务完成后登录 MCP');
+      const server = loadConfig().mcpServers.find((item) => item.name === p.name);
+      if (!server) throw new Error('MCP 服务器未配置');
+      await services.mcp.login(server, async (url) => {
+        event('openOAuthBrowser', { url });
+      });
+      return { message: 'OAuth 登录成功（本次运行有效）' };
+    }
+    case 'logoutMcpServer': {
+      if (active) throw new Error('请等待当前任务完成后退出 MCP');
+      await services.mcp.logout(String(p.name ?? ''));
+      return { message: '已清除本机 OAuth 会话；未撤销服务端授权' };
+    }
+    case 'cancelMcpLogin': {
+      services.mcp.cancelLogin(String(p.name ?? ''));
+      return null;
     }
     case 'saveHook': {
       if (active) throw new Error('请等待当前任务完成后再修改 Hook');
@@ -647,6 +670,9 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const name = String(p.name ?? '') as ToolCall['name'];
       if (
         ![
+          'search_repository',
+          'list_snapshots',
+          'restore_snapshot',
           'create_worktree',
           'list_worktrees',
           'remove_worktree',
