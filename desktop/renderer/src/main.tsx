@@ -564,7 +564,9 @@ function FileEditorViewer({
 function sessionTitle(session: Session, events?: SessionEvent[]) {
   const user = events?.find((e) => e.type === 'user');
   const label = typeof user?.payload.text === 'string' ? user.payload.text : '';
-  return label ? label.slice(0, 36) : short(session.workspace);
+  if (label) return label.slice(0, 36);
+  if (session.managedWorkspace) return `新会话 (${short(session.workspace).slice(-8)})`;
+  return short(session.workspace);
 }
 function App() {
   const [config, setConfig] = useState<Config>({
@@ -660,12 +662,7 @@ function App() {
     try {
       setBusy(false);
       const alias = config.defaultProfile ?? config.profiles[0]?.alias ?? '';
-      const workspace =
-        customWorkspace !== undefined
-          ? customWorkspace
-          : view?.session.workspace && !view.session.managedWorkspace
-            ? view.session.workspace
-            : '';
+      const workspace = customWorkspace ?? '';
       const result = await api<SessionView>('createSession', { workspace, profileAlias: alias });
       setSessions((previous) => [result.session, ...previous]);
       viewRevision.current++;
@@ -1367,10 +1364,20 @@ function App() {
               >
                 <div className="conversation-intro">
                   <div className="project-monogram">
-                    {short(view.session.workspace).slice(0, 1).toUpperCase()}
+                    {view.session.managedWorkspace
+                      ? 'N'
+                      : short(view.session.workspace).slice(0, 1).toUpperCase()}
                   </div>
-                  <h1>{short(view.session.workspace)}</h1>
-                  <p>{view.session.workspace}</p>
+                  <h1>
+                    {view.session.managedWorkspace
+                      ? `新会话 (${short(view.session.workspace)})`
+                      : short(view.session.workspace)}
+                  </h1>
+                  <p>
+                    {view.session.managedWorkspace
+                      ? `${view.session.workspace}（待写入文件时真正创建）`
+                      : view.session.workspace}
+                  </p>
                   <span>
                     模型 {view.session.profile.alias} · 会话 {view.session.id.slice(0, 8)}
                   </span>
