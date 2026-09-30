@@ -484,6 +484,11 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
   let truncated = false;
   let matchesCount = 0;
   const appendMatch = (line: string): boolean => {
+    if (matchesCount >= 100) {
+      truncated = true;
+      return false;
+    }
+    matchesCount++;
     const buf = Buffer.from(line);
     const remaining = Math.max(0, req.maxOutputBytes - size);
     if (remaining) {
@@ -495,8 +500,7 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
       truncated = true;
       return false;
     }
-    matchesCount++;
-    return matchesCount < 100;
+    return true;
   };
   async function searchFile(fullPath: string, relPath: string): Promise<boolean> {
     try {
@@ -568,7 +572,9 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
   }
   await walk(root);
   return {
-    output: Buffer.concat(chunks).toString('utf8') + (truncated ? '\n[输出已截断]' : ''),
+    output:
+      new TextDecoder().decode(Buffer.concat(chunks), { stream: truncated }) +
+      (truncated ? '\n[输出已截断]' : ''),
     truncated,
     exitCode: matchesCount > 0 ? 0 : 1,
     isError: false,

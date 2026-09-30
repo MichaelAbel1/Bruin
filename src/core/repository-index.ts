@@ -20,7 +20,10 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
   try {
     if (fs.statSync(cacheFile).size < 10_000_000) {
       const value = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-      if (Array.isArray(value)) previous = value;
+      if (Array.isArray(value))
+        previous = value.filter(
+          (entry) => entry && typeof entry === 'object' && typeof entry.path === 'string',
+        );
     }
   } catch {
     /* Rebuild a missing or corrupt cache. */

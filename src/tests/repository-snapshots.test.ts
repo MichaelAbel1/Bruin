@@ -67,6 +67,23 @@ test('repository index detects same-size edits, deletions, new files and git ign
     await f.close();
   }
 });
+test('repository index rebuilds caches containing invalid entries', async () => {
+  const f = fixture();
+  try {
+    fs.writeFileSync(path.join(f.root, 'code.ts'), 'export function visible() {}');
+    searchRepository(f.root, 'visible');
+    const key = createHash('sha256').update(fs.realpathSync(f.root)).digest('hex');
+    const cache = path.join(f.dir, 'home', 'repository-index', `${key}.json`);
+    for (const invalid of [[null], [42, 'invalid'], [{ path: 'code.ts', symbols: null }]]) {
+      fs.writeFileSync(cache, JSON.stringify(invalid));
+      const result = await f.run('search_repository', { query: 'visible' });
+      assert.equal(result.isError, false, result.output);
+      assert.equal(JSON.parse(result.output).results[0].symbols[0].name, 'visible');
+    }
+  } finally {
+    await f.close();
+  }
+});
 test(
   'non-git repository index skips symlinks, binary files and excluded directories',
   { skip: process.platform === 'win32' },

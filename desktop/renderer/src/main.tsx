@@ -658,9 +658,11 @@ function App() {
       }>('readWorkspaceFile', { sessionId: view.session.id, path });
       setOpenFiles((current) => {
         const existing = current.find((item) => item.path === path);
+        // Keep the original save precondition while the editor has unsaved changes.
+        if (existing && existing.content !== existing.originalContent) return current;
         const openItem: OpenFile = {
           path: file.path,
-          content: existing ? existing.content : file.content,
+          content: file.content,
           originalContent: file.content,
           baselineContent: file.baselineContent ?? file.content,
           truncated: file.truncated,

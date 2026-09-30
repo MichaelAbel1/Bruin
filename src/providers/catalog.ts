@@ -74,6 +74,8 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
     } catch {
       throw new Error('模型列表不是有效 JSON');
     }
+    if (!result || typeof result !== 'object' || Array.isArray(result))
+      throw new Error('模型列表格式不受支持');
     const entries = profile.provider === 'google' ? result.models : result.data;
     if (!Array.isArray(entries)) throw new Error('模型列表格式不受支持');
     for (const item of entries) {
@@ -105,5 +107,5 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
   }
   const models = [...ids].sort((a, b) => a.localeCompare(b));
   modelCache.set(cacheKey, { until: Date.now() + 5 * 60_000, models });
-  return models;
+  return [...models];
 }

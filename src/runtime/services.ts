@@ -281,7 +281,9 @@ export class RuntimeServices {
           return { output: '工作区目录不存在', isError: true };
         }
         const name =
-          typeof input.name === 'string' && input.name ? input.name : randomUUID().slice(0, 8);
+          typeof input.name === 'string' && input.name
+            ? input.name
+            : `worktree-${randomUUID().slice(0, 8)}`;
         if (!/^[a-z][a-z0-9-]{0,39}$/.test(name))
           return {
             output: '工作树名称必须以字母开头，仅包含小写字母、数字和连字符',

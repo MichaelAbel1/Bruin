@@ -32,6 +32,43 @@ function fixture() {
   };
 }
 
+test('search fallback reports omitted matches and preserves complete UTF-8 output', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-search-fallback-'));
+  const oldPath = process.env.PATH;
+  process.env.PATH = dir;
+  const executor = new ProcessExecutor();
+  if (oldPath === undefined) delete process.env.PATH;
+  else process.env.PATH = oldPath;
+  let id = 0;
+  const search = (maxOutputBytes: number) =>
+    executor.execute({
+      requestId: String(++id),
+      name: 'search',
+      input: { pattern: '甲' },
+      workspace: dir,
+      timeoutMs: 5000,
+      maxOutputBytes,
+    });
+  try {
+    const file = path.join(dir, 'sample.txt');
+    fs.writeFileSync(file, '甲\n'.repeat(101));
+    const limited = await search(100_000);
+    assert.equal(limited.isError, false, limited.output);
+    assert.equal(limited.truncated, true);
+    assert.match(limited.output, /输出已截断/);
+    fs.writeFileSync(file, '甲');
+    const cut = await search(Buffer.byteLength('sample.txt:1:') + 1);
+    assert.equal(cut.isError, false, cut.output);
+    assert.equal(cut.truncated, true);
+    assert.equal(cut.output.includes('\uFFFD'), false);
+    fs.writeFileSync(file, '甲\n'.repeat(100));
+    assert.equal((await search(100_000)).truncated, false);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('read_file pages preserve line endings and can reach content after the old byte limit', async () => {
   const f = fixture();
   try {

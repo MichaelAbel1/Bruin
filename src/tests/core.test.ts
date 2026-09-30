@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -93,6 +93,15 @@ const profile: ModelProfile = {
   model: 'mock',
   baseUrl: 'http://localhost:9999/v1',
 };
+const testHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-core-home-'));
+const globalOldHome = process.env.BRUIN_HOME;
+process.env.BRUIN_HOME = testHomeDir;
+after(() => {
+  if (globalOldHome === undefined) delete process.env.BRUIN_HOME;
+  else process.env.BRUIN_HOME = globalOldHome;
+  fs.rmSync(testHomeDir, { recursive: true, force: true });
+});
+
 function temp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-test-'));
 }
@@ -1057,19 +1066,24 @@ test(
 
 test('local skill installs and loads on demand', () => {
   const dir = temp();
+  const oldHome = process.env.BRUIN_HOME;
   process.env.BRUIN_HOME = path.join(dir, 'home');
-  const skillDir = path.join(dir, 'sample');
-  fs.mkdirSync(skillDir);
-  fs.writeFileSync(
-    path.join(skillDir, 'SKILL.md'),
-    '---\nname: sample\ndescription: Sample workflow\n---\nDo the work.\n',
-  );
-  const info = installLocal(skillDir);
-  assert.equal(info.name, 'sample');
-  assert.ok(listSkills().some((skill) => skill.name === 'sample'));
-  assert.match(loadSkill('sample'), /Do the work/);
-  delete process.env.BRUIN_HOME;
-  fs.rmSync(dir, { recursive: true, force: true });
+  try {
+    const skillDir = path.join(dir, 'sample');
+    fs.mkdirSync(skillDir);
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: sample\ndescription: Sample workflow\n---\nDo the work.\n',
+    );
+    const info = installLocal(skillDir);
+    assert.equal(info.name, 'sample');
+    assert.ok(listSkills().some((skill) => skill.name === 'sample'));
+    assert.match(loadSkill('sample'), /Do the work/);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 test('agent persists request, approval and result before continuing', async () => {
   const dir = temp();

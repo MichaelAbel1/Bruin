@@ -71,7 +71,12 @@ export function readWorkspaceFile(
     if (!fs.fstatSync(fd).isFile()) throw new Error('只能浏览普通文件');
     const limit = previewBytes;
     const buffer = Buffer.alloc(limit + 1);
-    const size = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    let size = 0;
+    while (size < buffer.length) {
+      const read = fs.readSync(fd, buffer, size, buffer.length - size, size);
+      if (!read) break;
+      size += read;
+    }
     const bytes = buffer.subarray(0, Math.min(size, limit));
     if (bytes.includes(0)) throw new Error('二进制文件暂不支持预览');
     let content: string;
@@ -86,7 +91,7 @@ export function readWorkspaceFile(
     let baselineContent: string | undefined;
     try {
       const normRelative = path.relative(root, target).split(path.sep).join('/');
-      const gitShow = execFileSync('git', ['show', `HEAD:${normRelative}`], {
+      const gitShow = execFileSync('git', ['show', `HEAD:./${normRelative}`], {
         cwd: root,
         stdio: ['ignore', 'pipe', 'ignore'],
         encoding: 'utf8',

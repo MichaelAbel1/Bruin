@@ -77,9 +77,10 @@ function resolveExecutable(command: string, workspace: string): string {
   throw new Error(`MCP 启动命令不存在: ${command}`);
 }
 function sandboxProfile(workspace: string, _executable: string): string {
-  const root = fs.realpathSync(workspace).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+  const root = fs.realpathSync(workspace);
   if (!fs.statSync(root).isDirectory()) throw new Error('MCP 工作区不是目录');
-  return `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "/tmp"))`;
+  const escapedRoot = root.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+  return `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath "${escapedRoot}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "/tmp"))`;
 }
 
 /** Connections are owned by the host. No MCP process inherits model credentials by default. */

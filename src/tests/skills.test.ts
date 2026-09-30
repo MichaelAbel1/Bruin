@@ -37,6 +37,7 @@ test('bundled skills load on demand and can be disabled without uninstalling', (
 
 test('market snapshot validates paths and supports multiline descriptions', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-market-test-'));
+  const oldHome = process.env.BRUIN_HOME;
   process.env.BRUIN_HOME = path.join(dir, 'home');
   try {
     assert.throws(
@@ -61,7 +62,8 @@ test('market snapshot validates paths and supports multiline descriptions', () =
     setSkillEnabled('sample', true);
     assert.match(loadSkill('sample'), /Instructions/);
   } finally {
-    delete process.env.BRUIN_HOME;
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

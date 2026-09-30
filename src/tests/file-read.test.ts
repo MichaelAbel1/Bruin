@@ -9,6 +9,8 @@ import { readWorkspaceFile, writeWorkspaceFile } from '../core/workspace-files.j
 
 test('bounded UTF-8 reads preserve complete characters and reject malformed files', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-file-read-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
   const executor = new ProcessExecutor();
   const read = (name: string, max: number) =>
     executor.execute({
@@ -49,6 +51,8 @@ test('bounded UTF-8 reads preserve complete characters and reject malformed file
     assert.equal((await read('partial.txt', 100)).isError, true);
   } finally {
     await executor.close();
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -84,6 +88,60 @@ test('desktop text previews reject invalid UTF-8 and omit partial boundary chara
     assert.equal(preview.content, 'x'.repeat(255_999));
     fs.writeFileSync(target, Buffer.from([0x61, 0xff]));
     assert.throws(() => readWorkspaceFile(dir, 'sample.txt'), /有效的 UTF-8/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('desktop previews continue after short reads and still detect truncation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-preview-short-read-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'small.txt'), '甲🙂乙');
+    fs.writeFileSync(path.join(dir, 'large.txt'), 'x'.repeat(256_001));
+    const module = new URL('../core/workspace-files.js', import.meta.url).href;
+    const script = `
+      import fs from 'node:fs';
+      import assert from 'node:assert/strict';
+      const { readWorkspaceFile } = await import(${JSON.stringify(module)});
+      const read = fs.readSync;
+      fs.readSync = (fd, buffer, offset, length, position) => read(fd, buffer, offset, Math.min(2, length), position);
+      const small = readWorkspaceFile(${JSON.stringify(dir)}, 'small.txt');
+      assert.equal(small.content, '甲🙂乙');
+      assert.equal(small.truncated, false);
+      const large = readWorkspaceFile(${JSON.stringify(dir)}, 'large.txt');
+      assert.equal(large.content.length, 256_000);
+      assert.equal(large.truncated, true);
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 10_000 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('desktop git baselines resolve from a workspace inside the repository', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-preview-git-'));
+  const workspace = path.join(dir, 'nested');
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+  try {
+    git('init');
+    git('config', 'user.name', 'test');
+    git('config', 'user.email', 'test@example.com');
+    fs.mkdirSync(workspace);
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'root baseline');
+    fs.writeFileSync(path.join(workspace, 'sample.txt'), 'nested baseline');
+    git('add', '.');
+    git('commit', '-m', 'initial');
+    fs.writeFileSync(path.join(workspace, 'sample.txt'), 'edited nested file');
+    const preview = readWorkspaceFile(workspace, 'sample.txt');
+    assert.equal(preview.content, 'edited nested file');
+    assert.equal(preview.baselineContent, 'nested baseline');
+    assert.equal(readWorkspaceFile(dir, 'nested/sample.txt').baselineContent, 'nested baseline');
+    assert.equal(
+      readWorkspaceFile(workspace, '../nested/sample.txt').baselineContent,
+      'nested baseline',
+    );
+    fs.writeFileSync(path.join(workspace, 'untracked.txt'), 'new');
+    assert.equal(readWorkspaceFile(workspace, 'untracked.txt').baselineContent, undefined);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

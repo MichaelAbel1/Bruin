@@ -4,6 +4,29 @@ import http from 'node:http';
 import { discoverModels } from '../providers/catalog.js';
 import { setRuntimeApiKey } from '../config.js';
 
+test('model discovery protects its cache from caller mutations and rejects invalid JSON shapes', async (t) => {
+  let body = JSON.stringify({ data: [{ id: 'first' }, { id: 'second' }] });
+  let requests = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    requests++;
+    return new Response(body);
+  });
+  const profile = {
+    alias: 'cache-isolation-test',
+    provider: 'openai-compatible' as const,
+    model: 'first',
+    baseUrl: 'http://127.0.0.1/cache-isolation-test',
+  };
+  const models = await discoverModels(profile, true);
+  models.splice(0, models.length, 'caller-change');
+  assert.deepEqual(await discoverModels(profile), ['first', 'second']);
+  assert.equal(requests, 1);
+  for (const value of [null, 42, [], 'invalid']) {
+    body = JSON.stringify(value);
+    await assert.rejects(discoverModels(profile, true), /模型列表格式不受支持/);
+  }
+});
+
 test('discovers other models from a configured OpenAI-compatible API', async () => {
   const paths: string[] = [];
   const auth: string[] = [];

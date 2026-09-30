@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import { SqliteEventStore } from '../storage/event-store.js';
 import { AgentRunner } from '../core/agent.js';
 import { RuntimeServices } from '../runtime/services.js';
@@ -44,6 +46,54 @@ function fixture() {
     },
   };
 }
+
+test('worktree creation generates a valid default name even when the UUID starts with a digit', async (t) => {
+  const f = fixture();
+  const executor: ToolExecutor = {
+    async execute() {
+      throw new Error('unused');
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: f.dir });
+    execFileSync(
+      'git',
+      [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '--allow-empty',
+        '-qm',
+        'initial',
+      ],
+      { cwd: f.dir },
+    );
+    const uuid = t.mock.method(crypto, 'randomUUID', () => '01234567-89ab-4def-8123-456789abcdef');
+    syncBuiltinESMExports();
+    try {
+      const result = await services.execute(
+        { id: 'default-worktree', name: 'create_worktree', input: {} },
+        f.session,
+        new AbortController().signal,
+      );
+      assert.equal(result.isError, false, result.output);
+      assert.match(path.basename(result.output), /^[a-z][a-z0-9-]{0,39}$/);
+      assert.equal(fs.existsSync(path.join(result.output, '.git')), true);
+    } finally {
+      uuid.mock.restore();
+      syncBuiltinESMExports();
+    }
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
 
 test('paused subagent is reported as incomplete and its error survives host recreation', async () => {
   const f = fixture();
@@ -387,8 +437,10 @@ test('worktree, hooks, background task and read-only subagent use durable events
   }
 });
 
-test('MCP stdio client lists and invokes a configured tool without inheriting secrets', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-mcp-'));
+test('MCP stdio client supports special workspace paths without inheriting secrets', async () => {
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), process.platform === 'win32' ? 'bruin-mcp-' : 'bruin-mcp-"\\-'),
+  );
   const script = path.join(dir, 'server.cjs');
   const launches = path.join(dir, 'launches.txt');
   fs.writeFileSync(
