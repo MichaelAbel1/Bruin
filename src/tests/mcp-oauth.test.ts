@@ -121,6 +121,18 @@ test('MCP OAuth performs discovery, PKCE, state validation, token exchange and r
         challenge = url.searchParams.get('code_challenge')!;
         assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
         const callback = new URL(url.searchParams.get('redirect_uri')!);
+        const malformedStatus = await new Promise<number | undefined>((resolve, reject) => {
+          const request = http.request(
+            { hostname: callback.hostname, port: callback.port, path: 'http://[' },
+            (response) => {
+              response.resume();
+              response.on('end', () => resolve(response.statusCode));
+            },
+          );
+          request.on('error', reject);
+          request.end();
+        });
+        assert.equal(malformedStatus, 400);
         callback.searchParams.set('code', 'test-code');
         callback.searchParams.set('state', '中'.repeat(64));
         assert.equal((await fetch(callback)).status, 400);

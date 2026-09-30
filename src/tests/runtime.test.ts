@@ -47,6 +47,46 @@ function fixture() {
   };
 }
 
+test('task heartbeat survives storage errors, retries and stops after lost ownership', async (t) => {
+  const f = fixture();
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const services = new RuntimeServices(
+    f.store,
+    {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    },
+    async () => {},
+  );
+  try {
+    f.store.createTask(f.session.id, 'heartbeat task', []);
+    const task = services.claimReadyTask(f.session)!;
+    assert.ok(task);
+    const renew = t.mock.method(f.store, 'renewTask');
+    renew.mock.mockImplementationOnce(() => {
+      throw new Error('SQLITE_BUSY');
+    });
+    const stderr = t.mock.method(process.stderr, 'write', () => true);
+    t.mock.timers.tick(60_000);
+    assert.equal(renew.mock.callCount(), 1);
+    assert.match(String(stderr.mock.calls[0].arguments[0]), /renewal failed/);
+    t.mock.timers.tick(60_000);
+    assert.equal(renew.mock.callCount(), 2);
+    assert.equal(f.store.listTasks(f.session.id)[0].status, 'running');
+    renew.mock.mockImplementation(() => false);
+    t.mock.timers.tick(60_000);
+    t.mock.timers.tick(60_000);
+    assert.equal(renew.mock.callCount(), 3);
+    services.finishClaimIfOpen(task.id);
+    assert.equal(f.store.listTasks(f.session.id)[0].status, 'running');
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
+
 test('worktree creation generates a valid default name even when the UUID starts with a digit', async (t) => {
   const f = fixture();
   const executor: ToolExecutor = {
@@ -94,6 +134,72 @@ test('worktree creation generates a valid default name even when the UUID starts
     f.close();
   }
 });
+
+for (const outcome of ['completed', 'failed', 'cancelled', 'synchronous-error'] as const) {
+  test(`subagent session is leased until ${outcome} and rejects concurrent deletion or execution`, async () => {
+    const f = fixture();
+    let finish!: () => void;
+    const services = new RuntimeServices(
+      f.store,
+      {
+        async execute() {
+          throw new Error('unused');
+        },
+        async close() {},
+      },
+      (child, _prompt, signal) => {
+        assert.equal(f.store.isLeased(child.id), true);
+        if (outcome === 'synchronous-error') throw new Error('sync failure');
+        return new Promise<void>((resolve, reject) => {
+          finish = () => {
+            if (outcome === 'failed') reject(new Error('child failed'));
+            else {
+              f.store.append(child.id, 'turn_completed', {});
+              resolve();
+            }
+          };
+          signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+        });
+      },
+    );
+    try {
+      const result = await services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+        f.session,
+        new AbortController().signal,
+      );
+      const id = result.output.split(': ')[1];
+      // The callback may fail synchronously, but settlement is still asynchronous.
+      if (outcome !== 'synchronous-error') {
+        assert.equal(f.store.isLeased(id), true);
+        assert.equal(f.store.isLeased(f.session.id), true);
+        assert.throws(() => f.store.deleteSession(f.session.id), /运行中的会话/);
+        assert.throws(() => f.store.acquireLease(id, 'other-process', 30_000), /另一个进程/);
+        assert.throws(() => f.store.deleteSession(id), /运行中的会话/);
+      }
+      if (outcome === 'cancelled') await services.close();
+      else {
+        if (outcome !== 'synchronous-error') finish();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      assert.equal(f.store.isLeased(id), false);
+      assert.equal(f.store.isLeased(f.session.id), false);
+      const status = await services.execute(
+        { id: 'status', name: 'subagent_status', input: { id } },
+        f.session,
+        new AbortController().signal,
+      );
+      assert.equal(
+        JSON.parse(status.output).status,
+        outcome === 'completed' ? 'completed' : 'failed',
+      );
+      f.store.deleteSession(id);
+    } finally {
+      await services.close();
+      f.close();
+    }
+  });
+}
 
 test('paused subagent is reported as incomplete and its error survives host recreation', async () => {
   const f = fixture();
@@ -688,6 +794,114 @@ test('services.close() releases claimed tasks back to pending state', async () =
     assert.equal(f.store.getTask(f.session.id, task.id)?.status, 'pending');
     assert.equal(f.store.getTask(f.session.id, task.id)?.owner, undefined);
   } finally {
+    f.close();
+  }
+});
+
+test('background settlement does not emit an unhandled rejection when event persistence fails', async (t) => {
+  const f = fixture();
+  let finish!: (result: ToolResult) => void;
+  const services = new RuntimeServices(
+    f.store,
+    {
+      execute: () =>
+        new Promise<ToolResult>((resolve) => {
+          finish = resolve;
+        }),
+      async close() {},
+    },
+    async () => {},
+  );
+  try {
+    const result = await services.execute(
+      { id: 'background', name: 'start_background', input: { command: 'pwd' } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(result.isError, false);
+    assert.throws(() => f.store.deleteSession(f.session.id), /运行中的会话/);
+    const append = f.store.append.bind(f.store);
+    t.mock.method(
+      f.store,
+      'append',
+      (...[id, type, payload]: Parameters<SqliteEventStore['append']>) => {
+        if (type === 'background_finished') throw new Error('simulated storage failure');
+        return append(id, type, payload);
+      },
+    );
+    finish({ output: 'done', isError: false });
+    await services.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(f.store.isLeased(f.session.id), false);
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
+
+test('foreground can resume while background work retains the parent lease across processes', async () => {
+  const f = fixture();
+  const other = new SqliteEventStore(path.join(f.dir, 'home', 'db.sqlite'));
+  const completions: Array<() => void> = [];
+  let finishChild!: () => void;
+  const services = new RuntimeServices(
+    f.store,
+    {
+      execute: (_request, signal) =>
+        new Promise<ToolResult>((resolve, reject) => {
+          completions.push(() => resolve({ output: 'done', isError: false }));
+          signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+        }),
+      async close() {},
+    },
+    (child, _prompt, signal) =>
+      new Promise<void>((resolve, reject) => {
+        finishChild = () => {
+          f.store.append(child.id, 'turn_completed', {});
+          resolve();
+        };
+        signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+      }),
+  );
+  const foreground = services.sessionLeases.retain(f.session.id, new AbortController());
+  let resumed: ReturnType<RuntimeServices['sessionLeases']['retain']> | undefined;
+  const run = (name: ToolCall['name'], input: Record<string, unknown>) =>
+    services.execute({ id: name, name, input }, f.session, new AbortController().signal);
+  try {
+    await run('start_background', { command: 'first' });
+    const second = await run('start_background', { command: 'second' });
+    const child = await run('spawn_subagent', { prompt: 'inspect' });
+    foreground.release();
+    assert.throws(() => other.deleteSession(f.session.id), /运行中的会话/);
+    assert.throws(() => other.acquireLease(f.session.id, 'other', 30_000), /另一个进程/);
+    resumed = services.sessionLeases.retain(f.session.id, new AbortController());
+    assert.equal(resumed.owner, foreground.owner);
+    completions[0]();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(other.isLeased(f.session.id), true);
+    await run('cancel_background', { id: second.output.split(': ')[1] });
+    finishChild();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(other.isLeased(child.output.split(': ')[1]), false);
+    assert.equal(other.isLeased(f.session.id), true);
+    resumed.release();
+    assert.equal(other.isLeased(f.session.id), false);
+    const events = f.store.events(f.session.id);
+    assert.equal(events.filter((event) => event.type === 'background_finished').length, 2);
+    assert.equal(events.filter((event) => event.type === 'subagent_finished').length, 1);
+    assert.equal(
+      events.find(
+        (event) =>
+          event.type === 'background_finished' && event.payload.id === second.output.split(': ')[1],
+      )?.payload.status,
+      'cancelled',
+    );
+    other.deleteSession(f.session.id);
+  } finally {
+    foreground.release();
+    resumed?.release();
+    await services.close();
+    other.close();
     f.close();
   }
 });

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { z } from 'zod';
 import { dataDir } from '../config.js';
 
 export interface AttachmentRef {
@@ -20,6 +21,47 @@ const imageTypes: Record<string, string> = {
   '.webp': 'image/webp',
   '.gif': 'image/gif',
 };
+const metadataSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(1000),
+  kind: z.enum(['image', 'document', 'file']),
+  note: z.string().max(1000).optional(),
+  text: z.string().max(60_000),
+  mimeType: z.string(),
+});
+function readMetadata(root: string, id: string) {
+  const fd = fs.openSync(
+    path.join(root, `${id}.json`),
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+  );
+  try {
+    const stat = fs.fstatSync(fd);
+    const limit = 1_000_000;
+    if (!stat.isFile() || stat.size > limit) throw new Error('附件元数据文件无效或过大');
+    const buffer = Buffer.alloc(limit + 1);
+    let count = 0;
+    while (count < buffer.length) {
+      const read = fs.readSync(fd, buffer, count, buffer.length - count, count);
+      if (!read) break;
+      count += read;
+    }
+    if (count > limit) throw new Error('附件元数据超过大小上限');
+    const metadata = metadataSchema.parse(
+      JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, count))),
+    );
+    const expectedMime =
+      metadata.kind === 'image'
+        ? imageTypes[path.extname(metadata.name).toLowerCase()]
+        : 'application/octet-stream';
+    if (metadata.id !== id || !expectedMime || metadata.mimeType !== expectedMime)
+      throw new Error('附件元数据与附件不匹配');
+    return metadata;
+  } catch {
+    throw new Error('附件元数据无效、过大或不可读取');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 function xmlText(value: string): string {
   return value
     .replace(/<\/w:p>|<\/row>/g, '\n')
@@ -201,9 +243,7 @@ export function loadAttachment(
 ): { ref: AttachmentRef; text: string; image?: { data: Buffer; mimeType: string } } {
   if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('无效附件 ID');
   const root = attachmentDir(sessionId);
-  const metadata = JSON.parse(
-    fs.readFileSync(path.join(root, `${id}.json`), 'utf8'),
-  ) as AttachmentRef & { text: string; mimeType: string };
+  const metadata = readMetadata(root, id);
   const ref: AttachmentRef = {
     id,
     name: metadata.name,

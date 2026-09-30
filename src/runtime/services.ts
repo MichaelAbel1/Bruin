@@ -10,6 +10,7 @@ import type { Session, ToolCall, ToolResult } from '../core/types.js';
 import { dataDir, loadConfig, type HookConfig } from '../config.js';
 import { McpManager } from './mcp.js';
 import { planState, setPlanProgress } from './plan.js';
+import { SessionLeases } from '../core/session-leases.js';
 
 const execFileAsync = promisify(execFile);
 type Background = {
@@ -27,6 +28,7 @@ type Subagent = {
 
 export class RuntimeServices {
   readonly mcp = new McpManager();
+  readonly sessionLeases: SessionLeases;
   private readonly taskOwner = randomUUID();
   private readonly claimedTasks = new Set<string>();
   private readonly taskHeartbeat: ReturnType<typeof setInterval>;
@@ -38,9 +40,16 @@ export class RuntimeServices {
     private executor: ToolExecutor,
     private runSubagent: (session: Session, prompt: string, signal: AbortSignal) => Promise<void>,
   ) {
+    this.sessionLeases = new SessionLeases(store);
     this.taskHeartbeat = setInterval(() => {
-      for (const id of this.claimedTasks)
-        if (!this.store.renewTask(id, this.taskOwner, 3_600_000)) this.claimedTasks.delete(id);
+      for (const id of this.claimedTasks) {
+        try {
+          if (!this.store.renewTask(id, this.taskOwner, 3_600_000)) this.claimedTasks.delete(id);
+        } catch {
+          // Keep the claim for a retry; the store still rejects expired ownership.
+          process.stderr.write('Bruin task lease renewal failed; retrying on next heartbeat\n');
+        }
+      }
     }, 60_000);
     this.taskHeartbeat.unref();
   }
@@ -371,11 +380,29 @@ export class RuntimeServices {
           if (!workspace.startsWith(parentReal + path.sep))
             return { output: '子 Agent 只能使用 Bruin 创建的工作树', isError: true };
         }
-        const child = this.store.createSession(workspace, session.profile);
         const controller = new AbortController();
+        const parentLease = this.sessionLeases.retain(session.id, controller);
+        let child: Session;
+        let childLease: ReturnType<SessionLeases['retain']> | undefined;
+        try {
+          child = this.store.createSession(workspace, session.profile);
+          childLease = this.sessionLeases.retain(child.id, controller);
+          this.store.append(session.id, 'subagent_started', {
+            childId: child.id,
+            prompt,
+            workspace,
+          });
+        } catch (error) {
+          try {
+            childLease?.release();
+          } finally {
+            parentLease.release();
+          }
+          throw error;
+        }
         this.subagents.set(child.id, { sessionId: child.id, controller, status: 'running' });
-        this.store.append(session.id, 'subagent_started', { childId: child.id, prompt, workspace });
-        const running = this.runSubagent(child, prompt, controller.signal)
+        const running = Promise.resolve()
+          .then(() => this.runSubagent(child, prompt, controller.signal))
           .then(() => {
             const terminal = [...this.store.events(child.id)]
               .reverse()
@@ -401,9 +428,19 @@ export class RuntimeServices {
               status: 'failed',
               error: message,
             });
+          })
+          .finally(() => {
+            try {
+              childLease!.release();
+            } finally {
+              parentLease.release();
+            }
           });
         this.pending.add(running);
-        void running.finally(() => this.pending.delete(running));
+        void running.then(
+          () => this.pending.delete(running),
+          () => this.pending.delete(running),
+        );
         return { output: `子 Agent 已启动: ${child.id}`, isError: false };
       }
       case 'subagent_status': {
@@ -446,19 +483,27 @@ export class RuntimeServices {
         }
         const id = randomUUID();
         const controller = new AbortController();
+        const lease = this.sessionLeases.retain(session.id, controller);
+        try {
+          this.store.append(session.id, 'background_started', { id, command });
+        } catch (error) {
+          lease.release();
+          throw error;
+        }
         this.background.set(id, { sessionId: session.id, controller, status: 'running' });
-        this.store.append(session.id, 'background_started', { id, command });
-        const running = this.executor
-          .execute(
-            {
-              requestId: id,
-              name: 'shell',
-              input: { command },
-              workspace: session.workspace,
-              timeoutMs: 600_000,
-              maxOutputBytes: 100_000,
-            },
-            controller.signal,
+        const running = Promise.resolve()
+          .then(() =>
+            this.executor.execute(
+              {
+                requestId: id,
+                name: 'shell',
+                input: { command },
+                workspace: session.workspace,
+                timeoutMs: 600_000,
+                maxOutputBytes: 100_000,
+              },
+              controller.signal,
+            ),
           )
           .then((result) => {
             const task = this.background.get(id);
@@ -481,9 +526,13 @@ export class RuntimeServices {
               status: task?.status ?? 'failed',
               error: error instanceof Error ? error.message : String(error),
             });
-          });
+          })
+          .finally(() => lease.release());
         this.pending.add(running);
-        void running.finally(() => this.pending.delete(running));
+        void running.then(
+          () => this.pending.delete(running),
+          () => this.pending.delete(running),
+        );
         return { output: `后台任务已启动: ${id}`, isError: false };
       }
       case 'background_status':

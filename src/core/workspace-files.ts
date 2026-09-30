@@ -96,6 +96,7 @@ export function readWorkspaceFile(
         stdio: ['ignore', 'pipe', 'ignore'],
         encoding: 'utf8',
         maxBuffer: limit + 1024,
+        timeout: 5000,
       });
       baselineContent = gitShow;
     } catch {

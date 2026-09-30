@@ -16,3 +16,4 @@ dist/
 desktop/build/
 desktop/release*/
 desktop/assets/icon-*.png
+.DS_Store

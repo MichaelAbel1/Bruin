@@ -29,6 +29,8 @@ Agent 后台进程掌握模型密钥、权限判断和事件事务；工具子�
 
 批准与执行分成不同事件，方便审计。事件记录包含工具输入与输出，因此会话数据库可能含源代码、用户输入和模型输出，应视为敏感数据。`providerMessages` 用于同一模型配置下保留供应商所需的响应细节；跨模型切换时使用通用消息重建。模型不会从供应商侧“恢复远程会话”，而是从本地事件构造请求。
 
+`SessionLeases` 复用 `EventStore` 的 acquire/renew/release 操作。同一进程中，一个会话的前台与后台工作持有同一 SQLite 所有者；各项工作独立释放引用，最后一项结算才停止心跳并释放存储租约。子 Agent 同时持有父会话和独立子会话租约。每次新增工作都重新验证 SQLite 所有权；续期异常或发现所有权丢失时，向全部持有者发送取消信号。CLI 的审批、恢复确认和输入等待也接收该取消信号。
+
 ## 桌面编排时序
 
 桌面扩展经 `RuntimeServices` 执行，继续使用 `tool_requested`、`tool_approved`、`tool_started`、`tool_finished` / `tool_unknown` 链；MCP 及编排工具不进入文件工具子进程。后台 Shell 和 Hook 仍经 `ProcessExecutor` 的受限 Shell 路径执行。规划的 `plan_mode`、`plan_updated`、`plan_approved`、`plan_progress` 事件可从日志重建；子 Agent 和后台任务另有开始、结束事件。详见 [桌面 Agent 扩展能力](RUNTIME_CAPABILITIES.md)。
@@ -44,7 +46,7 @@ Agent 后台进程掌握模型密钥、权限判断和事件事务；工具子�
 - `sessions(id, workspace, profile_json, created_at, updated_at)` 保存会话属性。
 - `events(session_id, seq, type, at, payload_json)` 保存有序事件，主键为 `(session_id, seq)`。
 - 追加事件使用 SQLite 事务分配序号并更新会话时间；`journal_mode=WAL`、`synchronous=FULL`、外键约束与忙等待已启用。
-- `PRAGMA user_version=1` 标识当前 schema 版本；遇到未来版本会拒绝打开。当前没有正式迁移器，部署升级前应先备份并制定迁移脚本。
+- `PRAGMA user_version=8` 标识当前 schema 版本；遇到未来版本会拒绝打开。`SqliteEventStore` 构造阶段执行已有版本的升级分支，包含工作区任务迁移及托管工作区字段；当前没有独立迁移工具，部署升级前应先备份并验证升级路径。
 
 SQLite 适合单机 CLI：零外部服务、事件与会话同库事务、容易备份。单机写入仍需注意 WAL、SHM 文件与数据库文件整体备份；建议使用 SQLite backup API 或暂停客户端后复制完整数据库相关文件。恢复时不要只复制运行中的 `.sqlite` 主文件。
 

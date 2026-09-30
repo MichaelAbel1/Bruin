@@ -257,6 +257,7 @@ async function main(): Promise<void> {
           return '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。';
         const answer = await rl.question(
           `\n批准 ${call.name} ${JSON.stringify(call.input)}? ${reason} [y/N] `,
+          { signal: controller.signal },
         );
         return /^y(es)?$/i.test(answer.trim());
       },
@@ -288,17 +289,11 @@ async function main(): Promise<void> {
           }
         : { unattended: effectiveUnattended };
     const controller = new AbortController();
-    const leaseOwner = randomUUID();
     const leaseSessionId = session.id;
-    let heartbeat: ReturnType<typeof setInterval> | undefined;
-    let leaseAcquired = false;
+    let lease: ReturnType<RuntimeServices['sessionLeases']['retain']> | undefined;
     process.once('SIGINT', () => controller.abort());
     try {
-      store.acquireLease(leaseSessionId, leaseOwner, 30_000);
-      leaseAcquired = true;
-      heartbeat = setInterval(() => {
-        if (!store.renewLease(leaseSessionId, leaseOwner, 30_000)) controller.abort();
-      }, 10_000);
+      lease = services.sessionLeases.retain(leaseSessionId, controller);
       const unknown = resume ? runner.recover(session) : 0;
       if (unknown) {
         if (effectiveUnattended) {
@@ -308,6 +303,7 @@ async function main(): Promise<void> {
         }
         const answer = await rl.question(
           `发现 ${unknown} 个结果未知的工具调用。请检查工作区后继续。[y/N] `,
+          { signal: controller.signal },
         );
         if (!/^y(es)?$/i.test(answer.trim())) return;
       }
@@ -339,7 +335,8 @@ async function main(): Promise<void> {
       if (effectiveUnattended && store.events(session.id).at(-1)?.type === 'turn_paused')
         process.exitCode = 2;
       while (!effectiveUnattended && !controller.signal.aborted) {
-        const line = await rl.question('\n你> ');
+        const line = await rl.question('\n你> ', { signal: controller.signal });
+        if (controller.signal.aborted) throw new Error('已取消');
         if (line.trim() === '/exit') break;
         if (line.trim() === '/continue' || !line.trim()) {
           if (store.events(session.id).at(-1)?.type === 'turn_paused') {
@@ -360,7 +357,7 @@ async function main(): Promise<void> {
           continue;
         }
         if (line.startsWith('/model ')) {
-          store.setProfile(session.id, findProfile(line.slice(7).trim()), leaseOwner);
+          store.setProfile(session.id, findProfile(line.slice(7).trim()), lease.owner);
           session = store.getSession(session.id)!;
           console.log(`模型已切换为 ${session.profile.alias}`);
           continue;
@@ -374,11 +371,13 @@ async function main(): Promise<void> {
         stdout.write('\n');
       }
     } finally {
-      if (heartbeat) clearInterval(heartbeat);
-      if (leaseAcquired) store.releaseLease(leaseSessionId, leaseOwner);
-      await services.close();
-      await executor.close();
-      rl.close();
+      try {
+        lease?.release();
+      } finally {
+        await services.close();
+        await executor.close();
+        rl.close();
+      }
     }
   } finally {
     store.close();

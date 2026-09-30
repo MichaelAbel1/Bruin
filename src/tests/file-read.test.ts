@@ -7,6 +7,29 @@ import { execFileSync } from 'node:child_process';
 import { ProcessExecutor } from '../executor/client.js';
 import { readWorkspaceFile, writeWorkspaceFile } from '../core/workspace-files.js';
 
+test(
+  'desktop preview remains readable when Git hangs',
+  { skip: process.platform === 'win32' },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-git-timeout-'));
+    const oldPath = process.env.PATH;
+    try {
+      fs.writeFileSync(path.join(dir, 'git'), '#!/bin/sh\nexec /bin/sleep 20\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(dir, 'sample.txt'), 'working copy');
+      process.env.PATH = dir;
+      const started = Date.now();
+      const preview = readWorkspaceFile(dir, 'sample.txt');
+      assert.equal(preview.content, 'working copy');
+      assert.equal(preview.baselineContent, undefined);
+      assert.ok(Date.now() - started < 10_000, 'Git must not block until its natural exit');
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
 test('bounded UTF-8 reads preserve complete characters and reject malformed files', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-file-read-'));
   const oldHome = process.env.BRUIN_HOME;

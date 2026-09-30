@@ -97,7 +97,14 @@ export class McpOAuthSession implements OAuthClientProvider {
     void callback.catch(() => {});
     let consumed = false;
     const server = http.createServer((req, res) => {
-      const url = new URL(req.url ?? '/', this.redirectUrl);
+      let url: URL;
+      try {
+        url = new URL(req.url ?? '/', this.redirectUrl);
+      } catch {
+        res.writeHead(400);
+        res.end('Invalid OAuth callback');
+        return;
+      }
       const state = url.searchParams.get('state') ?? '';
       const valid =
         /^[a-f0-9]{64}$/.test(state) &&

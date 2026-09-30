@@ -226,19 +226,14 @@ async function startRun(
 ): Promise<{ started: boolean }> {
   if (active) throw new Error('已有任务正在运行');
   if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认继续');
-  const owner = randomUUID();
-  store.acquireLease(session.id, owner, 30_000);
+  const controller = new AbortController();
+  const lease = services.sessionLeases.retain(session.id, controller);
   try {
     store.append(session.id, 'run_configured', runSettings);
   } catch (error) {
-    store.releaseLease(session.id, owner);
+    lease.release();
     throw error;
   }
-  const controller = new AbortController();
-  const heartbeat = setInterval(() => {
-    if (!store.renewLease(session.id, owner, 30_000)) controller.abort();
-  }, 10_000);
-  heartbeat.unref();
   active = {
     sessionId: session.id,
     controller,
@@ -268,12 +263,17 @@ async function startRun(
       }),
     )
     .finally(() => {
-      clearInterval(heartbeat);
-      store.releaseLease(session.id, owner);
-      active = undefined;
-      activeRun = undefined;
-      for (const pending of approvals.values()) pending.resolve(false);
-      approvals.clear();
+      try {
+        lease.release();
+      } finally {
+        active = undefined;
+        activeRun = undefined;
+        for (const pending of approvals.values()) pending.resolve(false);
+        approvals.clear();
+      }
+    })
+    .catch(() => {
+      event('runFailed', { sessionId: session.id, message: '运行收尾失败，请检查数据库状态' });
     });
   return { started: true };
 }

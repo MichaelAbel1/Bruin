@@ -146,6 +146,10 @@ test(
       fs.unlinkSync(image);
       execFileSync('mkfifo', [image]);
       assert.throws(() => loadAttachment(${JSON.stringify(session)}, ref.id), /不是普通文件/);
+      const metadata = image + '.json';
+      fs.unlinkSync(metadata);
+      execFileSync('mkfifo', [metadata]);
+      assert.throws(() => loadAttachment(${JSON.stringify(session)}, ref.id), /元数据/);
       const open = fs.openSync;
       let replaced = false;
       fs.openSync = (...args) => {
@@ -165,3 +169,35 @@ test(
     }
   },
 );
+
+test('attachment metadata rejects oversized, invalid and mismatched records', () => {
+  const f = fixture();
+  try {
+    const file = path.join(f.dir, 'source.txt');
+    fs.writeFileSync(file, 'hello');
+    const [ref] = importAttachments(session, [file]);
+    const metadataFile = path.join(f.root, `${ref.id}.json`);
+    const metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
+    for (const value of [
+      null,
+      [],
+      {},
+      { ...metadata, id: session },
+      { ...metadata, text: 42 },
+      { ...metadata, kind: 'unknown' },
+      { ...metadata, text: 'x'.repeat(60_001) },
+      { ...metadata, kind: 'image', mimeType: 'text/html' },
+    ]) {
+      fs.writeFileSync(metadataFile, JSON.stringify(value));
+      assert.throws(() => loadAttachment(session, ref.id), /元数据/);
+    }
+    fs.writeFileSync(metadataFile, ' '.repeat(1_000_001));
+    assert.throws(() => loadAttachment(session, ref.id), /元数据/);
+    fs.writeFileSync(metadataFile, Buffer.from([0xff]));
+    assert.throws(() => loadAttachment(session, ref.id), /元数据/);
+    fs.writeFileSync(metadataFile, JSON.stringify(metadata));
+    assert.equal(loadAttachment(session, ref.id).text, 'hello');
+  } finally {
+    f.close();
+  }
+});
