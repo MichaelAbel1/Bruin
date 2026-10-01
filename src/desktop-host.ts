@@ -138,11 +138,15 @@ const runner = new AgentRunner(
           (call.name === 'write_file' || call.name === 'edit_file')
         )
           return resolve(true);
-        const command = call.name === 'shell' ? String(call.input.command ?? '') : '';
+        const command =
+          (call.name === 'shell' || call.name === 'start_background') &&
+          typeof call.input.command === 'string'
+            ? call.input.command
+            : '';
         const workspace = getSession(sessionId).workspace;
         const config = loadConfig();
         if (config.approvalMode === 'auto') {
-          if (call.name === 'shell') {
+          if (call.name === 'shell' || call.name === 'start_background') {
             if (!isMaliciousShell(command)) return resolve(true);
           } else {
             return resolve(true);
@@ -150,6 +154,7 @@ const runner = new AgentRunner(
         }
         if (
           command &&
+          !isMaliciousShell(command) &&
           (config.approvedCommands.some(
             (rule) =>
               rule.workspace === workspace &&
@@ -513,6 +518,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           throw new Error('仅 Shell 命令支持记住授权');
         const workspace = getSession(pending.sessionId).workspace;
         const command = pending.call.input.command;
+        if (isMaliciousShell(command)) throw new Error('高危破坏性命令不支持记住授权');
         const sessionId = scope === 'session' ? pending.sessionId : undefined;
         updateConfig((config) => {
           if (

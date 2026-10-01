@@ -505,7 +505,7 @@ export class RuntimeServices {
                 requestId: id,
                 name: 'shell',
                 input: { command },
-                workspace: session.workspace,
+                workspace: fs.realpathSync(session.workspace),
                 timeoutMs: 600_000,
                 maxOutputBytes: 100_000,
               },

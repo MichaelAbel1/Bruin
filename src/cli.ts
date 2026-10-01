@@ -241,15 +241,18 @@ async function main(): Promise<void> {
         if (allowWorkspaceEdits && ['write_file', 'edit_file'].includes(call.name)) return true;
         const config = loadConfig();
         const command =
-          call.name === 'shell' && typeof call.input.command === 'string' ? call.input.command : '';
+          (call.name === 'shell' || call.name === 'start_background') &&
+          typeof call.input.command === 'string'
+            ? call.input.command
+            : '';
         if (config.approvalMode === 'auto') {
-          if (call.name === 'shell') {
+          if (call.name === 'shell' || call.name === 'start_background') {
             if (!isMaliciousShell(command)) return true;
           } else {
             return true;
           }
         }
-        if (call.name === 'shell' && command) {
+        if (command && !isMaliciousShell(command)) {
           if (
             config.approvedCommands.some(
               (rule) =>
