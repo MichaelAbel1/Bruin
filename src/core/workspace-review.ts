@@ -140,8 +140,13 @@ export function readWorkspaceReview(workspace: string, relative: string, events:
     }
   }
   if (change.status === 'deleted') {
-    if (baseline === undefined)
-      baseline = git(workspace, ['show', `HEAD:./${relative.split(path.sep).join('/')}`]);
+    if (baseline === undefined) {
+      try {
+        baseline = git(workspace, ['show', `HEAD:./${relative.split(path.sep).join('/')}`]);
+      } catch {
+        baseline = '';
+      }
+    }
     if (Buffer.byteLength(baseline) > 256_000) throw new Error('删除文件超过预览上限');
     if (baseline.includes('\0')) throw new Error('二进制文件暂不支持预览');
     return {

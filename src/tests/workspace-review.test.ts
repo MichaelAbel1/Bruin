@@ -136,3 +136,24 @@ test('review rejects symbolic links and handles unmaterialized workspaces', (t) 
   ];
   assert.throws(() => readWorkspaceReview(root, 'link.txt', events), /符号链接/);
 });
+
+test('review handles deleted untracked files in non-git workspaces gracefully', (t) => {
+  const root = setup(t);
+  const events = [
+    event('tool_requested', {
+      callId: 'w1',
+      name: 'write_file',
+      input: { path: 'deleted-untracked.txt' },
+    }),
+    event('tool_finished', { callId: 'w1', isError: false }),
+  ];
+  const changes = listWorkspaceChanges(root, events);
+  assert.deepEqual(changes, [
+    { path: 'deleted-untracked.txt', source: 'agent', status: 'deleted' },
+  ]);
+  const review = readWorkspaceReview(root, 'deleted-untracked.txt', events);
+  assert.equal(review.path, 'deleted-untracked.txt');
+  assert.equal(review.content, '');
+  assert.equal(review.baselineContent, '');
+  assert.match(review.readOnlyReason ?? '', /只读/);
+});

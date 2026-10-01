@@ -428,11 +428,10 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       }
       const date = new Date().toISOString();
       const name = `${date.slice(0, 10).replaceAll('-', '')}-${date.slice(11, 19).replaceAll(':', '')}-${randomUUID().slice(0, 8)}`;
+      fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
+      const managedRoot = fs.existsSync(dataDir()) ? fs.realpathSync(dataDir()) : dataDir();
       return viewSession(
-        store.createManagedSession(
-          path.join(fs.realpathSync(dataDir()), 'workspaces', name),
-          profile,
-        ),
+        store.createManagedSession(path.join(managedRoot, 'workspaces', name), profile),
       );
     }
     case 'setWorkspace': {

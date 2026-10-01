@@ -774,6 +774,8 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
             '--rm',
             '--name',
             containerName,
+            '--label',
+            'bruin.managed=true',
             '--network',
             'none',
             '--read-only',
@@ -877,8 +879,11 @@ process.on('message', async (raw: ToolRequest | { type: 'cancel'; requestId: str
   if (process.connected) process.send?.(reply);
 });
 
-process.on('disconnect', () => {
+const terminate = () => {
   void Promise.allSettled([...active.values()].map((kill) => kill())).finally(() =>
     process.exit(0),
   );
-});
+};
+process.on('disconnect', terminate);
+process.on('SIGTERM', terminate);
+process.on('SIGINT', terminate);

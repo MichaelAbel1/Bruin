@@ -735,9 +735,14 @@ export class AgentRunner {
         let toolFinished = false;
         try {
           if (
-            ['write_file', 'edit_file', 'shell', 'create_task', 'update_task'].includes(
-              call.name,
-            ) &&
+            [
+              'write_file',
+              'edit_file',
+              'shell',
+              'start_background',
+              'create_task',
+              'update_task',
+            ].includes(call.name) &&
             session.managedWorkspace &&
             !fs.existsSync(session.workspace)
           )

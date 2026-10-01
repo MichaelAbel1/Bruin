@@ -332,7 +332,9 @@ export function setSkillEnabled(name: string, enabled: boolean): void {
   const file = path.join(skill.path, '.bruin-source.json');
   const data = JSON.parse(readSkillText(file, 64_000));
   data.enabled = enabled;
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 });
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  fs.renameSync(temp, file);
 }
 export function uninstallSkill(name: string): void {
   const skill = listSkills().find((x) => x.name === name);

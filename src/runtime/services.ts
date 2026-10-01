@@ -339,8 +339,15 @@ export class RuntimeServices {
         const destinationStat = fs.statSync(destination);
         const belongsToRepository = stdout.split(/\r?\n/).some((line) => {
           if (!line.startsWith('worktree ')) return false;
+          const listedPath = line.slice('worktree '.length).trim();
           try {
-            const listedStat = fs.statSync(line.slice('worktree '.length));
+            const listedReal = fs.realpathSync(listedPath);
+            const pathMatches =
+              process.platform === 'win32'
+                ? listedReal.toLowerCase() === destination.toLowerCase()
+                : listedReal === destination;
+            if (pathMatches) return true;
+            const listedStat = fs.statSync(listedPath);
             return (
               destinationStat.ino !== 0 &&
               listedStat.isDirectory() &&

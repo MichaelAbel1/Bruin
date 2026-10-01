@@ -26,9 +26,26 @@ export function isMaliciousShell(command: string): boolean {
   if (/\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+(\/\*|\/\.\*|~\/\*|~\/\.\*)(?=\s|$|[;&|])/i.test(trimmed)) {
     return true;
   }
+  if (
+    /\b(rd|rmdir)\s+[^;&|]*\/s[^;&|]*\s+([a-zA-Z]:\\?|%SystemDrive%|%USERPROFILE%|%WINDIR%|\\)(?=\s|$|[;&|])/i.test(
+      trimmed,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\bdel(ete)?\s+[^;&|]*\/s[^;&|]*\s+([a-zA-Z]:\\?|%SystemDrive%|%USERPROFILE%|%WINDIR%|\\)(?=\s|$|[;&|])/i.test(
+      trimmed,
+    )
+  ) {
+    return true;
+  }
 
   // 2. Dangerous raw disk writes or formatting
-  if (/\b(mkfs(\.[a-z0-9]+)?|fdisk|parted)\b/i.test(trimmed)) {
+  if (
+    /\b(mkfs(\.[a-z0-9]+)?|fdisk|parted)\b/i.test(trimmed) ||
+    /\bformat\s+[a-zA-Z]:/i.test(trimmed)
+  ) {
     return true;
   }
   if (/\bdd\s+[^;&|]*\bof=\/dev\/(r?disk|sd|hd|nvme|mapper|zero|null)\b/i.test(trimmed)) {
@@ -44,7 +61,10 @@ export function isMaliciousShell(command: string): boolean {
   }
 
   // 4. Remote script piped directly into shell execution
-  if (/\b(curl|wget)\b[^|;&\n]+?\|\s*(sudo\s+)?(bash|sh|zsh)\b/i.test(trimmed)) {
+  if (
+    /\b(curl|wget)\b[^|;&\n]+?\|\s*(sudo\s+)?(bash|sh|zsh)\b/i.test(trimmed) ||
+    /\b(iwr|Invoke-WebRequest|curl)\b[^|;&\n]+?\|\s*(iex|Invoke-Expression)\b/i.test(trimmed)
+  ) {
     return true;
   }
 
