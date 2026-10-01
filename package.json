@@ -18,7 +18,8 @@
     "desktop:build": "npm run build && node desktop/scripts/generate-icon.cjs && vite build --config desktop/vite.config.ts",
     "desktop:dev": "npm run build && node desktop/scripts/dev.cjs",
     "desktop:pack": "npm run desktop:build && node desktop/scripts/stage-runtime.cjs && electron-builder --config desktop/electron-builder.yml --dir",
-    "desktop:dist": "npm run desktop:build && node desktop/scripts/stage-runtime.cjs && electron-builder --config desktop/electron-builder.yml"
+    "desktop:dist": "npm run desktop:build && node desktop/scripts/stage-runtime.cjs && electron-builder --config desktop/electron-builder.yml",
+    "desktop:stage-artifacts": "node desktop/scripts/stage-release-assets.cjs"
   },
   "engines": {
     "node": ">=22.12"

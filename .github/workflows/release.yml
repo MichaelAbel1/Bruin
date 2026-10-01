@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.11.0, defaults to tag from ref or package.json)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+            dist_args: '--mac --publish never'
+          - os: ubuntu-latest
+            platform: linux
+            dist_args: '--linux --publish never'
+          - os: windows-latest
+            platform: windows
+            dist_args: '--win --publish never'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run check
+      - run: npm run desktop:check
+      - run: npm test
+      - name: Build desktop packages
+        run: npm run desktop:dist -- ${{ matrix.dist_args }}
+      - name: Verify macOS archive
+        if: matrix.platform == 'macos'
+        run: unzip -tq desktop/release-current/Bruin-*-mac.zip
+      - name: Stage release artifacts
+        run: npm run desktop:stage-artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bruin-dist-${{ matrix.platform }}
+          path: stage-artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: 'bruin-dist-*'
+          path: release-assets
+          merge-multiple: true
+      - name: Generate Checksums
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+              TAG="${{ github.ref_name }}"
+            else
+              TAG="v$(node -p "require('./package.json').version")"
+            fi
+          fi
+          echo "Target release tag: $TAG"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets..."
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            echo "Creating release $TAG..."
+            gh release create "$TAG" release-assets/* \
+              --title "Bruin $TAG" \
+              --generate-notes
+          fi

@@ -16,4 +16,6 @@ dist/
 desktop/build/
 desktop/release*/
 desktop/assets/icon-*.png
+stage-artifacts/
+release-assets/
 .DS_Store
