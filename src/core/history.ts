@@ -246,15 +246,17 @@ export function buildPrompt(
       event.type === 'tool_unknown' ||
       event.type === 'tool_denied'
     ) {
-      const callId = String(event.payload.callId);
+      const callId = String(event.payload.callId || 'call');
+      const pending = pendingCalls.get(callId);
       pendingCalls.delete(callId);
+      const toolName = String(event.payload.name || pending?.name || 'tool');
       messages.push({
         role: 'tool',
         content: [
           {
             type: 'tool-result',
             toolCallId: callId,
-            toolName: String(event.payload.name),
+            toolName,
             output: {
               type: 'text',
               value: `${event.type !== 'tool_finished' || Boolean(event.payload.isError) ? 'ERROR: ' : ''}${excerpt(String(event.payload.output ?? ''), 12_000)}`,

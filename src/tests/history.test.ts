@@ -166,3 +166,35 @@ test('model switch before a checkpoint still prevents replaying old provider mes
   assert.match(JSON.stringify(result), /neutral answer/);
   assert.doesNotMatch(JSON.stringify(result), /stale provider state/);
 });
+
+test('tool result reconstruction falls back to pending call name or "tool" when payload.name is missing', () => {
+  const event = (
+    seq: number,
+    type: SessionEvent['type'],
+    payload: Record<string, unknown>,
+  ): SessionEvent => ({ sessionId: 'fallback', seq, type, at: '', payload });
+
+  const messages = buildPrompt(
+    [
+      event(1, 'user', { text: 'list files' }),
+      event(2, 'assistant', {
+        text: 'looking',
+        calls: [{ id: 'call-1', name: 'read_file', input: { path: 'a.txt' } }],
+      }),
+      // tool_finished with name omitted in payload
+      event(3, 'tool_finished', { callId: 'call-1', output: 'content' }),
+      // tool_denied with unknown call and name omitted
+      event(4, 'tool_denied', { callId: 'call-2', output: 'denied' }),
+    ],
+    'rules',
+  );
+
+  const toolMessages = messages.filter((m) => m.role === 'tool');
+  assert.equal(toolMessages.length, 2);
+
+  const result1 = (toolMessages[0].content as Array<{ type: string; toolName: string }>)[0];
+  assert.equal(result1.toolName, 'read_file');
+
+  const result2 = (toolMessages[1].content as Array<{ type: string; toolName: string }>)[0];
+  assert.equal(result2.toolName, 'tool');
+});

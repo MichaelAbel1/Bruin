@@ -209,7 +209,11 @@ export class SqliteEventStore implements EventStore {
       const session = this.getSession(id);
       if (!session) throw new Error('会话不存在');
       if (this.isLeased(id)) throw new Error('运行中的会话不能更换工作区');
-      if (session.workspace === canonical && !session.managedWorkspace) return;
+      const isSameWorkspace =
+        process.platform === 'win32'
+          ? session.workspace.toLowerCase() === canonical.toLowerCase()
+          : session.workspace === canonical;
+      if (isSameWorkspace && !session.managedWorkspace) return;
       this.db
         .prepare(
           'UPDATE sessions SET workspace = ?, managed_workspace = 0, updated_at = ? WHERE id = ?',
@@ -224,20 +228,25 @@ export class SqliteEventStore implements EventStore {
     const parent = path.join(path.dirname(this.db.name), 'workspaces');
     fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
     const root = fs.realpathSync(parent);
-    if (
-      path.dirname(session.workspace) !== root ||
-      !/^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/.test(path.basename(session.workspace))
-    )
+    const sessionDir = path.resolve(path.dirname(session.workspace));
+    const rootMatches =
+      process.platform === 'win32'
+        ? sessionDir.toLowerCase() === root.toLowerCase()
+        : sessionDir === root;
+    if (!rootMatches || !/^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/.test(path.basename(session.workspace)))
       throw new Error('无效的托管工作区路径');
     try {
       fs.mkdirSync(session.workspace, { mode: 0o700 });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    if (
-      !fs.lstatSync(session.workspace).isDirectory() ||
-      fs.realpathSync(session.workspace) !== session.workspace
-    )
+    const realWorkspace = fs.realpathSync(session.workspace);
+    const resolvedWorkspace = path.resolve(session.workspace);
+    const workspaceMatches =
+      process.platform === 'win32'
+        ? realWorkspace.toLowerCase() === resolvedWorkspace.toLowerCase()
+        : realWorkspace === resolvedWorkspace;
+    if (!fs.lstatSync(session.workspace).isDirectory() || !workspaceMatches)
       throw new Error('托管工作区路径已被替换');
   }
   setProfile(id: string, profile: ModelProfile, leaseOwner?: string): void {
@@ -345,7 +354,12 @@ export class SqliteEventStore implements EventStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    if (!fs.lstatSync(directory).isDirectory() || fs.realpathSync(directory) !== directory)
+    const realDirectory = fs.realpathSync(directory);
+    const directoryMatches =
+      process.platform === 'win32'
+        ? realDirectory.toLowerCase() === directory.toLowerCase()
+        : realDirectory === directory;
+    if (!fs.lstatSync(directory).isDirectory() || !directoryMatches)
       throw new Error('.tasks 必须是工作区内的真实目录');
     return directory;
   }
@@ -355,7 +369,12 @@ export class SqliteEventStore implements EventStore {
     if (!tasks.length) return;
     for (const task of tasks) {
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(task.id)) throw new Error('任务 ID 无法用作快照文件名');
-      if (fs.realpathSync(directory) !== directory) throw new Error('.tasks 目录已被替换');
+      const realDir = fs.realpathSync(directory);
+      const dirMatches =
+        process.platform === 'win32'
+          ? realDir.toLowerCase() === directory.toLowerCase()
+          : realDir === directory;
+      if (!dirMatches) throw new Error('.tasks 目录已被替换');
       const filename = path.join(directory, `${task.id}.json`);
       const content =
         JSON.stringify(
@@ -613,7 +632,12 @@ export class SqliteEventStore implements EventStore {
         .run(id, workspace);
     })();
     try {
-      if (fs.realpathSync(directory) !== directory) throw new Error('.tasks 目录已被替换');
+      const realDir = fs.realpathSync(directory);
+      const dirMatches =
+        process.platform === 'win32'
+          ? realDir.toLowerCase() === directory.toLowerCase()
+          : realDir === directory;
+      if (!dirMatches) throw new Error('.tasks 目录已被替换');
       const stat = fs.lstatSync(filename);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('任务快照不是普通文件');
       fs.unlinkSync(filename);

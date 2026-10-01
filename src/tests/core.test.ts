@@ -2675,3 +2675,33 @@ test('workspace file operations reject root directory and oversized content', ()
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('materializeWorkspace rejects invalid names, non-managed sessions, and path escapes', () => {
+  const dir = fs.realpathSync(temp());
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const regularSession = store.createSession(dir, profile);
+    assert.throws(() => store.materializeWorkspace(regularSession.id), /不是 Bruin 管理的工作区/);
+
+    const escapeDir = path.join(dir, 'other-dir', '20260928-120000-11223344');
+    const badSession1 = store.createManagedSession(escapeDir, profile);
+    assert.throws(() => store.materializeWorkspace(badSession1.id), /无效的托管工作区路径/);
+
+    const badNameDir = path.join(dir, 'workspaces', 'invalid_name_format');
+    const badSession2 = store.createManagedSession(badNameDir, profile);
+    assert.throws(() => store.materializeWorkspace(badSession2.id), /无效的托管工作区路径/);
+
+    // Valid managed workspace materializes cleanly
+    const validDir = path.join(dir, 'workspaces', '20260928-120000-11223344');
+    const validSession = store.createManagedSession(validDir, profile);
+    assert.equal(fs.existsSync(validDir), false);
+    store.materializeWorkspace(validSession.id);
+    assert.equal(fs.existsSync(validDir), true);
+    // Repeated materialization is idempotent
+    store.materializeWorkspace(validSession.id);
+    assert.equal(fs.existsSync(validDir), true);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
