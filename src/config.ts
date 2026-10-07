@@ -155,23 +155,29 @@ export function configLockPath(): string {
   return path.join(dataDir(), 'config.lock');
 }
 
-let configLockDepth = 0;
+const fileLockDepths = new Map<string, number>();
 
-export function withConfigLock<T>(fn: () => T): T {
-  if (configLockDepth > 0) {
-    configLockDepth++;
+export function withFileLock<T>(
+  lockFile: string,
+  fn: () => T,
+  timeoutMs = 5000,
+  timeoutMessage = '获取文件锁超时，可能存在并发写入冲突',
+): T {
+  const depth = fileLockDepths.get(lockFile) ?? 0;
+  if (depth > 0) {
+    fileLockDepths.set(lockFile, depth + 1);
     try {
       return fn();
     } finally {
-      configLockDepth--;
+      if (depth === 0) fileLockDepths.delete(lockFile);
+      else fileLockDepths.set(lockFile, depth);
     }
   }
 
-  fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
-  const lockFile = configLockPath();
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
   const start = Date.now();
-  const timeoutMs = 5000;
   let fd: number | null = null;
+  let myLockToken = '';
 
   while (Date.now() - start < timeoutMs) {
     try {
@@ -180,7 +186,8 @@ export function withConfigLock<T>(fn: () => T): T {
         fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR,
         0o600,
       );
-      fs.writeSync(fd, `${process.pid}\n${Date.now()}`);
+      myLockToken = `${process.pid}\n${Date.now()}`;
+      fs.writeSync(fd, myLockToken);
       break;
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
@@ -208,7 +215,19 @@ export function withConfigLock<T>(fn: () => T): T {
           const isExpired =
             Date.now() - (Number.isFinite(timestamp) ? timestamp : stat.mtimeMs) > 10000;
           if ((validPid && !isAlive) || (!validPid && isExpired)) {
-            fs.unlinkSync(lockFile);
+            try {
+              const currentStat = fs.statSync(lockFile);
+              const currentContent = fs.readFileSync(lockFile, 'utf8');
+              const sameInode =
+                process.platform !== 'win32' && stat.ino !== 0
+                  ? currentStat.ino === stat.ino
+                  : true;
+              if (sameInode && currentContent === content && currentStat.mtimeMs === stat.mtimeMs) {
+                fs.unlinkSync(lockFile);
+              }
+            } catch {
+              // The lock was already removed or replaced concurrently
+            }
             continue;
           }
         } catch {
@@ -223,21 +242,28 @@ export function withConfigLock<T>(fn: () => T): T {
   }
 
   if (fd === null) {
-    throw new Error('获取配置文件锁超时，可能存在并发写入冲突');
+    throw new Error(timeoutMessage);
   }
 
-  configLockDepth++;
+  fileLockDepths.set(lockFile, 1);
   try {
     return fn();
   } finally {
-    configLockDepth--;
+    fileLockDepths.delete(lockFile);
     try {
       fs.closeSync(fd);
     } catch {}
     try {
-      fs.unlinkSync(lockFile);
+      const currentContent = fs.readFileSync(lockFile, 'utf8');
+      if (currentContent === myLockToken) {
+        fs.unlinkSync(lockFile);
+      }
     } catch {}
   }
+}
+
+export function withConfigLock<T>(fn: () => T): T {
+  return withFileLock(configLockPath(), fn, 5000, '获取配置文件锁超时，可能存在并发写入冲突');
 }
 
 export function saveConfig(config: z.input<typeof configSchema>): void {

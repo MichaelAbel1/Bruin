@@ -165,3 +165,53 @@ test('market snapshot validates paths and supports multiline descriptions', () =
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('concurrent builtin skill enablement changes persist without lost updates (R26)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-builtin-concurrent-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  try {
+    setSkillEnabled('debug', false);
+    setSkillEnabled('plan', false);
+    const skills = listSkills();
+    assert.equal(skills.find((s) => s.name === 'debug')?.enabled, false);
+    assert.equal(skills.find((s) => s.name === 'plan')?.enabled, false);
+    assert.equal(skills.find((s) => s.name === 'test')?.enabled, true);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('installed skill updates preserve enabled state and lock metadata updates (R26)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-skill-lock-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  try {
+    const info = installSnapshot(
+      [{ path: 'SKILL.md', contents: '---\nname: lockable\ndescription: lockable\n---\nBody' }],
+      'skills.sh:x/y/z',
+      'r1',
+    );
+    assert.equal(info.enabled, false);
+    setSkillEnabled('lockable', true);
+    assert.equal(listSkills().find((s) => s.name === 'lockable')?.enabled, true);
+    const updated = installSnapshot(
+      [
+        {
+          path: 'SKILL.md',
+          contents: '---\nname: lockable\ndescription: updated lockable\n---\nBody 2',
+        },
+      ],
+      'skills.sh:x/y/z',
+      'r2',
+    );
+    assert.equal(updated.enabled, true);
+    assert.equal(listSkills().find((s) => s.name === 'lockable')?.enabled, true);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

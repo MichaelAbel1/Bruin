@@ -59,24 +59,109 @@ function writeEncryptedKeys(keys) {
   fs.writeFileSync(temp, JSON.stringify(keys), { mode: 0o600 });
   fs.renameSync(temp, file);
 }
+function withSecretsLock(fn) {
+  const lockFile = `${secretsPath()}.lock`;
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+  const start = Date.now();
+  const timeoutMs = 5000;
+  let fd = null;
+  let myLockToken = '';
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      fd = fs.openSync(
+        lockFile,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR,
+        0o600,
+      );
+      myLockToken = `${process.pid}\n${Date.now()}`;
+      fs.writeSync(fd, myLockToken);
+      break;
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        try {
+          const stat = fs.statSync(lockFile);
+          const content = fs.readFileSync(lockFile, 'utf8');
+          const [pidStr, timestampStr] = content.split('\n');
+          const pid = parseInt(pidStr, 10);
+          const timestamp = parseInt(timestampStr, 10);
+          let isAlive = false;
+          if (Number.isFinite(pid) && pid > 0) {
+            try {
+              process.kill(pid, 0);
+              isAlive = true;
+            } catch (e) {
+              if (e.code === 'ESRCH') isAlive = false;
+              else isAlive = true;
+            }
+          }
+          const validPid = Number.isFinite(pid) && pid > 0;
+          const isExpired =
+            Date.now() - (Number.isFinite(timestamp) ? timestamp : stat.mtimeMs) > 10000;
+          if ((validPid && !isAlive) || (!validPid && isExpired)) {
+            try {
+              const currentStat = fs.statSync(lockFile);
+              const currentContent = fs.readFileSync(lockFile, 'utf8');
+              const sameInode =
+                process.platform !== 'win32' && stat.ino !== 0
+                  ? currentStat.ino === stat.ino
+                  : true;
+              if (sameInode && currentContent === content && currentStat.mtimeMs === stat.mtimeMs) {
+                fs.unlinkSync(lockFile);
+              }
+            } catch {}
+            continue;
+          }
+        } catch {}
+        const wait = 20 + Math.floor(Math.random() * 30);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  if (fd === null) {
+    throw new Error('获取密钥文件锁超时，可能存在并发写入冲突');
+  }
+
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+    try {
+      const currentContent = fs.readFileSync(lockFile, 'utf8');
+      if (currentContent === myLockToken) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch {}
+  }
+}
 function updateStoredKey(alias, ciphertext, remove) {
-  const keys = readEncryptedKeys();
-  if (remove) delete keys[alias];
-  else if (ciphertext) keys[alias] = ciphertext;
-  writeEncryptedKeys(keys);
+  return withSecretsLock(() => {
+    const keys = readEncryptedKeys();
+    if (remove) delete keys[alias];
+    else if (ciphertext) keys[alias] = ciphertext;
+    writeEncryptedKeys(keys);
+  });
 }
 async function restoreStoredKeys() {
-  const keys = readEncryptedKeys();
   const legacy = await requestHost('takeLegacyKeys');
   if (Object.keys(legacy).length && secureStorageAvailable()) {
-    let changed = false;
-    for (const [alias, key] of Object.entries(legacy)) {
-      if (typeof key !== 'string' || keys[alias]) continue;
-      keys[alias] = safeStorage.encryptString(key).toString('base64');
-      changed = true;
-    }
-    if (changed) writeEncryptedKeys(keys);
+    withSecretsLock(() => {
+      const keys = readEncryptedKeys();
+      let changed = false;
+      for (const [alias, key] of Object.entries(legacy)) {
+        if (typeof key !== 'string' || keys[alias]) continue;
+        keys[alias] = safeStorage.encryptString(key).toString('base64');
+        changed = true;
+      }
+      if (changed) writeEncryptedKeys(keys);
+    });
   }
+  const keys = readEncryptedKeys();
   if (!Object.keys(keys).length) return;
   if (!secureStorageAvailable()) throw new Error('系统安全存储不可用，无法恢复 API Key');
   const restored = {};
@@ -233,84 +318,96 @@ function createWindow() {
   else void window.loadFile(path.join(__dirname, 'build', 'renderer', 'index.html'));
 }
 
-app.whenReady().then(() => {
-  loadAppearance();
-  startHost();
-  hostReady = restoreStoredKeys();
-  createWindow();
-  applyIcon();
-  ipcMain.handle('bruin:request', async (event, method, params) => {
-    if (
-      !window ||
-      event.sender !== window.webContents ||
-      event.senderFrame !== window.webContents.mainFrame
-    )
-      throw new Error('无效的界面请求');
-    if (method === 'chooseWorkspace')
-      return dialog
-        .showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
-        .then((result) => (result.canceled ? null : result.filePaths[0]));
-    if (method === 'chooseAttachments') {
-      const selection = await dialog.showOpenDialog(window, {
-        properties:
-          params?.kind === 'folder'
-            ? ['openDirectory', 'multiSelections']
-            : ['openFile', 'multiSelections'],
-      });
-      if (selection.canceled) return [];
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (window) {
+      if (window.isMinimized()) window.restore();
+      window.focus();
+    }
+  });
+
+  app.whenReady().then(() => {
+    loadAppearance();
+    startHost();
+    hostReady = restoreStoredKeys();
+    createWindow();
+    applyIcon();
+    ipcMain.handle('bruin:request', async (event, method, params) => {
+      if (
+        !window ||
+        event.sender !== window.webContents ||
+        event.senderFrame !== window.webContents.mainFrame
+      )
+        throw new Error('无效的界面请求');
+      if (method === 'chooseWorkspace')
+        return dialog
+          .showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
+          .then((result) => (result.canceled ? null : result.filePaths[0]));
+      if (method === 'chooseAttachments') {
+        const selection = await dialog.showOpenDialog(window, {
+          properties:
+            params?.kind === 'folder'
+              ? ['openDirectory', 'multiSelections']
+              : ['openFile', 'multiSelections'],
+        });
+        if (selection.canceled) return [];
+        await hostReady;
+        return requestHost('importAttachments', {
+          sessionId: params?.sessionId,
+          paths: selection.filePaths,
+        });
+      }
+      if (method === 'getAppearance') return { iconBackground, uiTheme };
+      if (method === 'setIconBackground') return saveAppearance({ iconBackground: params?.theme });
+      if (method === 'setTheme') return saveAppearance({ uiTheme: params?.theme });
+      if (
+        method === 'restoreApiKeys' ||
+        method === 'takeLegacyKeys' ||
+        method === 'importAttachments'
+      )
+        throw new Error('不支持此界面操作');
       await hostReady;
-      return requestHost('importAttachments', {
-        sessionId: params?.sessionId,
-        paths: selection.filePaths,
-      });
-    }
-    if (method === 'getAppearance') return { iconBackground, uiTheme };
-    if (method === 'setIconBackground') return saveAppearance({ iconBackground: params?.theme });
-    if (method === 'setTheme') return saveAppearance({ uiTheme: params?.theme });
-    if (
-      method === 'restoreApiKeys' ||
-      method === 'takeLegacyKeys' ||
-      method === 'importAttachments'
-    )
-      throw new Error('不支持此界面操作');
-    await hostReady;
-    if (method === 'saveProfile' && params?.apiKey && !secureStorageAvailable())
-      throw new Error('系统安全存储不可用，无法持久保存 API Key');
-    const encryptedKey =
-      method === 'saveProfile' && params?.apiKey
-        ? safeStorage.encryptString(params.apiKey).toString('base64')
-        : undefined;
-    const previousProfile =
-      method === 'saveProfile'
-        ? (await requestHost('bootstrap')).config.profiles.find(
-            (item) => item.alias === params?.alias,
-          )
-        : null;
-    const result = await requestHost(method, params || {});
-    if (method === 'saveProfile') {
-      const removeKey = Boolean(
-        params?.clearApiKey ||
-        (previousProfile && previousProfile.provider !== params?.provider && !params?.apiKey),
-      );
-      if (params?.apiKey || removeKey)
-        updateStoredKey(String(params.alias), encryptedKey, removeKey);
-    }
-    if (method === 'removeProfile') updateStoredKey(String(params?.alias), undefined, true);
-    return result;
+      if (method === 'saveProfile' && params?.apiKey && !secureStorageAvailable())
+        throw new Error('系统安全存储不可用，无法持久保存 API Key');
+      const encryptedKey =
+        method === 'saveProfile' && params?.apiKey
+          ? safeStorage.encryptString(params.apiKey).toString('base64')
+          : undefined;
+      const previousProfile =
+        method === 'saveProfile'
+          ? (await requestHost('bootstrap')).config.profiles.find(
+              (item) => item.alias === params?.alias,
+            )
+          : null;
+      const result = await requestHost(method, params || {});
+      if (method === 'saveProfile') {
+        const removeKey = Boolean(
+          params?.clearApiKey ||
+          (previousProfile && previousProfile.provider !== params?.provider && !params?.apiKey),
+        );
+        if (params?.apiKey || removeKey)
+          updateStoredKey(String(params.alias), encryptedKey, removeKey);
+      }
+      if (method === 'removeProfile') updateStoredKey(String(params?.alias), undefined, true);
+      return result;
+    });
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  app.on('before-quit', () => {
+    stopLongRunPowerBlocker();
+    if (host && !host.killed) {
+      host.stdin.end();
+      setTimeout(() => {
+        if (host && !host.killed) host.kill('SIGKILL');
+      }, 15000).unref();
+    }
   });
-});
-app.on('before-quit', () => {
-  stopLongRunPowerBlocker();
-  if (host && !host.killed) {
-    host.stdin.end();
-    setTimeout(() => {
-      if (host && !host.killed) host.kill('SIGKILL');
-    }, 15000).unref();
-  }
-});
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+}

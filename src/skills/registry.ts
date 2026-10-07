@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-import { dataDir, loadConfig, saveConfig, updateConfig } from '../config.js';
+import { dataDir, loadConfig, saveConfig, updateConfig, withFileLock } from '../config.js';
 
 export interface SkillInfo {
   name: string;
@@ -21,6 +21,12 @@ function skillRoot(): string {
 const builtinRoot = fileURLToPath(new URL('../../skills/builtin/', import.meta.url));
 function builtinSettingsPath(): string {
   return path.join(dataDir(), 'builtin-skills.json');
+}
+function builtinLockPath(): string {
+  return path.join(dataDir(), 'builtin-skills.lock');
+}
+function skillLockPath(name: string): string {
+  return path.join(dataDir(), `skill-${encodeURIComponent(name)}.lock`);
 }
 function readSkillBytes(file: string, maxBytes: number): Buffer {
   const stat = fs.lstatSync(file);
@@ -78,11 +84,13 @@ function builtinSettings(): Record<string, boolean> {
   return {};
 }
 function setBuiltinEnabled(name: string, enabled: boolean): void {
-  const settings = { ...builtinSettings(), [name]: enabled };
-  fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
-  const temp = `${builtinSettingsPath()}.${process.pid}.${randomUUID()}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(settings, null, 2), { mode: 0o600 });
-  fs.renameSync(temp, builtinSettingsPath());
+  withFileLock(builtinLockPath(), () => {
+    const settings = { ...builtinSettings(), [name]: enabled };
+    fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
+    const temp = `${builtinSettingsPath()}.${process.pid}.${randomUUID()}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(settings, null, 2), { mode: 0o600 });
+    fs.renameSync(temp, builtinSettingsPath());
+  });
 }
 function builtinSkills(): SkillInfo[] {
   if (!fs.existsSync(builtinRoot)) return [];
@@ -189,64 +197,76 @@ function installDirectory(dir: string, source: string, revision: string): SkillI
   let ownedStage = false;
   let committed = false;
   let failure: unknown;
-  try {
-    fs.mkdirSync(stage, { mode: 0o700 });
-    ownedStage = true;
-    copySafe(dir, stage);
-    const copied = parseManifest(stage);
-    if (copied.name !== manifest.name || copied.description !== manifest.description)
-      throw new Error('Skill 复制期间 manifest 发生变化');
-    const enabled = source.startsWith('local:');
-    const snapshotRevision = enabled
-      ? createHash('sha256').update(readManifest(stage)).digest('hex')
-      : revision;
-    const info = { ...copied, path: final, source, revision: snapshotRevision, enabled };
-    fs.writeFileSync(
-      path.join(stage, '.bruin-source.json'),
-      JSON.stringify({ source, revision: snapshotRevision, enabled }, null, 2),
-      { mode: 0o600 },
-    );
-    const prior = fs.existsSync(final) ? path.join(root, `.old-${randomUUID()}`) : undefined;
-    if (prior) fs.renameSync(final, prior);
+  return withFileLock(skillLockPath(manifest.name), () => {
     try {
-      fs.renameSync(stage, final);
-    } catch (error) {
+      fs.mkdirSync(stage, { mode: 0o700 });
+      ownedStage = true;
+      copySafe(dir, stage);
+      const copied = parseManifest(stage);
+      if (copied.name !== manifest.name || copied.description !== manifest.description)
+        throw new Error('Skill 复制期间 manifest 发生变化');
+      let enabled = source.startsWith('local:');
+      if (fs.existsSync(path.join(final, '.bruin-source.json'))) {
+        try {
+          const priorData = JSON.parse(
+            readSkillText(path.join(final, '.bruin-source.json'), 64_000),
+          );
+          if (typeof priorData.enabled === 'boolean') {
+            enabled = priorData.enabled;
+          }
+        } catch {}
+      }
+      const snapshotRevision = enabled
+        ? createHash('sha256').update(readManifest(stage)).digest('hex')
+        : revision;
+      const info = { ...copied, path: final, source, revision: snapshotRevision, enabled };
+      fs.writeFileSync(
+        path.join(stage, '.bruin-source.json'),
+        JSON.stringify({ source, revision: snapshotRevision, enabled }, null, 2),
+        { mode: 0o600 },
+      );
+      const prior = fs.existsSync(final) ? path.join(root, `.old-${randomUUID()}`) : undefined;
+      if (prior) fs.renameSync(final, prior);
+      try {
+        fs.renameSync(stage, final);
+      } catch (error) {
+        if (prior) {
+          try {
+            fs.renameSync(prior, final);
+          } catch (restoreError) {
+            throw new AggregateError(
+              [error, restoreError],
+              `Skill 发布失败，旧版本恢复失败，请检查 ${prior}`,
+            );
+          }
+        }
+        throw error;
+      }
+      committed = true;
       if (prior) {
         try {
-          fs.renameSync(prior, final);
-        } catch (restoreError) {
+          fs.rmSync(prior, { recursive: true, force: true });
+        } catch {
+          throw new Error(`Skill 已安装，但旧版本清理失败，请检查 ${prior}`);
+        }
+      }
+      return info;
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      if (ownedStage && !committed) {
+        try {
+          fs.rmSync(stage, { recursive: true, force: true });
+        } catch (cleanupError) {
           throw new AggregateError(
-            [error, restoreError],
-            `Skill 发布失败，旧版本恢复失败，请检查 ${prior}`,
+            [failure, cleanupError],
+            `Skill 安装失败且暂存目录清理失败，请检查 ${stage}`,
           );
         }
       }
-      throw error;
     }
-    committed = true;
-    if (prior) {
-      try {
-        fs.rmSync(prior, { recursive: true, force: true });
-      } catch {
-        throw new Error(`Skill 已安装，但旧版本清理失败，请检查 ${prior}`);
-      }
-    }
-    return info;
-  } catch (error) {
-    failure = error;
-    throw error;
-  } finally {
-    if (ownedStage && !committed) {
-      try {
-        fs.rmSync(stage, { recursive: true, force: true });
-      } catch (cleanupError) {
-        throw new AggregateError(
-          [failure, cleanupError],
-          `Skill 安装失败且暂存目录清理失败，请检查 ${stage}`,
-        );
-      }
-    }
-  }
+  });
 }
 export function installLocal(dir: string): SkillInfo {
   return installDirectory(path.resolve(dir), `local:${path.resolve(dir)}`, '');
@@ -329,18 +349,22 @@ export function setSkillEnabled(name: string, enabled: boolean): void {
     setBuiltinEnabled(name, enabled);
     return;
   }
-  const file = path.join(skill.path, '.bruin-source.json');
-  const data = JSON.parse(readSkillText(file, 64_000));
-  data.enabled = enabled;
-  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 });
-  fs.renameSync(temp, file);
+  withFileLock(skillLockPath(name), () => {
+    const file = path.join(skill.path, '.bruin-source.json');
+    const data = JSON.parse(readSkillText(file, 64_000));
+    data.enabled = enabled;
+    const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.renameSync(temp, file);
+  });
 }
 export function uninstallSkill(name: string): void {
   const skill = listSkills().find((x) => x.name === name);
   if (!skill) throw new Error('Skill 不存在');
   if (skill.source.startsWith('builtin:')) throw new Error('内置 Skill 不能卸载，可选择停用');
-  fs.rmSync(skill.path, { recursive: true });
+  withFileLock(skillLockPath(name), () => {
+    fs.rmSync(skill.path, { recursive: true });
+  });
 }
 export async function updateSkill(name: string): Promise<SkillInfo> {
   const skill = listSkills().find((x) => x.name === name);
