@@ -702,32 +702,63 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       while (true) {
         const row = this.db
-          .prepare('SELECT * FROM cron_jobs WHERE next_run_at <= ? ORDER BY next_run_at LIMIT 1')
-          .get(now) as any;
+          .prepare(
+            `SELECT * FROM cron_jobs WHERE next_run_at <= ?
+            AND COALESCE(last_status, '') NOT IN ('dispatched', 'needs_review')
+            AND NOT EXISTS (SELECT 1 FROM session_leases l
+              WHERE l.session_id = cron_jobs.session_id AND l.expires_at >= ?)
+            ORDER BY next_run_at LIMIT 1`,
+          )
+          .get(now, Date.now()) as any;
         if (!row) return [];
         const job = this.rowToCronJob(row);
+        let next: number;
         try {
-          const next = CronExpressionParser.parse(job.expression, { currentDate: new Date(now) })
+          next = CronExpressionParser.parse(job.expression, { currentDate: new Date(now) })
             .next()
             .getTime();
-          this.db
-            .prepare(
-              `UPDATE cron_jobs SET next_run_at = ?, last_status = 'dispatched' WHERE id = ?`,
-            )
-            .run(next, job.id);
-          return [job];
         } catch {
           this.db
             .prepare(
               `UPDATE cron_jobs SET next_run_at = ?, last_status = 'invalid_expression' WHERE id = ?`,
             )
             .run(now + 86_400_000, job.id);
+          continue;
         }
+        this.append(job.sessionId, 'cron_started', {
+          jobId: job.id,
+          runId: randomUUID(),
+          scheduledFor: job.nextRunAt,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        });
+        this.db
+          .prepare(`UPDATE cron_jobs SET next_run_at = ?, last_status = 'dispatched' WHERE id = ?`)
+          .run(next, job.id);
+        return [job];
       }
     })();
   }
   markCronJob(id: string, status: string): void {
-    this.db.prepare('UPDATE cron_jobs SET last_status = ? WHERE id = ?').run(status, id);
+    this.db.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id) as any;
+      if (!row) return;
+      const events = this.events(row.session_id);
+      const run = [...events]
+        .reverse()
+        .find((event) => event.type === 'cron_started' && event.payload.jobId === id);
+      if (
+        run &&
+        !events.some(
+          (event) => event.type === 'cron_finished' && event.payload.runId === run.payload.runId,
+        )
+      )
+        this.append(row.session_id, 'cron_finished', {
+          jobId: id,
+          runId: run.payload.runId,
+          status,
+        });
+      this.db.prepare('UPDATE cron_jobs SET last_status = ? WHERE id = ?').run(status, id);
+    })();
   }
   listMemory(workspace: string): MemoryPage[] {
     return (

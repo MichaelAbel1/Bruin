@@ -37,6 +37,7 @@ import {
 } from './skills/registry.js';
 import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
+import { recoverCronJobs } from './runtime/cron.js';
 import {
   listWorkspaceEntries,
   readWorkspaceFile,
@@ -924,6 +925,7 @@ async function scheduleTick() {
   if (active || scheduling) return;
   scheduling = true;
   try {
+    recoverCronJobs(store);
     const job = store.takeDueCronJobs(Date.now())[0];
     if (job) {
       const session = store.getSession(job.sessionId);
@@ -932,7 +934,11 @@ async function scheduleTick() {
         return;
       }
       try {
-        await startRun(session, job.prompt);
+        await startRun(session, job.prompt, [], undefined, {
+          maxModelCalls: 24,
+          allowWorkspaceEdits: false,
+          unattended: process.env.BRUIN_SERVICE === '1',
+        });
         await activeRun;
         const last = store.events(session.id).at(-1);
         store.markCronJob(job.id, last?.type === 'turn_completed' ? 'completed' : 'needs_review');
@@ -955,6 +961,13 @@ async function scheduleTick() {
         await startRun(
           session,
           `Execute claimed task ${task.id}: ${task.title}. Respect dependencies and tool approvals. Call finish_task with this ID only after verifying the result. If blocked, report why; do not claim success.`,
+          [],
+          undefined,
+          {
+            maxModelCalls: 24,
+            allowWorkspaceEdits: false,
+            unattended: process.env.BRUIN_SERVICE === '1',
+          },
         );
         await activeRun;
         services.finishClaimIfOpen(task.id);

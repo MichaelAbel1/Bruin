@@ -41,7 +41,9 @@ export type EventType =
   | 'background_started'
   | 'background_finished'
   | 'hook_finished'
-  | 'mcp_capabilities';
+  | 'mcp_capabilities'
+  | 'cron_started'
+  | 'cron_finished';
 export interface SessionEvent {
   sessionId: string;
   seq: number;

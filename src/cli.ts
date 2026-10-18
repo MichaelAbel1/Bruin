@@ -35,6 +35,7 @@ import {
 import { searchSkillsSh, installSkillsSh } from './skills/skills-sh.js';
 import type { ModelProfile, ProviderKind, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
+import { runService } from './runtime/service.js';
 
 const help = `Bruin — local coding agent
 
@@ -42,6 +43,8 @@ bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV] [--context-tokens 
 bruin model list | default ALIAS
 bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [PROMPT]
 bruin sessions list | show SESSION_ID
+bruin service run [--timezone IANA_ZONE]
+bruin cron list | review JOB_ID --confirm
 bruin skill list | show NAME | enable NAME | disable NAME | install-local DIR | install-github OWNER/REPO SUBDIR [REF] | update NAME | remove NAME
 bruin market add NAME OWNER/REPO | list | search NAME | install MARKET SKILL
 bruin market skills-sh-search QUERY | skills-sh-install OWNER/REPO/SKILL
@@ -61,6 +64,13 @@ async function main(): Promise<void> {
   const area = args.shift();
   if (!area || area === 'help' || area === '--help') {
     console.log(help);
+    return;
+  }
+  if (area === 'service') {
+    const action = args.shift();
+    const timezone = takeFlag(args, '--timezone');
+    if (action !== 'run' || args.length) throw new Error(help);
+    await runService(timezone);
     return;
   }
   if (area === 'model') {
@@ -186,6 +196,28 @@ async function main(): Promise<void> {
   }
   const store = new SqliteEventStore(path.join(dataDir(), 'sessions.sqlite'));
   try {
+    if (area === 'cron') {
+      const action = args.shift();
+      const jobs = store.listSessions().flatMap((session) => store.listCronJobs(session.id));
+      if (action === 'list' && !args.length) {
+        console.log(JSON.stringify(jobs, null, 2));
+        return;
+      }
+      const job = jobs.find((job) => job.id === args[0]);
+      if (action !== 'review' || !job || args[1] !== '--confirm' || args.length !== 2)
+        throw new Error(
+          '检查会话事件及工作区后，使用 bruin cron review JOB_ID --confirm 解锁后续调度',
+        );
+      const owner = randomUUID();
+      store.acquireLease(job.sessionId, owner, 10_000);
+      try {
+        store.markCronJob(job.id, 'reviewed');
+      } finally {
+        store.releaseLease(job.sessionId, owner);
+      }
+      console.log('已确认检查，后续到期调度已解锁');
+      return;
+    }
     if (area === 'sessions') {
       const action = args.shift();
       if (action === 'list') {
