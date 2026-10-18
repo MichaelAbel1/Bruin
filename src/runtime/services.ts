@@ -20,10 +20,12 @@ type Background = {
   result?: ToolResult;
 };
 type Subagent = {
+  parentSessionId: string;
   sessionId: string;
   controller: AbortController;
   status: 'running' | 'completed' | 'failed';
   error?: string;
+  settled?: Promise<void>;
 };
 
 export class RuntimeServices {
@@ -35,6 +37,30 @@ export class RuntimeServices {
   private background = new Map<string, Background>();
   private subagents = new Map<string, Subagent>();
   private pending = new Set<Promise<unknown>>();
+  async waitForSubagents(
+    sessionId: string,
+    signal: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<void> {
+    const tasks = [...this.subagents.values()].filter(
+      (task) => task.parentSessionId === sessionId && task.status === 'running',
+    );
+    if (!tasks.length) return;
+    if (signal.aborted) throw new Error('已取消');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort!: () => void;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        abort = () => reject(new Error('已取消'));
+        timer = timeoutMs === undefined ? undefined : setTimeout(resolve, Math.max(0, timeoutMs));
+        signal.addEventListener('abort', abort, { once: true });
+        void Promise.all(tasks.map((task) => task.settled)).then(() => resolve(), reject);
+      });
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+    }
+  }
   constructor(
     private store: EventStore,
     private executor: ToolExecutor,
@@ -412,7 +438,12 @@ export class RuntimeServices {
           }
           throw error;
         }
-        this.subagents.set(child.id, { sessionId: child.id, controller, status: 'running' });
+        this.subagents.set(child.id, {
+          parentSessionId: session.id,
+          sessionId: child.id,
+          controller,
+          status: 'running',
+        });
         const running = Promise.resolve()
           .then(() => this.runSubagent(child, prompt, controller.signal))
           .then(() => {
@@ -426,6 +457,13 @@ export class RuntimeServices {
             this.store.append(session.id, 'subagent_finished', {
               childId: child.id,
               status: 'completed',
+              answer: String(
+                [...this.store.events(child.id)]
+                  .reverse()
+                  .find(
+                    (event) => event.type === 'assistant' && typeof event.payload.text === 'string',
+                  )?.payload.text ?? '',
+              ).slice(0, 20_000),
             });
           })
           .catch((error) => {
@@ -448,6 +486,7 @@ export class RuntimeServices {
               parentLease.release();
             }
           });
+        this.subagents.get(child.id)!.settled = running;
         this.pending.add(running);
         void running.then(
           () => this.pending.delete(running),
