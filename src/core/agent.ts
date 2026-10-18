@@ -13,9 +13,10 @@ import {
 } from './history.js';
 import { decisionFor } from './permissions.js';
 import { listSkills, loadSkill } from '../skills/registry.js';
-import { modelProtocol, resolveApiKey, toolSchemas } from '../providers/gateway.js';
+import { modelProtocol, resolveApiKey } from '../providers/gateway.js';
 import { planBlocks, planState } from '../runtime/plan.js';
 import type { RuntimeServices } from '../runtime/services.js';
+import { toolDefinition } from './tools.js';
 import { loadConfig } from '../config.js';
 import { loadInstructions } from './instructions.js';
 import type { AttachmentRef } from './attachments.js';
@@ -115,10 +116,7 @@ function repeatedFailedTools(events: SessionEvent[]): string[] {
       if (!request || event.type === 'tool_unknown') continue;
       const name = String(request.payload.name);
       // Polling can legitimately repeat while a child or background process runs.
-      if (
-        ['background_status', 'subagent_status'].includes(name) ||
-        !Object.hasOwn(toolSchemas, name)
-      )
+      if (['background_status', 'subagent_status'].includes(name) || !toolDefinition(name))
         continue;
       const key = JSON.stringify([name, request.payload.input], (_key, value: unknown) =>
         value && typeof value === 'object' && !Array.isArray(value)
@@ -697,9 +695,9 @@ export class AgentRunner {
           name: call.name,
           input: call.input,
         });
-        const schema = Object.hasOwn(toolSchemas, call.name) ? toolSchemas[call.name] : undefined;
+        const schema = toolDefinition(call.name);
         const parsed = schema?.inputSchema.safeParse(call.input);
-        if (!parsed?.success) {
+        if (!schema || !parsed?.success) {
           const detail = parsed?.error
             ? parsed.error.issues
                 .map((i) => `${i.path.join('.') || 'input'}: ${i.message}`)
@@ -716,15 +714,7 @@ export class AgentRunner {
         }
         call.input = parsed.data as Record<string, unknown>;
         const policy =
-          this.readOnly &&
-          ![
-            'read_file',
-            'list_files',
-            'search_repository',
-            'list_snapshots',
-            'search',
-            'load_skill',
-          ].includes(call.name)
+          this.readOnly && !schema.readOnly
             ? { decision: 'deny' as const, reason: '子 Agent 只能使用只读工具' }
             : planBlocks(call, planState(this.store.events(session.id)))
               ? { decision: 'deny' as const, reason: '规划模式等待用户批准计划' }
@@ -804,19 +794,7 @@ export class AgentRunner {
                 result = { output: loaded.content, isError: false };
               }
             }
-          } else if (
-            ![
-              'read_file',
-              'list_files',
-              'search_repository',
-              'list_snapshots',
-              'restore_snapshot',
-              'write_file',
-              'edit_file',
-              'search',
-              'shell',
-            ].includes(call.name)
-          ) {
+          } else if (schema.target === 'runtime') {
             result = this.services
               ? await this.services.execute(call, session, signal)
               : { output: '此运行模式不支持该工具', isError: true };

@@ -1,36 +1,5 @@
 export type ProviderKind = 'openai' | 'anthropic' | 'google' | 'openai-compatible';
-export type ToolName =
-  | 'read_file'
-  | 'list_files'
-  | 'search_repository'
-  | 'list_snapshots'
-  | 'restore_snapshot'
-  | 'write_file'
-  | 'edit_file'
-  | 'search'
-  | 'shell'
-  | 'load_skill'
-  | 'mcp_list_tools'
-  | 'mcp_call'
-  | 'spawn_subagent'
-  | 'subagent_status'
-  | 'create_worktree'
-  | 'list_worktrees'
-  | 'remove_worktree'
-  | 'start_background'
-  | 'background_status'
-  | 'cancel_background'
-  | 'update_plan'
-  | 'update_plan_progress'
-  | 'create_task'
-  | 'list_tasks'
-  | 'get_task'
-  | 'update_task'
-  | 'claim_task'
-  | 'finish_task'
-  | 'list_memory'
-  | 'save_memory'
-  | 'remember_preference';
+export type ToolName = keyof typeof import('./tools.js').toolDefinitions;
 export interface ModelProfile {
   alias: string;
   provider: ProviderKind;

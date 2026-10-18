@@ -1,3 +1,4 @@
+import { toolDefinition } from '../core/tools.js';
 import type { EventStore } from '../storage/event-store.js';
 import type { SessionEvent, ToolCall } from '../core/types.js';
 
@@ -27,26 +28,7 @@ export function planState(events: SessionEvent[]): PlanState {
   return state;
 }
 export function planBlocks(call: ToolCall, state: PlanState): boolean {
-  return (
-    state.enabled &&
-    !state.approved &&
-    ![
-      'read_file',
-      'list_files',
-      'search_repository',
-      'list_snapshots',
-      'search',
-      'load_skill',
-      'update_plan',
-      'mcp_list_tools',
-      'list_worktrees',
-      'subagent_status',
-      'background_status',
-      'list_tasks',
-      'get_task',
-      'list_memory',
-    ].includes(call.name)
-  );
+  return state.enabled && !state.approved && !toolDefinition(call.name)?.planning;
 }
 export function setPlanMode(store: EventStore, sessionId: string, enabled: boolean): PlanState {
   store.append(sessionId, 'plan_mode', { enabled });

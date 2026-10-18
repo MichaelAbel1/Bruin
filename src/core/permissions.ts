@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { toolDefinition } from './tools.js';
 import type { ToolCall } from './types.js';
 
 export type Decision = 'allow' | 'ask' | 'deny';
@@ -9,42 +10,7 @@ export function decisionFor(
   workspace: string,
   managedPending = false,
 ): { decision: Decision; reason: string } {
-  if (
-    ![
-      'read_file',
-      'list_files',
-      'search_repository',
-      'list_snapshots',
-      'restore_snapshot',
-      'write_file',
-      'edit_file',
-      'search',
-      'shell',
-      'load_skill',
-      'mcp_list_tools',
-      'mcp_call',
-      'spawn_subagent',
-      'subagent_status',
-      'create_worktree',
-      'list_worktrees',
-      'remove_worktree',
-      'start_background',
-      'background_status',
-      'cancel_background',
-      'update_plan',
-      'update_plan_progress',
-      'create_task',
-      'list_tasks',
-      'get_task',
-      'update_task',
-      'claim_task',
-      'finish_task',
-      'list_memory',
-      'save_memory',
-      'remember_preference',
-    ].includes(call.name)
-  )
-    return { decision: 'deny', reason: '未知工具' };
+  if (!toolDefinition(call.name)) return { decision: 'deny', reason: '未知工具' };
   if (call.name === 'shell')
     return {
       decision: 'ask',

@@ -1,0 +1,381 @@
+import { z } from 'zod';
+
+// Internal registry only. Registration never grants execution permission.
+export const toolDefinitions = {
+  search_repository: {
+    target: 'executor' as const,
+    readOnly: true,
+    basic: true,
+    planning: true,
+    parallel: true,
+    replay: 'safe' as const,
+    description:
+      'Search a local file/symbol index. Revalidates content hashes; supports common declaration forms, not a full semantic graph. Returns source lines for paged reading.',
+    inputSchema: z.object({
+      query: z.string().max(500),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+  },
+  list_snapshots: {
+    target: 'executor' as const,
+    readOnly: true,
+    basic: true,
+    planning: true,
+    parallel: true,
+    replay: 'safe' as const,
+    description: 'List automatic snapshots of Bruin file changes in this workspace.',
+    inputSchema: z.object({
+      offset: z.number().int().min(0).optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+  },
+  restore_snapshot: {
+    target: 'executor' as const,
+    readOnly: false,
+    basic: true,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Restore one file snapshot. Requires approval; rejects subsequent changes. Reverting a newly created file deletes it.',
+    inputSchema: z.object({ id: z.string().uuid() }),
+  },
+  read_file: {
+    target: 'executor' as const,
+    readOnly: true,
+    basic: true,
+    planning: true,
+    parallel: true,
+    replay: 'safe' as const,
+    description:
+      'Read a UTF-8 workspace file. Optional startLine (1-based) and lineCount select a page; with either option, lineCount defaults to 200. Output is still byte-limited.',
+    inputSchema: z.object({
+      path: z.string(),
+      startLine: z.number().int().min(1).max(1_000_000).optional(),
+      lineCount: z.number().int().min(1).max(10_000).optional(),
+    }),
+  },
+  list_files: {
+    target: 'executor' as const,
+    readOnly: true,
+    basic: true,
+    planning: true,
+    parallel: true,
+    replay: 'safe' as const,
+    description:
+      'List one workspace directory, sorted with directories first. Skips symlinks and special files. Use path for subdirectories and nextOffset to page through entries; does not apply gitignore.',
+    inputSchema: z.object({
+      path: z.string().min(1).optional(),
+      offset: z.number().int().min(0).max(1_000_000).optional(),
+      limit: z.number().int().min(1).max(300).optional(),
+    }),
+  },
+  write_file: {
+    target: 'executor' as const,
+    readOnly: false,
+    basic: true,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Create or replace a UTF-8 file inside the workspace',
+    inputSchema: z.object({ path: z.string(), content: z.string() }),
+  },
+  edit_file: {
+    target: 'executor' as const,
+    readOnly: false,
+    basic: true,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Replace exactly one occurrence in a UTF-8 file',
+    inputSchema: z.object({ path: z.string(), oldText: z.string(), newText: z.string() }),
+  },
+  search: {
+    target: 'executor' as const,
+    readOnly: true,
+    basic: true,
+    planning: true,
+    parallel: true,
+    replay: 'safe' as const,
+    description: 'Search workspace text with ripgrep',
+    inputSchema: z.object({ pattern: z.string(), glob: z.string().optional() }),
+  },
+  load_skill: {
+    target: 'skill' as const,
+    readOnly: true,
+    basic: true,
+    planning: true,
+    parallel: false,
+    replay: 'safe' as const,
+    description: 'Load the instructions of an installed skill by name',
+    inputSchema: z.object({ name: z.string() }),
+  },
+  shell: {
+    target: 'executor' as const,
+    readOnly: false,
+    basic: true,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Run a shell command in the workspace. Requires user approval.',
+    inputSchema: z.object({ command: z.string() }),
+  },
+  mcp_list_tools: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'List tools offered by a configured MCP server',
+    inputSchema: z.object({ server: z.string() }),
+  },
+  mcp_call: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Call a configured MCP server tool. Requires user approval.',
+    inputSchema: z.object({
+      server: z.string(),
+      tool: z.string(),
+      arguments: z.record(z.string(), z.unknown()).default({}),
+    }),
+  },
+  spawn_subagent: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Start a read-only subagent for a bounded research task',
+    inputSchema: z.object({ prompt: z.string(), worktree: z.string().optional() }),
+  },
+  subagent_status: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Read a subagent result by ID',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  create_worktree: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Create an isolated Git worktree at HEAD',
+    inputSchema: z.object({ name: z.string().optional() }),
+  },
+  list_worktrees: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'List Git worktrees for this workspace',
+    inputSchema: z.object({}),
+  },
+  remove_worktree: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Remove a clean Bruin-managed Git worktree. Requires approval.',
+    inputSchema: z.object({ path: z.string() }),
+  },
+  start_background: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Start a sandboxed shell command in the background. Requires approval.',
+    inputSchema: z.object({ command: z.string() }),
+  },
+  background_status: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Read a background command status and output',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  cancel_background: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Stop a background command',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  update_plan: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Create or revise a step-by-step execution plan. A revised plan needs user approval before changes.',
+    inputSchema: z.object({ steps: z.array(z.string().min(1)).min(1).max(30) }),
+  },
+  update_plan_progress: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Mark an approved plan step pending, in progress or completed',
+    inputSchema: z.object({
+      index: z.number().int().min(0),
+      status: z.enum(['pending', 'in_progress', 'completed']),
+    }),
+  },
+  create_task: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Add a task to the workspace task graph. Dependencies must be existing task IDs in this workspace.',
+    inputSchema: z.object({
+      title: z.string().min(1).max(500),
+      description: z.string().max(8000).default(''),
+      dependencies: z.array(z.string()).max(30).default([]),
+    }),
+  },
+  list_tasks: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'List durable tasks and their dependencies for this workspace',
+    inputSchema: z.object({}),
+  },
+  get_task: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Read full details, owner and dependencies of one workspace task',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  update_task: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Edit a workspace task and add dependencies; cycles are rejected. Requires approval.',
+    inputSchema: z.object({
+      id: z.string(),
+      title: z.string().min(1).max(500).optional(),
+      description: z.string().max(8000).optional(),
+      addBlockedBy: z.array(z.string()).max(30).optional(),
+    }),
+  },
+  claim_task: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Atomically claim the next ready task for this local Bruin process',
+    inputSchema: z.object({}),
+  },
+  finish_task: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Mark a task claimed by this process completed or failed',
+    inputSchema: z.object({ id: z.string(), success: z.boolean() }),
+  },
+  list_memory: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Read persistent memory for this workspace',
+    inputSchema: z.object({}),
+  },
+  save_memory: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description: 'Save a persistent memory page for this workspace. Requires user approval.',
+    inputSchema: z.object({ key: z.string(), content: z.string() }),
+  },
+  remember_preference: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: false,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Remember a lasting user preference only when explicitly stated in the latest user message. Pass the exact words, not an inference.',
+    inputSchema: z.object({ content: z.string().min(1).max(1000) }),
+  },
+};
+
+export type ToolMode = 'basic' | 'full' | 'read-only';
+export const toolSchemas = Object.fromEntries(
+  Object.entries(toolDefinitions).map(([name, { description, inputSchema }]) => [
+    name,
+    { description, inputSchema },
+  ]),
+) as {
+  [K in keyof typeof toolDefinitions]: Pick<
+    (typeof toolDefinitions)[K],
+    'description' | 'inputSchema'
+  >;
+};
+
+export function toolsForMode(mode: ToolMode) {
+  return Object.fromEntries(
+    Object.entries(toolSchemas).filter(([name]) => {
+      const definition = toolDefinitions[name as keyof typeof toolDefinitions];
+      return mode === 'full' || (mode === 'read-only' ? definition.readOnly : definition.basic);
+    }),
+  );
+}
+
+export function toolDefinition(name: string) {
+  return Object.hasOwn(toolDefinitions, name)
+    ? toolDefinitions[name as keyof typeof toolDefinitions]
+    : undefined;
+}
