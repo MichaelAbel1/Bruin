@@ -455,8 +455,8 @@ export class AgentRunner {
         : '';
       const mcpInstruction = this.services
         ? `\nConfigured MCP servers (discover tools with mcp_list_tools): ${
-            loadConfig()
-              .mcpServers.map((item) => item.name)
+            (this.services.configuredMcpServers?.() ?? loadConfig().mcpServers)
+              .map((item) => item.name)
               .join(', ') || '(none)'
           }. MCP calls require approval.`
         : '';

@@ -85,6 +85,7 @@ function sandboxProfile(workspace: string, _executable: string): string {
 
 /** Connections are owned by the host. No MCP process inherits model credentials by default. */
 export class McpManager {
+  constructor(private sessionEnv: Record<string, Record<string, string>> = {}) {}
   onCredentials?: (name: string, signature: string, state?: OAuthSnapshot) => void;
   restoreOAuth(server: McpServerConfig, signature: string, state: unknown) {
     if (server.transport !== 'http' || !server.oauth || signature !== JSON.stringify(server))
@@ -204,8 +205,12 @@ export class McpManager {
             : {}),
           ...Object.fromEntries(
             server.envNames
-              .filter((name) => process.env[name] !== undefined)
-              .map((name) => [name, process.env[name]!]),
+              .filter(
+                (name) =>
+                  this.sessionEnv[server.name]?.[name] !== undefined ||
+                  process.env[name] !== undefined,
+              )
+              .map((name) => [name, this.sessionEnv[server.name]?.[name] ?? process.env[name]!]),
           ),
         },
         stderr: 'pipe',

@@ -7,7 +7,7 @@ import type { EventStore } from '../storage/event-store.js';
 import type { TaskNode } from '../storage/event-store.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { Session, ToolCall, ToolResult } from '../core/types.js';
-import { dataDir, loadConfig, type HookConfig } from '../config.js';
+import { dataDir, loadConfig, type HookConfig, type McpServerConfig } from '../config.js';
 import { McpManager } from './mcp.js';
 import { planState, setPlanProgress } from './plan.js';
 import { SessionLeases } from '../core/session-leases.js';
@@ -29,7 +29,10 @@ type Subagent = {
 };
 
 export class RuntimeServices {
-  readonly mcp = new McpManager();
+  readonly mcp: McpManager;
+  configuredMcpServers(): McpServerConfig[] {
+    return this.sessionMcp?.servers ?? loadConfig().mcpServers;
+  }
   readonly sessionLeases: SessionLeases;
   private readonly taskOwner = randomUUID();
   private readonly claimedTasks = new Set<string>();
@@ -65,7 +68,12 @@ export class RuntimeServices {
     private store: EventStore,
     private executor: ToolExecutor,
     private runSubagent: (session: Session, prompt: string, signal: AbortSignal) => Promise<void>,
+    private sessionMcp?: {
+      servers: McpServerConfig[];
+      env: Record<string, Record<string, string>>;
+    },
   ) {
+    this.mcp = new McpManager(sessionMcp?.env);
     this.sessionLeases = new SessionLeases(store);
     this.taskHeartbeat = setInterval(() => {
       for (const id of this.claimedTasks) {
@@ -260,7 +268,7 @@ export class RuntimeServices {
         }
       }
       case 'mcp_list_tools': {
-        const server = loadConfig().mcpServers.find((item) => item.name === input.server);
+        const server = this.configuredMcpServers().find((item) => item.name === input.server);
         if (!server) return { output: 'MCP 服务器未配置', isError: true };
         const tools = await this.mcp.listTools(server, session.workspace);
         this.store.append(session.id, 'mcp_capabilities', {
@@ -274,7 +282,7 @@ export class RuntimeServices {
         };
       }
       case 'mcp_call': {
-        const server = loadConfig().mcpServers.find((item) => item.name === input.server);
+        const server = this.configuredMcpServers().find((item) => item.name === input.server);
         if (!server) return { output: 'MCP 服务器未配置', isError: true };
         return this.mcp.callTool(
           server,

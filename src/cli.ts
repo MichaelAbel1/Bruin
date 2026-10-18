@@ -44,6 +44,7 @@ bruin model list | default ALIAS
 bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [PROMPT]
 bruin sessions list | show SESSION_ID
 bruin service run [--timezone IANA_ZONE]
+bruin acp [--model ALIAS]
 bruin cron list | review JOB_ID --confirm
 bruin skill list | show NAME | enable NAME | disable NAME | install-local DIR | install-github OWNER/REPO SUBDIR [REF] | update NAME | remove NAME
 bruin market add NAME OWNER/REPO | list | search NAME | install MARKET SKILL
@@ -71,6 +72,13 @@ async function main(): Promise<void> {
     const timezone = takeFlag(args, '--timezone');
     if (action !== 'run' || args.length) throw new Error(help);
     await runService(timezone);
+    return;
+  }
+  if (area === 'acp') {
+    const model = takeFlag(args, '--model');
+    if (args.length) throw new Error(help);
+    const { runAcp } = await import('./runtime/acp.js');
+    await runAcp(model);
     return;
   }
   if (area === 'model') {

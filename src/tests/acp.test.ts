@@ -1,0 +1,251 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { PassThrough } from 'node:stream';
+import { AcpServer, runAcp } from '../runtime/acp.js';
+import { McpManager } from '../runtime/mcp.js';
+import { SqliteEventStore } from '../storage/event-store.js';
+import { saveConfig, loadConfig } from '../config.js';
+import type { ModelGateway } from '../providers/gateway.js';
+
+function fixture(gateway: ModelGateway) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-acp-'));
+  const old = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  saveConfig({
+    ...loadConfig(),
+    profiles: [{ alias: 'test', provider: 'openai', model: 'mock' }],
+    defaultProfile: 'test',
+  });
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  const messages: any[] = [];
+  let effects = 0;
+  const server = new AcpServer(
+    store,
+    {
+      async execute() {
+        effects++;
+        return { output: 'written', isError: false };
+      },
+      async close() {},
+    },
+    (message) => messages.push(message),
+    undefined,
+    () => gateway,
+  );
+  let id = 0;
+  return {
+    dir,
+    store,
+    server,
+    messages,
+    effects: () => effects,
+    async request(method: string, params: unknown) {
+      const requestId = ++id;
+      await server.handle({ jsonrpc: '2.0', id: requestId, method, params });
+      return messages.find((message) => message.id === requestId);
+    },
+    async close() {
+      await server.close();
+      store.close();
+      if (old === undefined) delete process.env.BRUIN_HOME;
+      else process.env.BRUIN_HOME = old;
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test('ACP negotiates v1, validates capabilities, preserves streams and records normal sessions', async () => {
+  const f = fixture({
+    async complete(_profile, prompt, _signal, onText) {
+      assert.match(JSON.stringify(prompt), /Resource link.*example.ts/);
+      onText('Hello ');
+      onText('IDE');
+      return { text: 'Hello IDE', calls: [] };
+    },
+  });
+  try {
+    assert.equal((await f.request('session/new', {})).error.code, -32600);
+    assert.equal((await f.request('initialize', { protocolVersion: 2 })).result.protocolVersion, 1);
+    assert.equal((await f.request('session/new', { cwd: '.', mcpServers: [] })).error.code, -32602);
+    const created = await f.request('session/new', { cwd: f.dir, mcpServers: [] });
+    const sessionId = created.result.sessionId;
+    assert.equal((await f.request('session/load', {})).error.code, -32601);
+    assert.equal(
+      (await f.request('session/prompt', { sessionId, prompt: [{ type: 'image', data: 'x' }] }))
+        .error.code,
+      -32602,
+    );
+    const reply = await f.request('session/prompt', {
+      sessionId,
+      prompt: [
+        { type: 'text', text: 'Inspect' },
+        { type: 'resource_link', uri: 'file:///example.ts', name: 'example.ts' },
+      ],
+    });
+    assert.equal(reply.result.stopReason, 'end_turn');
+    const chunks = f.messages.filter(
+      (message) => message.params?.update.sessionUpdate === 'agent_message_chunk',
+    );
+    assert.equal(chunks.map((message) => message.params.update.content.text).join(''), 'Hello IDE');
+    assert.equal(f.store.isLeased(sessionId), false);
+    assert.equal(f.store.events(sessionId).at(-1)?.type, 'turn_completed');
+  } finally {
+    await f.close();
+  }
+});
+
+for (const outcome of ['allow', 'reject', 'cancelled', 'invalid'] as const) {
+  test(`ACP tool permission ${outcome} cannot bypass approval`, async () => {
+    let calls = 0;
+    const f = fixture({
+      async complete() {
+        if (++calls === 1)
+          return {
+            text: '',
+            calls: [{ id: 'write', name: 'write_file', input: { path: 'a.txt', content: 'data' } }],
+          };
+        return { text: 'done', calls: [] };
+      },
+    });
+    try {
+      await f.request('initialize', { protocolVersion: 1 });
+      const sessionId = (await f.request('session/new', { cwd: f.dir, mcpServers: [] })).result
+        .sessionId;
+      const running = f.request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'write' }],
+      });
+      const deadline = Date.now() + 3000;
+      while (!f.messages.some((message) => message.method === 'session/request_permission')) {
+        if (Date.now() > deadline) throw new Error('permission timeout');
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(f.effects(), 0);
+      assert.equal(
+        (
+          await f.request('session/prompt', {
+            sessionId,
+            prompt: [{ type: 'text', text: 'overlap' }],
+          })
+        ).error.code,
+        -32600,
+      );
+      const permission = f.messages.find(
+        (message) => message.method === 'session/request_permission',
+      );
+      if (outcome === 'cancelled')
+        await f.server.handle({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+      else
+        await f.server.handle({
+          jsonrpc: '2.0',
+          id: permission.id,
+          result: { outcome: { outcome: 'selected', optionId: outcome } },
+        });
+      const reply = await running;
+      assert.equal(reply.result.stopReason, outcome === 'cancelled' ? 'cancelled' : 'end_turn');
+      assert.equal(f.effects(), outcome === 'allow' ? 1 : 0);
+      assert.equal(f.store.isLeased(sessionId), false);
+      assert.ok(f.messages.some((message) => message.params?.update.sessionUpdate === 'tool_call'));
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test('session MCP environments stay per server and out of persisted config and events', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-acp-env-'));
+  const script = path.join(dir, 'server.cjs');
+  fs.writeFileSync(
+    script,
+    `require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+    const message=JSON.parse(line); if(message.id===undefined)return;
+    const result=message.method==='initialize'?{protocolVersion:message.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'test',version:'1'}}:{tools:[{name:'env',description:process.env.ACP_SECRET,inputSchema:{type:'object'}}]};
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\\n');
+  });`,
+  );
+  const manager = new McpManager({ one: { ACP_SECRET: 'first' }, two: { ACP_SECRET: 'second' } });
+  try {
+    const server = {
+      transport: 'stdio' as const,
+      command: process.execPath,
+      args: [script],
+      envNames: ['ACP_SECRET'],
+    };
+    assert.equal(
+      (await manager.listTools({ ...server, name: 'one' }, dir))[0].description,
+      'first',
+    );
+    assert.equal(
+      (await manager.listTools({ ...server, name: 'two' }, dir))[0].description,
+      'second',
+    );
+    assert.equal(process.env.ACP_SECRET, undefined);
+  } finally {
+    await manager.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const f = fixture({
+    async complete() {
+      return { text: 'done', calls: [] };
+    },
+  });
+  try {
+    await f.request('initialize', { protocolVersion: 1 });
+    await f.request('session/new', {
+      cwd: f.dir,
+      mcpServers: [
+        {
+          name: 'local',
+          command: process.execPath,
+          args: [],
+          env: [{ name: 'ACP_SECRET', value: 'DO_NOT_PERSIST' }],
+        },
+      ],
+    });
+    assert.doesNotMatch(JSON.stringify(loadConfig()), /DO_NOT_PERSIST/);
+    assert.doesNotMatch(
+      JSON.stringify(f.store.listSessions().map((session) => f.store.events(session.id))),
+      /DO_NOT_PERSIST/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('ACP stdio emits protocol-only output and handles malformed JSON and EOF', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-acp-stdio-'));
+  const old = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = dir;
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let text = '';
+  output.on('data', (chunk) => {
+    text += chunk;
+  });
+  try {
+    const serving = runAcp(undefined, input, output);
+    input.write('{invalid}\n');
+    input.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: 1 },
+      }) + '\n',
+    );
+    await serving;
+    const messages = text
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(messages[0].error.code, -32700);
+    assert.equal(messages[1].result.protocolVersion, 1);
+  } finally {
+    if (old === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = old;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
