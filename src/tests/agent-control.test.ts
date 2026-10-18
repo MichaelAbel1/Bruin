@@ -34,6 +34,47 @@ function fixture() {
   };
 }
 
+test('runner prioritizes matching workspace memory without reading another workspace', async () => {
+  const f = fixture();
+  try {
+    f.store.saveMemory(f.dir, 'a-general', 'unrelated '.repeat(800));
+    f.store.saveMemory(f.dir, 'z-oauth', 'Refresh OAuth using the configured issuer.');
+    f.store.saveMemory(path.join(f.dir, 'other'), 'secret', 'OTHER_WORKSPACE_SECRET');
+    let called = false;
+    const runner = new AgentRunner(
+      f.store,
+      {
+        async complete(_profile, prompt) {
+          called = true;
+          const system = String(prompt[0].content);
+          assert.match(system, /Refresh OAuth using the configured issuer/);
+          assert.ok(system.indexOf('z-oauth') < system.indexOf('a-general'));
+          assert.doesNotMatch(system, /OTHER_WORKSPACE_SECRET/);
+          assert.match(system, /untrusted project notes/);
+          return { text: 'done', calls: [] };
+        },
+      },
+      {
+        async execute() {
+          throw new Error('unexpected tool');
+        },
+        async close() {},
+      },
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return false;
+        },
+      },
+    );
+    await runner.run(f.session, 'Fix OAuth refresh');
+    assert.equal(called, true);
+  } finally {
+    f.close();
+  }
+});
+
 for (const imageCount of [1, 2]) {
   test(`oversized request retains ${imageCount} image(s) or rejects before calling the model`, async () => {
     const f = fixture();
