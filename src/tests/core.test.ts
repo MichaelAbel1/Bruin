@@ -6,7 +6,7 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { SqliteEventStore } from '../storage/event-store.js';
 import Database from 'better-sqlite3';
-import { budgetPrompt, buildPrompt, promptBytes } from '../core/history.js';
+import { budgetPrompt, buildPrompt, promptBytes, promptTokens } from '../core/history.js';
 import { isAutoSafeShell, isMaliciousShell } from '../core/approval-policy.js';
 
 import { decisionFor } from '../core/permissions.js';
@@ -1466,14 +1466,14 @@ test('budgetPrompt compresses old and oversized current input without aborting',
     { role: 'assistant' as const, content: 'old reply' },
     { role: 'user' as const, content: 'new:' + 'y'.repeat(15_000) },
   ];
-  const budgeted = budgetPrompt(messages, 32_768);
+  const budgeted = budgetPrompt(messages, 8192);
   assert.equal(budgeted.length, 3);
   assert.match(String(budgeted[1].content), /Earlier conversation summary/);
   assert.equal(budgeted[2], messages[3]);
   assert.equal(messages.length, 4);
   assert.equal(budgetPrompt(messages, 65_536).length, 4);
   assert.throws(
-    () => budgetPrompt([{ role: 'system', content: 'x'.repeat(30_000) }], 32_768),
+    () => budgetPrompt([{ role: 'system', content: 'x'.repeat(100_000) }], 32_768),
     /上下文预算不足/,
   );
   const huge = budgetPrompt(
@@ -1483,7 +1483,7 @@ test('budgetPrompt compresses old and oversized current input without aborting',
     ],
     8192,
   );
-  assert.ok(promptBytes(huge) <= 6144);
+  assert.ok(promptTokens(huge) <= 6144);
   assert.match(JSON.stringify(huge), /begin:/);
   assert.match(JSON.stringify(huge), /:end/);
   const imagePrompt = budgetPrompt([
@@ -1508,8 +1508,10 @@ test('agent persists a model summary and reuses it after context compaction', as
   try {
     const session = store.createSession(dir, { ...profile, contextWindowTokens: 8192 });
     for (let index = 0; index < 4; index++) {
-      store.append(session.id, 'user', { text: `request ${index}: ${'detail '.repeat(300)}` });
-      store.append(session.id, 'assistant', { text: `result ${index}: ${'finding '.repeat(300)}` });
+      store.append(session.id, 'user', { text: `request ${index}: ${'detail '.repeat(1000)}` });
+      store.append(session.id, 'assistant', {
+        text: `result ${index}: ${'finding '.repeat(1000)}`,
+      });
     }
     let summaries = 0;
     let delivered = '';

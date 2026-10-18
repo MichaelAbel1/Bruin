@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelMessage } from 'ai';
-import { budgetPrompt, buildPrompt, promptBytes } from '../core/history.js';
+import {
+  budgetPrompt,
+  buildPrompt,
+  promptTokens,
+  historyCompactionRange,
+  estimatedInputTokens,
+} from '../core/history.js';
 import type { SessionEvent } from '../core/types.js';
 
 function toolPair(id: string, output: string): ModelMessage[] {
@@ -25,6 +31,64 @@ function toolPair(id: string, output: string): ModelMessage[] {
     },
   ];
 }
+
+test('token budgets retain code that fits and account for provider calibration and tool overhead', () => {
+  const messages: ModelMessage[] = [
+    { role: 'system', content: 'Keep all rules.' },
+    { role: 'user', content: 'const value = 1;\n'.repeat(600) },
+  ];
+  assert.deepEqual(budgetPrompt(messages, 8192), messages);
+  const budget = { overheadTokens: 1500, tokenScale: 2 };
+  const result = budgetPrompt(messages, 8192, budget);
+  assert.ok(estimatedInputTokens(result, budget) <= 6144);
+  assert.match(JSON.stringify(result), /Keep all rules/);
+  assert.ok(JSON.stringify(result).length < JSON.stringify(messages).length);
+});
+
+test('single-turn compaction cuts after settled tools and retains recent model turns', () => {
+  const events: SessionEvent[] = [];
+  const add = (type: SessionEvent['type'], payload: Record<string, unknown>) =>
+    events.push({ sessionId: 'long', seq: events.length + 1, type, at: '', payload });
+  add('user', { text: 'Preserve API compatibility and verify.' });
+  for (let i = 0; i < 4; i++) {
+    add('assistant', { calls: [{ id: `read-${i}`, name: 'read_file', input: { path: 'a.ts' } }] });
+    add('tool_finished', { callId: `read-${i}`, name: 'read_file', output: 'source' });
+  }
+  const range = historyCompactionRange(events)!;
+  assert.equal(range.throughSeq, 5);
+  assert.equal(range.keepUserSeq, 1);
+  assert.equal(range.source[0].payload.text, 'Preserve API compatibility and verify.');
+  assert.equal(events.find((event) => event.seq === range.throughSeq + 1)?.type, 'assistant');
+  const resumed = buildPrompt(
+    [
+      ...events,
+      {
+        sessionId: 'long',
+        seq: 10,
+        type: 'summary',
+        at: '',
+        payload: {
+          throughSeq: range.throughSeq,
+          keepUserSeq: range.keepUserSeq,
+          text: 'Earlier findings.',
+        },
+      },
+    ],
+    'rules',
+  );
+  assert.deepEqual(
+    resumed
+      .filter((m) => m.role === 'tool')
+      .map((m) => (m.content[0].type === 'tool-result' ? m.content[0].toolCallId : '')),
+    ['read-2', 'read-3'],
+  );
+  assert.ok(
+    resumed.some(
+      (m) => m.role === 'user' && m.content === 'Preserve API compatibility and verify.',
+    ),
+  );
+  assert.equal(historyCompactionRange(events.slice(0, 4)), undefined);
+});
 
 test('history previews retain terminal error status at the end of large tool output', () => {
   const events: SessionEvent[] = [
@@ -65,7 +129,7 @@ test('output compaction preserves prior goals and tool protocol before dropping 
   ];
   const original = JSON.stringify(messages);
   const result = budgetPrompt(messages, 8192);
-  assert.ok(promptBytes(result) <= 6144);
+  assert.ok(promptTokens(result) <= 6144);
   assert.equal(result.length, messages.length);
   assert.match(JSON.stringify(result), /retain API compatibility/);
   assert.match(JSON.stringify(result), /header.*footer/);
@@ -86,7 +150,7 @@ test('a long single turn retains the actual request alongside compacted activity
   ];
   const original = JSON.stringify(messages);
   const result = budgetPrompt(messages, 8192);
-  assert.ok(promptBytes(result) <= 6144);
+  assert.ok(promptTokens(result) <= 6144);
   assert.deepEqual(result[0], system);
   assert.deepEqual(
     result.find((message) => message.role === 'user'),
@@ -103,7 +167,7 @@ test('a long single turn retains the actual request alongside compacted activity
   assert.equal(result.filter((message) => message.role === 'tool').length, 0);
   assert.equal(JSON.stringify(messages), original);
   const retried = budgetPrompt(result, 4096);
-  assert.ok(promptBytes(retried) <= 3072);
+  assert.ok(promptTokens(retried) <= 3072);
   assert.deepEqual(
     retried.find((message) => message.role === 'user'),
     user,
@@ -112,7 +176,7 @@ test('a long single turn retains the actual request alongside compacted activity
 
 test('insufficient budgets reject instead of silently truncating system rules or dropping images', () => {
   const messages: ModelMessage[] = [
-    { role: 'system', content: 'global rule\n' + '中'.repeat(3000) + '\nproject rule' },
+    { role: 'system', content: 'global rule\n' + '中'.repeat(10000) + '\nproject rule' },
     { role: 'user', content: 'current request' },
   ];
   assert.throws(() => budgetPrompt(messages, 8192), /上下文预算不足/);
@@ -133,7 +197,7 @@ test('insufficient budgets reject instead of silently truncating system rules or
             ],
           },
         ],
-        8192,
+        4096,
       ),
     /上下文预算不足/,
   );

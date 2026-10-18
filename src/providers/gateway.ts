@@ -6,6 +6,7 @@ import { generateText, streamText, type ModelMessage } from 'ai';
 import { z } from 'zod';
 import type { ModelProfile, ToolCall } from '../core/types.js';
 import { getRuntimeApiKey } from '../config.js';
+import { estimateTokens } from '../core/history.js';
 
 export interface ModelReply {
   text: string;
@@ -14,6 +15,7 @@ export interface ModelReply {
   providerMessages?: ModelMessage[];
 }
 export interface ModelGateway {
+  inputOverheadTokens?(): number;
   summarize?(
     profile: ModelProfile,
     source: string,
@@ -258,6 +260,16 @@ export function providerModel(profile: ModelProfile) {
 }
 export class AiSdkGateway implements ModelGateway {
   constructor(private mode: 'basic' | 'full' | 'read-only' = 'basic') {}
+  inputOverheadTokens(): number {
+    // Include tool definitions and a protocol margin, even before usage is available.
+    return (
+      estimateTokens(
+        JSON.stringify(toolSchemas, (_key, value) =>
+          value instanceof z.ZodType ? z.toJSONSchema(value) : value,
+        ),
+      ) + 256
+    );
+  }
   async summarize(
     profile: ModelProfile,
     source: string,

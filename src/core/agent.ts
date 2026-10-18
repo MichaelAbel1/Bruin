@@ -4,7 +4,13 @@ import type { EventStore } from '../storage/event-store.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { Session, SessionEvent, ToolCall, ToolResult } from './types.js';
-import { budgetPrompt, buildPrompt, historyCompactionRange, promptBytes } from './history.js';
+import {
+  budgetPrompt,
+  buildPrompt,
+  historyCompactionRange,
+  promptTokens,
+  estimatedInputTokens,
+} from './history.js';
 import { decisionFor } from './permissions.js';
 import { listSkills, loadSkill } from '../skills/registry.js';
 import { modelProtocol, resolveApiKey, toolSchemas } from '../providers/gateway.js';
@@ -338,6 +344,8 @@ export class AgentRunner {
     )
       throw new Error('检查点间隔无效');
     const newTurn = Boolean(input || attachments.length || quote);
+    // Calibrate only within this run/model. Never reuse counts across model changes.
+    let tokenScale = 1;
     if (newTurn) {
       this.store.append(session.id, 'user', {
         text: input ?? '',
@@ -473,6 +481,7 @@ export class AgentRunner {
         skillReminder;
       const contextWindow = Math.min(session.profile.contextWindowTokens ?? 32_768, 1_048_576);
       const inputBudget = Math.floor(contextWindow * 0.75);
+      const budget = { overheadTokens: this.gateway.inputOverheadTokens?.() ?? 0, tokenScale };
       let promptEvents = events;
       let fullPrompt = buildPrompt(
         promptEvents,
@@ -481,7 +490,11 @@ export class AgentRunner {
         modelProtocol(session.profile),
         Number.MAX_SAFE_INTEGER,
       );
-      for (let pass = 0; pass < 4 && promptBytes(fullPrompt) > inputBudget * 0.8; pass++) {
+      for (
+        let pass = 0;
+        pass < 4 && estimatedInputTokens(fullPrompt, budget) > inputBudget * 0.8;
+        pass++
+      ) {
         const range = historyCompactionRange(promptEvents);
         if (!range) break;
         if (pass === 0) this.io.notice('上下文接近上限，正在压缩较早的对话…');
@@ -493,7 +506,11 @@ export class AgentRunner {
           inputBudget,
           signal,
         );
-        this.store.append(session.id, 'summary', { throughSeq: range.throughSeq, text: summary });
+        this.store.append(session.id, 'summary', {
+          throughSeq: range.throughSeq,
+          text: summary,
+          ...(range.keepUserSeq === undefined ? {} : { keepUserSeq: range.keepUserSeq }),
+        });
         promptEvents = this.store.events(session.id);
         fullPrompt = buildPrompt(
           promptEvents,
@@ -503,7 +520,7 @@ export class AgentRunner {
           Number.MAX_SAFE_INTEGER,
         );
       }
-      if (promptBytes(fullPrompt) > inputBudget) {
+      if (estimatedInputTokens(fullPrompt, budget) > inputBudget) {
         const checkpoint = [...promptEvents]
           .reverse()
           .find((event) => event.type === 'summary' && Number.isInteger(event.payload.throughSeq));
@@ -552,6 +569,7 @@ export class AgentRunner {
           Math.max(100_000, contextWindow * 3),
         ),
         contextWindow,
+        budget,
       );
       let reply;
       let lastErr: unknown;
@@ -575,11 +593,13 @@ export class AgentRunner {
             /context|token|length|too long|too large|上下文|超长/i.test(formatModelError(err));
           if (isContextError && attempt < 2 && streamedChars === 0) {
             this.io.notice('模型反馈上下文超限，正在进一步压缩后重试…');
-            const retryWindow =
+            const retryWindow = Math.min(
+              Math.max(2048, Math.floor((estimatedInputTokens(prompt, budget) * 0.6) / 0.75)),
               attempt === 0
                 ? Math.min(32_768, Math.max(4096, Math.floor(contextWindow / 2)))
-                : Math.min(4096, Math.max(2048, Math.floor(contextWindow / 4)));
-            prompt = budgetPrompt(prompt, retryWindow);
+                : Math.min(4096, Math.max(2048, Math.floor(contextWindow / 4))),
+            );
+            prompt = budgetPrompt(prompt, retryWindow, budget);
             continue;
           }
           const isTransient =
@@ -632,6 +652,12 @@ export class AgentRunner {
         protocol: modelProtocol(session.profile),
         providerMessages: reply!.providerMessages,
       });
+      const reportedInput = reply!.usage?.inputTokens;
+      if (reportedInput && Number.isSafeInteger(reportedInput) && reportedInput > 0)
+        tokenScale = Math.max(
+          tokenScale,
+          (reportedInput - budget.overheadTokens) / Math.max(1, promptTokens(prompt)),
+        );
       const checkCancelledCalls = (index: number) => {
         if (!signal.aborted) return;
         for (const pending of reply!.calls.slice(index))
