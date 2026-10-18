@@ -103,8 +103,14 @@ export function buildPrompt(
   let remainingOldAttachmentText = 20_000;
   let remainingCurrentAttachmentText = 60_000;
   const pendingCalls = new Map<string, ToolCall>();
+  const completedCalls = new Map<string, ModelMessage>();
   const flushPendingCalls = () => {
     for (const [id, call] of pendingCalls.entries()) {
+      const completed = completedCalls.get(id);
+      if (completed) {
+        messages.push(completed);
+        continue;
+      }
       messages.push({
         role: 'tool',
         content: [
@@ -121,6 +127,7 @@ export function buildPrompt(
       });
     }
     pendingCalls.clear();
+    completedCalls.clear();
   };
   for (const event of events) {
     if (event.type === 'workspace_changed')
@@ -252,9 +259,8 @@ export function buildPrompt(
     ) {
       const callId = String(event.payload.callId || 'call');
       const pending = pendingCalls.get(callId);
-      pendingCalls.delete(callId);
       const toolName = String(event.payload.name || pending?.name || 'tool');
-      messages.push({
+      const result: ModelMessage = {
         role: 'tool',
         content: [
           {
@@ -267,7 +273,11 @@ export function buildPrompt(
             },
           },
         ],
-      });
+      };
+      if (pending) {
+        completedCalls.set(callId, result);
+        if ([...pendingCalls.keys()].every((id) => completedCalls.has(id))) flushPendingCalls();
+      } else messages.push(result);
     }
   }
   flushPendingCalls();

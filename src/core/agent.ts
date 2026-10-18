@@ -659,14 +659,19 @@ export class AgentRunner {
           tokenScale,
           (reportedInput - budget.overheadTokens) / Math.max(1, promptTokens(prompt)),
         );
+      const startedCalls = new Set<string>();
+      const settledCalls = new Set<string>();
       const checkCancelledCalls = (index: number) => {
         if (!signal.aborted) return;
-        for (const pending of reply!.calls.slice(index))
+        for (const pending of reply!.calls.slice(index)) {
+          if (startedCalls.has(pending.id) || settledCalls.has(pending.id)) continue;
+          settledCalls.add(pending.id);
           this.store.append(session.id, 'tool_denied', {
             callId: pending.id,
             name: pending.name,
             output: '运行已取消，此工具尚未开始执行',
           });
+        }
         throw new Error('已取消');
       };
       checkCancelledCalls(0);
@@ -698,7 +703,7 @@ export class AgentRunner {
           await this.services.runHooks('turn_finished', session, signal);
         return;
       }
-      for (const [index, call] of reply!.calls.entries()) {
+      const executeCall = async (call: ToolCall, index: number) => {
         checkCancelledCalls(index);
         this.store.append(session.id, 'tool_requested', {
           callId: call.id,
@@ -720,7 +725,8 @@ export class AgentRunner {
             output: reason,
           });
           this.io.notice(`工具 ${call.name} 被拒绝: ${reason}`);
-          continue;
+          settledCalls.add(call.id);
+          return;
         }
         call.input = parsed.data as Record<string, unknown>;
         const policy =
@@ -749,7 +755,8 @@ export class AgentRunner {
             output: reason,
           });
           this.io.notice(`工具 ${call.name} 被拒绝: ${reason}`);
-          continue;
+          settledCalls.add(call.id);
+          return;
         }
         this.store.append(session.id, 'tool_approved', {
           callId: call.id,
@@ -757,6 +764,7 @@ export class AgentRunner {
           reason: policy.reason,
         });
         this.store.append(session.id, 'tool_started', { callId: call.id, name: call.name });
+        startedCalls.add(call.id);
         let result: ToolResult;
         let toolFinished = false;
         try {
@@ -844,6 +852,7 @@ export class AgentRunner {
             truncated: result.truncated,
           });
           toolFinished = true;
+          settledCalls.add(call.id);
           this.io.notice(`${call.name}: ${result.isError ? '失败' : '完成'}\n${result.output}`);
           if (
             this.services &&
@@ -862,7 +871,50 @@ export class AgentRunner {
           }
           throw err;
         }
+      };
+      // A mixed batch stays serial. Hooks may mutate state even for a read tool.
+      const parallel =
+        reply!.calls.length > 1 &&
+        reply!.calls.every((call) => toolDefinition(call.name)?.parallel) &&
+        (!this.services ||
+          !loadConfig().hooks.some(
+            (hook) => hook.enabled && ['before_tool', 'after_tool'].includes(hook.event),
+          ));
+      if (parallel) {
+        let next = 0;
+        let failed = false;
+        let failure: unknown;
+        const worker = async () => {
+          while (next < reply!.calls.length && !failed && !signal.aborted) {
+            const index = next++;
+            try {
+              await executeCall(reply!.calls[index], index);
+            } catch (error) {
+              if (!failed) {
+                failed = true;
+                failure = error;
+              }
+            }
+          }
+        };
+        // Always join started work before returning or starting another model call.
+        await Promise.all(Array.from({ length: Math.min(3, reply!.calls.length) }, worker));
+        if (failed || signal.aborted) {
+          for (const call of reply!.calls)
+            if (!startedCalls.has(call.id) && !settledCalls.has(call.id)) {
+              this.store.append(session.id, 'tool_denied', {
+                callId: call.id,
+                name: call.name,
+                output: '工具批次已停止，此工具尚未开始执行',
+              });
+              settledCalls.add(call.id);
+            }
+          throw failed ? failure : new Error('已取消');
+        }
+      } else {
+        for (const [index, call] of reply!.calls.entries()) await executeCall(call, index);
       }
+
       if (
         planState(this.store.events(session.id)).enabled &&
         !planState(this.store.events(session.id)).approved &&
