@@ -15,6 +15,7 @@ export interface ToolCall {
 }
 export type EventType =
   | 'user'
+  | 'input_queued'
   | 'assistant'
   | 'tool_requested'
   | 'tool_approved'

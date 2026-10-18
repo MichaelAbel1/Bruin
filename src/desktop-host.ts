@@ -21,6 +21,7 @@ import { AiSdkGateway, toolSchemas } from './providers/gateway.js';
 import { discoverModels } from './providers/catalog.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
+import { enqueueInput } from './core/input-queue.js';
 import { isAutoSafeShell, isMaliciousShell } from './core/approval-policy.js';
 import {
   addMarket,
@@ -124,6 +125,11 @@ const runner = new AgentRunner(
   {
     text: (delta) => event('text', { sessionId: active?.sessionId, delta }),
     notice: (message) => event('notice', { sessionId: active?.sessionId, message }),
+    inputConsumed: () => {
+      const sessionId = active?.sessionId;
+      if (sessionId)
+        event('queueUpdated', { sessionId, events: viewSession(getSession(sessionId)).events });
+    },
     checkpoint: () => {
       const sessionId = active?.sessionId;
       if (sessionId)
@@ -482,6 +488,24 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         ? { seq: source.seq, text: String(source.payload.text ?? '').slice(0, 4000) }
         : undefined;
       if (!prompt && !refs.length && !quote) throw new Error('消息不能为空');
+      if (p.delivery !== undefined && !['steer', 'follow-up'].includes(String(p.delivery)))
+        throw new Error('无效的消息投递方式');
+      if (active && p.delivery !== undefined) {
+        if (active.sessionId !== session.id) throw new Error('请等待其他会话的任务完成');
+        const lease = services.sessionLeases.retain(session.id, active.controller);
+        try {
+          enqueueInput(store, session.id, {
+            id: randomUUID(),
+            mode: p.delivery as 'steer' | 'follow-up',
+            text: prompt,
+            attachments: refs,
+            ...(quote ? { quote } : {}),
+          });
+          return { queued: true, events: viewSession(session).events };
+        } finally {
+          lease.release();
+        }
+      }
       return startRun(session, prompt, refs, quote, requestedRunSettings(p));
     }
     case 'resume':

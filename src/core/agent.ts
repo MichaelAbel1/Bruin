@@ -17,6 +17,7 @@ import { modelProtocol, resolveApiKey } from '../providers/gateway.js';
 import { planBlocks, planState } from '../runtime/plan.js';
 import type { RuntimeServices } from '../runtime/services.js';
 import { toolDefinition } from './tools.js';
+import { consumeInputs } from './input-queue.js';
 import { loadConfig } from '../config.js';
 import { loadInstructions } from './instructions.js';
 import type { AttachmentRef } from './attachments.js';
@@ -33,6 +34,7 @@ function explicitPreferences(message: string): string[] {
 }
 
 export interface AgentIO {
+  inputConsumed?(): void;
   text(delta: string): void;
   notice(message: string): void;
   checkpoint?(modelCalls: number): void;
@@ -385,6 +387,7 @@ export class AgentRunner {
         pause('time_limit');
         return;
       }
+      if (consumeInputs(this.store, session.id, false).length) this.io.inputConsumed?.();
       const events = this.store.events(session.id);
       const repeated = repeatedFailedTools(events);
       for (const name of repeated)
@@ -668,6 +671,13 @@ export class AgentRunner {
       };
       checkCancelledCalls(0);
       if (!reply!.calls.length) {
+        if (consumeInputs(this.store, session.id, true).length) {
+          this.io.inputConsumed?.();
+          // Budget exhaustion still pauses normally and never loses admitted input.
+          if (step + 1 < maxSteps) continue;
+          pause('step_limit');
+          return;
+        }
         const currentPlan = planState(this.store.events(session.id));
         const remaining =
           currentPlan.enabled && currentPlan.approved

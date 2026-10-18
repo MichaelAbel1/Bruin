@@ -3075,3 +3075,8 @@ pre {
   background: var(--review-surface);
   color: var(--review-text);
 }
+.composer-queue {
+  padding: 4px 12px;
+  font-size: 12px;
+  opacity: 0.7;
+}

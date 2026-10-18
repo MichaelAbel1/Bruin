@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import './style.css';
 import { recordedUsage, recordedTokenLabel } from '../../../src/core/usage.js';
+import { pendingInputs } from '../../../src/core/input-queue.js';
 import bearWhite from '../../assets/icon-white.png';
 import bearBlack from '../../assets/icon-black.png';
 import bearSage from '../../assets/icon-sage.png';
@@ -581,6 +582,8 @@ function App() {
   const [view, setView] = useState<SessionView | null>(null);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [delivery, setDelivery] = useState<'steer' | 'follow-up'>('steer');
   const [stream, setStream] = useState('');
   const [composer, setComposer] = useState('');
   const [maxModelCalls, setMaxModelCalls] = useState<24 | 96 | 240 | 480>(24);
@@ -867,7 +870,7 @@ function App() {
       }
       if (message.type === 'text') setStream((previous) => previous + (message.delta ?? ''));
       if (message.type === 'notice') setNotice(message.message ?? '');
-      if (message.type === 'runCheckpoint' && message.events) {
+      if ((message.type === 'runCheckpoint' || message.type === 'queueUpdated') && message.events) {
         setView((previous) => (previous ? { ...previous, events: message.events! } : previous));
         setStream('');
       }
@@ -954,8 +957,32 @@ function App() {
   }, [view?.events.length, stream, notice, approval]);
 
   async function send() {
-    if (!view || (!composer.trim() && !attachments.length && !quote) || busy || view.needsReview)
+    if (!view || (!composer.trim() && !attachments.length && !quote) || sending || view.needsReview)
       return;
+    if (busy) {
+      const text = composer.trim();
+      setSending(true);
+      try {
+        const result = await api<{ queued?: boolean; events?: SessionEvent[] }>('send', {
+          sessionId: view.session.id,
+          prompt: text,
+          attachments: attachments.map((item) => item.id),
+          quoteSeq: quote?.seq,
+          delivery,
+        });
+        setComposer('');
+        setAttachments([]);
+        setQuote(null);
+        if (result.events)
+          setView((previous) => (previous ? { ...previous, events: result.events! } : previous));
+        setNotice(result.queued ? '消息已排队，将在安全边界处理。' : '消息已开始处理。');
+      } catch (err) {
+        fail(err);
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
     autoScrollRef.current = true;
     const text = composer.trim();
     const submittedAttachments = attachments;
@@ -1578,10 +1605,20 @@ function App() {
                     }
                   }}
                   placeholder={
-                    view.needsReview ? '请先检查并确认未知的工具操作' : '给 Bruin 一个任务…'
+                    view.needsReview
+                      ? '请先检查并确认未知的工具操作'
+                      : busy
+                        ? '补充指令或排队下一项任务…'
+                        : '给 Bruin 一个任务…'
                   }
-                  disabled={view.needsReview}
+                  disabled={view.needsReview || sending}
                 />
+                {pendingInputs(view.events).length > 0 && (
+                  <div className="composer-queue" role="status">
+                    待处理消息：{pendingInputs(view.events).length}{' '}
+                    条；停止或重启后保留，可继续任务处理。
+                  </div>
+                )}
                 <details className="long-run-settings">
                   <summary>
                     {maxModelCalls > 24
@@ -1797,24 +1834,35 @@ function App() {
                       ⌘ ↵
                     </span>
 
-                    {busy ? (
+                    {busy && (
+                      <select
+                        aria-label="消息处理时机"
+                        value={delivery}
+                        onChange={(e) => setDelivery(e.target.value as typeof delivery)}
+                      >
+                        <option value="steer">补充当前任务</option>
+                        <option value="follow-up">当前任务结束后</option>
+                      </select>
+                    )}
+                    <button
+                      className="send-button"
+                      title={busy ? '发送到队列 (⌘/Ctrl + Enter)' : '发送 (⌘/Ctrl + Enter)'}
+                      disabled={
+                        sending ||
+                        (!composer.trim() && !attachments.length && !quote) ||
+                        view.needsReview
+                      }
+                      onClick={() => void send()}
+                    >
+                      <Send size={15} />
+                    </button>
+                    {busy && (
                       <button
                         className="send-button stop"
                         title="停止运行"
                         onClick={() => void cancel()}
                       >
                         <Square size={15} fill="currentColor" />
-                      </button>
-                    ) : (
-                      <button
-                        className="send-button"
-                        title="发送 (⌘/Ctrl + Enter)"
-                        disabled={
-                          (!composer.trim() && !attachments.length && !quote) || view.needsReview
-                        }
-                        onClick={() => void send()}
-                      >
-                        <Send size={15} />
                       </button>
                     )}
                   </div>
