@@ -68,6 +68,12 @@ test('enabled tool hooks keep otherwise parallel reads serial', async () => {
     await runner.run(session, 'read');
     assert.equal(maximum, 1);
     assert.equal(beforeHooks, 2);
+    assert.ok(
+      store
+        .events(session.id)
+        .filter((e) => e.type === 'tool_started')
+        .every((e) => e.payload.recovery === 'manual'),
+    );
   } finally {
     await services.close();
     store.close();

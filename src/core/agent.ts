@@ -283,14 +283,29 @@ export class AgentRunner {
   /** Reconcile incomplete tool calls. Never automatically repeat an uncertain external action. */
   recover(session: Session): number {
     const events = this.store.events(session.id);
-    const pending = new Map<string, ToolCall[]>();
+    const pending = new Map<
+      string,
+      Array<{ call: ToolCall; recovery: 'not-started' | 'safe' | 'manual' }>
+    >();
     for (const event of events) {
       if (event.type === 'assistant')
         for (const call of (event.payload.calls ?? []) as ToolCall[]) {
           const queue = pending.get(call.id) ?? [];
-          queue.push(call);
+          queue.push({ call, recovery: 'not-started' });
           pending.set(call.id, queue);
         }
+      if (event.type === 'tool_started') {
+        const item = pending
+          .get(String(event.payload.callId))
+          ?.find((item) => item.recovery === 'not-started');
+        if (item)
+          item.recovery =
+            event.payload.recovery === 'safe' &&
+            toolDefinition(item.call.name)?.target === 'executor' &&
+            toolDefinition(item.call.name)?.replay === 'safe'
+              ? 'safe'
+              : 'manual';
+      }
       if (['tool_finished', 'tool_unknown', 'tool_denied'].includes(event.type)) {
         const queue = pending.get(String(event.payload.callId));
         queue?.shift();
@@ -299,14 +314,25 @@ export class AgentRunner {
     }
     let unknown = 0;
     for (const queue of pending.values())
-      for (const call of queue) {
-        this.store.append(session.id, 'tool_unknown', {
+      for (const { call, recovery } of queue) {
+        const type =
+          recovery === 'not-started'
+            ? 'tool_denied'
+            : recovery === 'safe'
+              ? 'tool_finished'
+              : 'tool_unknown';
+        this.store.append(session.id, type, {
           callId: call.id,
           name: call.name,
+          ...(type === 'tool_finished' ? { isError: true } : {}),
           output:
-            'Execution status unknown after interruption. Do not assume this action did or did not happen.',
+            recovery === 'not-started'
+              ? 'Action was not started before interruption. It has not been replayed.'
+              : recovery === 'safe'
+                ? 'Read interrupted; no result is available. Inspect again if needed; this call has not been replayed.'
+                : 'Execution status unknown after interruption. Do not assume this action did or did not happen.',
         });
-        unknown++;
+        if (type === 'tool_unknown') unknown++;
       }
     return unknown;
   }
@@ -703,6 +729,11 @@ export class AgentRunner {
           await this.services.runHooks('turn_finished', session, signal);
         return;
       }
+      // Freeze tool hooks for the batch, including recovery policy. Config changes apply next batch.
+      const toolHooks = this.services ? loadConfig().hooks : [];
+      const hasToolHooks = toolHooks.some(
+        (hook) => hook.enabled && ['before_tool', 'after_tool'].includes(hook.event),
+      );
       const executeCall = async (call: ToolCall, index: number) => {
         checkCancelledCalls(index);
         this.store.append(session.id, 'tool_requested', {
@@ -763,7 +794,13 @@ export class AgentRunner {
           name: call.name,
           reason: policy.reason,
         });
-        this.store.append(session.id, 'tool_started', { callId: call.id, name: call.name });
+        const safeRecovery =
+          schema.target === 'executor' && schema.replay === 'safe' && !hasToolHooks;
+        this.store.append(session.id, 'tool_started', {
+          callId: call.id,
+          name: call.name,
+          recovery: safeRecovery ? 'safe' : 'manual',
+        });
         startedCalls.add(call.id);
         let result: ToolResult;
         let toolFinished = false;
@@ -786,7 +823,7 @@ export class AgentRunner {
             (!planState(this.store.events(session.id)).enabled ||
               planState(this.store.events(session.id)).approved)
           )
-            await this.services.runHooks('before_tool', session, signal);
+            await this.services.runHooks('before_tool', session, signal, toolHooks);
           if (signal.aborted) throw new Error('已取消');
           if (call.name === 'load_skill') {
             const skillName = String(call.input.name ?? '');
@@ -859,13 +896,14 @@ export class AgentRunner {
             (!planState(this.store.events(session.id)).enabled ||
               planState(this.store.events(session.id)).approved)
           )
-            await this.services.runHooks('after_tool', session, signal);
+            await this.services.runHooks('after_tool', session, signal, toolHooks);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           if (!toolFinished) {
-            this.store.append(session.id, 'tool_unknown', {
+            this.store.append(session.id, safeRecovery ? 'tool_finished' : 'tool_unknown', {
               callId: call.id,
               name: call.name,
+              ...(safeRecovery ? { isError: true } : {}),
               output: message,
             });
           }
@@ -876,10 +914,7 @@ export class AgentRunner {
       const parallel =
         reply!.calls.length > 1 &&
         reply!.calls.every((call) => toolDefinition(call.name)?.parallel) &&
-        (!this.services ||
-          !loadConfig().hooks.some(
-            (hook) => hook.enabled && ['before_tool', 'after_tool'].includes(hook.event),
-          ));
+        !hasToolHooks;
       if (parallel) {
         let next = 0;
         let failed = false;

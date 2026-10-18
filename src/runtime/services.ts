@@ -71,11 +71,16 @@ export class RuntimeServices {
     }
   }
 
-  async runHooks(event: HookConfig['event'], session: Session, signal: AbortSignal): Promise<void> {
+  async runHooks(
+    event: HookConfig['event'],
+    session: Session,
+    signal: AbortSignal,
+    hooks: readonly HookConfig[] = loadConfig().hooks,
+  ): Promise<void> {
     if (signal.aborted) throw new Error('已取消');
     if (session.managedWorkspace && !fs.existsSync(session.workspace)) return;
     if (!fs.existsSync(session.workspace)) throw new Error('工作区目录不存在');
-    for (const hook of loadConfig().hooks.filter((item) => item.enabled && item.event === event)) {
+    for (const hook of hooks.filter((item) => item.enabled && item.event === event)) {
       if (signal.aborted) throw new Error('已取消');
       const result = await this.executor.execute(
         {

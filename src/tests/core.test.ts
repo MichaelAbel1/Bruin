@@ -689,6 +689,7 @@ test('uncertain tool call is reconciled once and not replayed', () => {
     text: '',
     calls: [{ id: 'c1', name: 'write_file', input: { path: 'x', content: 'a' } }],
   });
+  store.append(session.id, 'tool_started', { callId: 'c1', name: 'write_file' });
   const gateway: ModelGateway = {
     async complete() {
       throw new Error('should not call');
@@ -728,6 +729,7 @@ test('recovery tracks reused tool call IDs by occurrence', () => {
       output: 'done',
     });
     store.append(session.id, 'assistant', { text: '', calls: [call] });
+    store.append(session.id, 'tool_started', { callId: 'reused', name: 'write_file' });
     const runner = new AgentRunner(
       store,
       {
@@ -2093,7 +2095,7 @@ test('history does not read image bytes from an older turn', () => {
   }
 });
 
-test('tool execution runtime exception is recorded as tool_unknown and halts runner', async () => {
+test('interrupted read is recorded as a failed result and halts runner', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-tool-unknown-'));
   const store = new SqliteEventStore(path.join(dir, 'bruin.db'));
   const session = store.createSession(dir, profile);
@@ -2123,7 +2125,9 @@ test('tool execution runtime exception is recorded as tool_unknown and halts run
     });
     await assert.rejects(runner.run(session, 'test'), /connection reset/);
     const lastEvent = store.events(session.id).at(-1);
-    assert.equal(lastEvent?.type, 'tool_unknown');
+    assert.equal(lastEvent?.type, 'tool_finished');
+    assert.equal(lastEvent?.payload.isError, true);
+    assert.equal(runner.recover(session), 0);
     assert.match(String(lastEvent?.payload.output), /connection reset/);
   } finally {
     store.close();
