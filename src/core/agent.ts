@@ -725,7 +725,7 @@ export class AgentRunner {
       };
       checkCancelledCalls(0);
       if (!reply!.calls.length) {
-        await this.services?.waitForSubagents(
+        await this.services?.waitForSubagents?.(
           session.id,
           signal,
           deadline === undefined ? undefined : deadline - Date.now(),
