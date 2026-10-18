@@ -20,6 +20,8 @@ Bruin 的 `write_file/edit_file` 和桌面保存会在替换文件前记录原�
 
 HTTP 服务器可选择 OAuth 浏览器登录（与 Bearer 环境变量互斥）。复用现有 MCP SDK 的受保护资源/授权服务器发现、PKCE S256、资源绑定、issuer 校验及刷新；包括 401 challenge 提供的元数据地址和 scope。默认使用动态客户端注册，已有客户端可填 Client ID 与固定回调端口。服务器不支持动态注册时需预注册客户端；固定端口须与服务器注册的 redirect URI 一致。参考 [MCP 授权规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)。
 
-点击「OAuth 登录」后系统浏览器打开授权页；回调只监听 `127.0.0.1`，随机端口默认、state 校验、单次代码消费，120 秒超时，支持取消。令牌、客户端秘密、verifier 只保存在后台内存，不写入配置、会话事件或渲染进程；重启后重新登录。退出登录/删除或更改服务器会清除本机凭证并断开连接，退出不等同于服务端撤销授权。模型调用不自动打开浏览器，需要重新授权时提示到设置登录。远程授权地址要求 HTTPS；本机 loopback 可用 HTTP。网络请求受超时限制。
+点击「OAuth 登录」后系统浏览器打开授权页；回调只监听 `127.0.0.1`，随机端口默认、state 校验、单次代码消费，120 秒超时，支持取消。桌面主进程使用 Electron safeStorage 将令牌和客户端凭证加密保存到 `BRUIN_HOME/oauth.enc.json`；凭证绑定完整服务器配置，重启恢复，刷新后同步保存。它们不写入配置、会话事件或渲染进程。PKCE verifier、回调和发现缓存只在后台内存保存。CLI 与独立后台服务不解密桌面凭证。
 
-当前 SDK 支持发现与动态注册，本实现没有托管公共 Client ID 元数据文档，也未实现 OAuth 凭证的跨重启安全持久化。真实服务 OAuth 和系统浏览器端到端流程尚待目标平台验证。
+退出登录/删除或更改服务器会清除本机凭证并断开连接，退出不等同于服务端撤销授权。正常关闭应用保留加密凭证。系统加密不可用（包括 Linux basic_text）时拒绝桌面 OAuth 登录；保存或清除失败会明确报告。模型调用不自动打开浏览器，需要重新授权时提示到设置登录。远程授权地址要求 HTTPS；本机 loopback 可用 HTTP。网络请求受超时限制。
+
+MCP 设置提供 GitHub（Bearer 环境变量）与 Notion（OAuth）模板，仅预填表单，保存和调用继续经过原有规则。地址与授权说明分别来自 [GitHub 官方文档](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md) 和 [Notion 官方文档](https://developers.notion.com/guides/mcp/get-started-with-mcp)。当前 SDK 支持发现与动态注册，本实现没有托管公共 Client ID 元数据文档。真实服务 OAuth、系统浏览器和操作系统密钥环端到端流程尚待目标平台验证。

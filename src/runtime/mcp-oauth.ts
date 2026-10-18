@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { z } from 'zod';
 import {
   auth,
   extractWWWAuthenticateParams,
@@ -10,7 +11,25 @@ import {
   type OAuthClientInformationContext,
 } from '@modelcontextprotocol/client';
 
-/** Credentials are isolated by server configuration and stay in host memory. */
+const snapshotSchema = z.object({
+  version: z.literal(1),
+  clients: z.array(z.tuple([z.string(), z.object({ client_id: z.string() }).passthrough()])),
+  tokens: z.array(
+    z.tuple([
+      z.string(),
+      z.object({ access_token: z.string(), token_type: z.string() }).passthrough(),
+    ]),
+  ),
+  latest: z.object({ access_token: z.string(), token_type: z.string() }).passthrough().optional(),
+});
+export type OAuthSnapshot = {
+  version: 1;
+  clients: Array<[string, StoredOAuthClientInformation]>;
+  tokens: Array<[string, StoredOAuthTokens]>;
+  latest?: StoredOAuthTokens;
+};
+
+/** Only durable credentials are exported; PKCE, callbacks and discovery stay in memory. */
 export class McpOAuthSession implements OAuthClientProvider {
   redirectUrl = '';
   private verifier = '';
@@ -24,7 +43,27 @@ export class McpOAuthSession implements OAuthClientProvider {
   cancelLogin() {
     this.cancelPending?.();
   }
-  constructor(private clientId?: string) {}
+  constructor(
+    private clientId?: string,
+    private changed?: (state: OAuthSnapshot) => void,
+  ) {}
+  snapshot(): OAuthSnapshot {
+    return structuredClone({
+      version: 1,
+      clients: [...this.clients],
+      tokens: [...this.savedTokens],
+      latest: this.latest,
+    });
+  }
+  restore(value: unknown) {
+    const state = snapshotSchema.parse(value) as OAuthSnapshot;
+    this.clients = new Map(state.clients);
+    this.savedTokens = new Map(state.tokens);
+    this.latest = state.latest;
+  }
+  detachPersistence() {
+    this.changed = undefined;
+  }
   get clientMetadata() {
     return {
       client_name: 'Bruin',
@@ -42,6 +81,7 @@ export class McpOAuthSession implements OAuthClientProvider {
   }
   saveClientInformation(value: StoredOAuthClientInformation, ctx?: OAuthClientInformationContext) {
     this.clients.set(ctx?.issuer ?? '', value);
+    this.changed?.(this.snapshot());
   }
   tokens(ctx?: OAuthClientInformationContext) {
     return ctx ? this.savedTokens.get(ctx.issuer) : this.latest;
@@ -49,6 +89,7 @@ export class McpOAuthSession implements OAuthClientProvider {
   saveTokens(value: StoredOAuthTokens, ctx?: OAuthClientInformationContext) {
     this.savedTokens.set(ctx?.issuer ?? '', value);
     this.latest = value;
+    this.changed?.(this.snapshot());
   }
   saveCodeVerifier(value: string) {
     this.verifier = value;
@@ -80,6 +121,7 @@ export class McpOAuthSession implements OAuthClientProvider {
     if (scope === 'all' || scope === 'client') this.clients.clear();
     if (scope === 'all' || scope === 'verifier') this.verifier = '';
     if (scope === 'all' || scope === 'discovery') this.discovery = undefined;
+    this.changed?.(this.snapshot());
   }
   async login(
     serverUrl: string,

@@ -119,6 +119,9 @@ const services = new RuntimeServices(store, executor, (session, prompt, signal) 
     true,
   ).run(session, prompt, signal),
 );
+services.mcp.onCredentials = (name, signature, state) => {
+  if (process.env.BRUIN_SERVICE !== '1') event('oauthCredentials', { name, signature, state });
+};
 const runner = new AgentRunner(
   store,
   new AiSdkGateway('full'),
@@ -309,6 +312,12 @@ function requestedRunSettings(p: Record<string, unknown>) {
 }
 async function dispatch(method: string, p: Record<string, unknown>) {
   switch (method) {
+    case 'restoreMcpCredentials': {
+      if (active) throw new Error('运行中不能恢复凭证');
+      const server = loadConfig().mcpServers.find((server) => server.name === p.name);
+      if (server) services.mcp.restoreOAuth(server, String(p.signature ?? ''), p.state);
+      return { restored: true };
+    }
     case 'takeLegacyKeys': {
       if (legacyKeysTaken) return {};
       legacyKeysTaken = true;
@@ -680,7 +689,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       await services.mcp.login(server, async (url) => {
         event('openOAuthBrowser', { url });
       });
-      return { message: 'OAuth 登录成功（本次运行有效）' };
+      return { message: 'OAuth 登录成功' };
     }
     case 'logoutMcpServer': {
       if (active) throw new Error('请等待当前任务完成后退出 MCP');

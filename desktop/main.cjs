@@ -41,9 +41,9 @@ function secureStorageAvailable() {
     (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text')
   );
 }
-function readEncryptedKeys() {
+function readEncryptedKeys(file = secretsPath()) {
   try {
-    const value = JSON.parse(fs.readFileSync(secretsPath(), 'utf8'));
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
     return value && typeof value === 'object' && !Array.isArray(value)
       ? Object.assign(Object.create(null), value)
       : Object.create(null);
@@ -52,15 +52,14 @@ function readEncryptedKeys() {
     throw new Error('已保存的密钥文件损坏或不可读取');
   }
 }
-function writeEncryptedKeys(keys) {
-  const file = secretsPath();
+function writeEncryptedKeys(keys, file = secretsPath()) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(keys), { mode: 0o600 });
   fs.renameSync(temp, file);
 }
-function withSecretsLock(fn) {
-  const lockFile = `${secretsPath()}.lock`;
+function withSecretsLock(fn, file = secretsPath()) {
+  const lockFile = `${file}.lock`;
   fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
   const start = Date.now();
   const timeoutMs = 5000;
@@ -139,13 +138,26 @@ function withSecretsLock(fn) {
     } catch {}
   }
 }
-function updateStoredKey(alias, ciphertext, remove) {
+function updateStoredKey(alias, ciphertext, remove, file = secretsPath()) {
   return withSecretsLock(() => {
-    const keys = readEncryptedKeys();
+    const keys = readEncryptedKeys(file);
     if (remove) delete keys[alias];
     else if (ciphertext) keys[alias] = ciphertext;
-    writeEncryptedKeys(keys);
-  });
+    writeEncryptedKeys(keys, file);
+  }, file);
+}
+const oauthSaveErrors = new Map();
+function oauthPath() {
+  return path.join(path.dirname(secretsPath()), 'oauth.enc.json');
+}
+async function restoreStoredOAuth() {
+  const saved = readEncryptedKeys(oauthPath());
+  if (!Object.keys(saved).length) return;
+  if (!secureStorageAvailable()) throw new Error('系统安全存储不可用，无法恢复 OAuth 登录');
+  for (const [name, ciphertext] of Object.entries(saved)) {
+    const value = JSON.parse(safeStorage.decryptString(Buffer.from(ciphertext, 'base64')));
+    await requestHost('restoreMcpCredentials', { name, ...value });
+  }
 }
 async function restoreStoredKeys() {
   const legacy = await requestHost('takeLegacyKeys');
@@ -251,6 +263,30 @@ function startHost() {
       if (message.error) entry.reject(new Error(message.error));
       else entry.resolve(message.result);
     } else {
+      if (message.type === 'oauthCredentials') {
+        try {
+          if (message.state && !secureStorageAvailable()) throw new Error('系统安全存储不可用');
+          const ciphertext = message.state
+            ? safeStorage
+                .encryptString(
+                  JSON.stringify({
+                    signature: message.signature,
+                    state: message.state,
+                  }),
+                )
+                .toString('base64')
+            : undefined;
+          updateStoredKey(message.name, ciphertext, !message.state, oauthPath());
+          oauthSaveErrors.delete(message.name);
+        } catch {
+          oauthSaveErrors.set(message.name, true);
+          window?.webContents.send('bruin:event', {
+            type: 'notice',
+            message: 'OAuth 凭证保存失败，重启后可能需要重新登录。',
+          });
+        }
+        return;
+      }
       if (message.type === 'openOAuthBrowser') {
         const url = new URL(message.url);
         if (
@@ -332,7 +368,7 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     loadAppearance();
     startHost();
-    hostReady = restoreStoredKeys();
+    hostReady = restoreStoredKeys().then(restoreStoredOAuth);
     createWindow();
     applyIcon();
     ipcMain.handle('bruin:request', async (event, method, params) => {
@@ -366,10 +402,13 @@ if (!gotSingleInstanceLock) {
       if (
         method === 'restoreApiKeys' ||
         method === 'takeLegacyKeys' ||
+        method === 'restoreMcpCredentials' ||
         method === 'importAttachments'
       )
         throw new Error('不支持此界面操作');
       await hostReady;
+      if (method === 'loginMcpServer' && !secureStorageAvailable())
+        throw new Error('系统安全存储不可用，无法持久保存 OAuth 凭证');
       if (method === 'saveProfile' && params?.apiKey && !secureStorageAvailable())
         throw new Error('系统安全存储不可用，无法持久保存 API Key');
       const encryptedKey =
@@ -383,6 +422,13 @@ if (!gotSingleInstanceLock) {
             )
           : null;
       const result = await requestHost(method, params || {});
+      if (
+        ['loginMcpServer', 'logoutMcpServer', 'removeMcpServer', 'saveMcpServer'].includes(
+          method,
+        ) &&
+        oauthSaveErrors.has(params?.name)
+      )
+        throw new Error('OAuth 凭证保存或清除失败，请检查本机安全存储');
       if (method === 'saveProfile') {
         const removeKey = Boolean(
           params?.clearApiKey ||

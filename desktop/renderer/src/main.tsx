@@ -33,6 +33,7 @@ import { computeLineDiff } from './files/line-diff.js';
 import { groupConversationEvents, type SessionEvent } from './conversation/events.js';
 import { EventCard, ToolActivity, MarkdownMessage } from './conversation/Messages.js';
 import { date } from './formatting.js';
+import { connectorTemplates } from './connectors.js';
 import type { AttachmentRef } from '../../../src/core/attachments.js';
 import './style.css';
 import { recordedUsage, recordedTokenLabel } from '../../../src/core/usage.js';
@@ -1941,6 +1942,7 @@ function RuntimeDialog({
   const [oauthEnabled, setOauthEnabled] = useState(false);
   const [oauthClientId, setOauthClientId] = useState('');
   const [oauthPort, setOauthPort] = useState('');
+  const [connectorTemplate, setConnectorTemplate] = useState('');
   const [indexQuery, setIndexQuery] = useState('');
   const [snapshots, setSnapshots] = useState<
     Array<{ id: string; path: string; at: string; action: string }>
@@ -2115,6 +2117,44 @@ function RuntimeDialog({
           文件工具和桌面保存；Shell/MCP/外部编辑不自动生成快照。文件已有后续修改时拒绝回滚。
         </small>
         <h3>MCP 服务器</h3>
+        <label>
+          常用连接器
+          <select
+            value={connectorTemplate}
+            disabled={working}
+            onChange={(event) => {
+              const template = connectorTemplates.find((item) => item.id === event.target.value);
+              setConnectorTemplate(event.target.value);
+              if (!template) return;
+              setTransport('http');
+              setServerName(template.id);
+              setEndpoint(template.url);
+              setEnvName(template.tokenEnv);
+              setOauthEnabled(template.oauth);
+              setOauthClientId('');
+              setOauthPort('');
+              setArgs('');
+            }}
+          >
+            <option value="">自定义配置</option>
+            {connectorTemplates.map((template) => (
+              <option key={template.id} value={template.id}>
+                {template.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        {connectorTemplates
+          .filter((item) => item.id === connectorTemplate)
+          .map((item) => (
+            <small key={item.id}>
+              {item.help}{' '}
+              <a href={item.docs} target="_blank" rel="noreferrer">
+                配置说明
+              </a>
+              。模板仅填充表单，保存后才生效。
+            </small>
+          ))}
         {config.mcpServers.map((server) => (
           <div className="runtime-row" key={server.name}>
             <span>
@@ -2219,7 +2259,9 @@ function RuntimeDialog({
                   placeholder="固定回调端口（留空使用随机端口）"
                   aria-label="OAuth 回调端口"
                 />
-                <small>令牌仅保存在后台内存，退出或重启后需重新登录；不写入配置和会话日志。</small>
+                <small>
+                  桌面端使用系统加密存储保存授权，支持重启恢复；退出登录会清除本机凭证。不写入配置或会话日志。
+                </small>
               </>
             )}
           </>
