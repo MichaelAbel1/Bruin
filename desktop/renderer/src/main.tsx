@@ -37,6 +37,7 @@ import type { AttachmentRef } from '../../../src/core/attachments.js';
 import './style.css';
 import { recordedUsage, recordedTokenLabel } from '../../../src/core/usage.js';
 import { pendingInputs } from '../../../src/core/input-queue.js';
+import { acceptsEventSnapshot } from '../../../src/core/event-snapshot.js';
 import bearWhite from '../../assets/icon-white.png';
 import bearBlack from '../../assets/icon-black.png';
 import bearSage from '../../assets/icon-sage.png';
@@ -465,7 +466,11 @@ function App() {
       if (message.type === 'text') setStream((previous) => previous + (message.delta ?? ''));
       if (message.type === 'notice') setNotice(message.message ?? '');
       if ((message.type === 'runCheckpoint' || message.type === 'queueUpdated') && message.events) {
-        setView((previous) => (previous ? { ...previous, events: message.events! } : previous));
+        setView((previous) =>
+          acceptsEventSnapshot(previous, message.sessionId!, message.events!)
+            ? { ...previous!, events: message.events! }
+            : previous,
+        );
         setStream('');
       }
       if (message.type === 'runFinished' || message.type === 'runFailed') {
@@ -474,9 +479,9 @@ function App() {
         setApproval(null);
         if (message.events)
           setView((previous) =>
-            previous
+            acceptsEventSnapshot(previous, message.sessionId!, message.events!)
               ? {
-                  ...previous,
+                  ...previous!,
                   events: message.events!,
                   needsReview: message.events!.some(
                     (e) =>
@@ -493,7 +498,10 @@ function App() {
           const revision = viewRevision.current;
           void api<SessionView>('openSession', { sessionId: message.sessionId })
             .then((next) => {
-              if (isCurrentView(revision, message.sessionId!)) setView(next);
+              if (isCurrentView(revision, message.sessionId!))
+                setView((previous) =>
+                  acceptsEventSnapshot(previous, next.session.id, next.events) ? next : previous,
+                );
             })
             .catch(fail);
         }
@@ -555,23 +563,30 @@ function App() {
       return;
     if (busy) {
       const text = composer.trim();
+      const sessionId = view.session.id;
+      const revision = viewRevision.current;
       setSending(true);
       try {
         const result = await api<{ queued?: boolean; events?: SessionEvent[] }>('send', {
-          sessionId: view.session.id,
+          sessionId,
           prompt: text,
           attachments: attachments.map((item) => item.id),
           quoteSeq: quote?.seq,
           delivery,
         });
+        if (!isCurrentView(revision, sessionId)) return;
         setComposer('');
         setAttachments([]);
         setQuote(null);
         if (result.events)
-          setView((previous) => (previous ? { ...previous, events: result.events! } : previous));
+          setView((previous) =>
+            acceptsEventSnapshot(previous, sessionId, result.events!)
+              ? { ...previous!, events: result.events! }
+              : previous,
+          );
         setNotice(result.queued ? '消息已排队，将在安全边界处理。' : '消息已开始处理。');
       } catch (err) {
-        fail(err);
+        if (isCurrentView(revision, sessionId)) fail(err);
       } finally {
         setSending(false);
       }
