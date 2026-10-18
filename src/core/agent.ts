@@ -563,7 +563,12 @@ export class AgentRunner {
                 : value,
             )
           : '';
-        if (current && renderedText.length > inputBudget / 2) {
+        // A text summary cannot represent pixels. Let budgetPrompt shrink text
+        // while retaining images, or explicitly reject an impossible budget.
+        const hasImages =
+          Array.isArray(rendered?.content) &&
+          rendered.content.some((part) => part.type === 'image');
+        if (current && !hasImages && renderedText.length > inputBudget / 2) {
           this.io.notice('当前输入较长，正在提炼关键上下文…');
           const source = promptEvents
             .filter(

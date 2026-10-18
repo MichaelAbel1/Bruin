@@ -8,6 +8,7 @@ import { SqliteEventStore } from '../storage/event-store.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolCall, ToolResult } from '../core/types.js';
 import { ProcessExecutor } from '../executor/client.js';
+import { importAttachments } from '../core/attachments.js';
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-control-'));
@@ -31,6 +32,84 @@ function fixture() {
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+for (const imageCount of [1, 2]) {
+  test(`oversized request retains ${imageCount} image(s) or rejects before calling the model`, async () => {
+    const f = fixture();
+    try {
+      const session = f.store.getSession(f.session.id)!;
+      session.profile.contextWindowTokens = 8192;
+      const file = path.join(f.dir, 'pixel.png');
+      fs.writeFileSync(
+        file,
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j3ioAAAAASUVORK5CYII=',
+          'base64',
+        ),
+      );
+      const refs = Array.from(
+        { length: imageCount },
+        () => importAttachments(session.id, [file])[0],
+      );
+      const text =
+        'Analyze the supplied image. ' +
+        'detail '.repeat(10000) +
+        ' Preserve the last instruction.';
+      let completions = 0;
+      let summaries = 0;
+      const runner = new AgentRunner(
+        f.store,
+        {
+          async summarize() {
+            summaries++;
+            return 'Text-only summary';
+          },
+          async complete(_profile, prompt) {
+            completions++;
+            const images = prompt
+              .filter((m) => m.role === 'user')
+              .flatMap((m) =>
+                Array.isArray(m.content) ? m.content.filter((part) => part.type === 'image') : [],
+              );
+            assert.equal(images.length, imageCount);
+            assert.ok(
+              images.every((part) => String(part.image).startsWith('data:image/png;base64,')),
+            );
+            assert.match(JSON.stringify(prompt), /Analyze the supplied image/);
+            assert.match(JSON.stringify(prompt), /Preserve the last instruction/);
+            return { text: 'Image received', calls: [] };
+          },
+        },
+        {
+          async execute() {
+            throw new Error('unexpected tool');
+          },
+          async close() {},
+        },
+        {
+          text() {},
+          notice() {},
+          async approve() {
+            return false;
+          },
+        },
+      );
+      if (imageCount === 1) await runner.run(session, text, undefined, refs);
+      else await assert.rejects(runner.run(session, text, undefined, refs), /上下文预算不足/);
+      assert.equal(summaries, 0);
+      assert.equal(completions, imageCount === 1 ? 1 : 0);
+      const user = f.store.events(session.id).find((event) => event.type === 'user')!;
+      assert.equal(user.payload.text, text);
+      assert.deepEqual(user.payload.attachments, refs);
+      assert.equal(
+        f.store.events(session.id).some((event) => event.type === 'summary'),
+        false,
+      );
+    } finally {
+      f.close();
+    }
+  });
 }
 
 for (const mode of ['planning', 'read-only'] as const) {
