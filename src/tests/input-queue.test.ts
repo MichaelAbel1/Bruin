@@ -6,6 +6,7 @@ import path from 'node:path';
 import { SqliteEventStore } from '../storage/event-store.js';
 import { enqueueInput, consumeInputs, pendingInputs } from '../core/input-queue.js';
 import { AgentRunner } from '../core/agent.js';
+import { importAttachments } from '../core/attachments.js';
 
 test('queued input survives reopen; its user event acknowledges it without a second write', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-inbox-'));
@@ -152,6 +153,117 @@ test('a follow-up at the step limit is durable and pauses without claiming compl
     store.close();
     if (previousHome === undefined) delete process.env.BRUIN_HOME;
     else process.env.BRUIN_HOME = previousHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const interrupted of [false, true]) {
+  test(`queued images reach the model individually, including after interruption=${interrupted}`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-queued-images-'));
+    const previousHome = process.env.BRUIN_HOME;
+    process.env.BRUIN_HOME = path.join(dir, 'home');
+    const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+    try {
+      const session = store.createSession(dir, {
+        alias: 'test',
+        provider: 'openai',
+        model: 'mock',
+      });
+      const file = path.join(dir, 'pixel.png');
+      fs.writeFileSync(
+        file,
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j3ioAAAAASUVORK5CYII=',
+          'base64',
+        ),
+      );
+      const first = importAttachments(session.id, [file]);
+      const second = importAttachments(session.id, [file]);
+      let calls = 0;
+      const runner = new AgentRunner(
+        store,
+        {
+          async complete(_profile, prompt) {
+            calls++;
+            if (calls === 1) {
+              enqueueInput(store, session.id, {
+                id: 'first',
+                mode: 'steer',
+                text: 'FIRST_IMAGE',
+                attachments: first,
+              });
+              enqueueInput(store, session.id, {
+                id: 'second',
+                mode: 'steer',
+                text: 'SECOND_IMAGE',
+                attachments: second,
+              });
+              return { text: 'initial answer', calls: [] };
+            }
+            const users = prompt.filter((m) => m.role === 'user');
+            const latest = users.at(-1)!;
+            const parts = Array.isArray(latest.content) ? latest.content : [];
+            assert.equal(parts.filter((part) => part.type === 'image').length, 1);
+            if (calls === 2 || (interrupted && calls === 3)) {
+              assert.match(JSON.stringify(latest), /FIRST_IMAGE/);
+              assert.doesNotMatch(JSON.stringify(prompt), /SECOND_IMAGE/);
+              if (interrupted && calls === 2) throw new Error('mock request interrupted');
+            } else assert.match(JSON.stringify(latest), /SECOND_IMAGE/);
+            return { text: 'image received', calls: [] };
+          },
+        },
+        {
+          async execute() {
+            throw new Error('unexpected tool');
+          },
+          async close() {},
+        },
+        {
+          text() {},
+          notice() {},
+          async approve() {
+            return false;
+          },
+        },
+      );
+      if (interrupted) {
+        await assert.rejects(runner.run(session, 'initial request'), /mock request interrupted/);
+        assert.deepEqual(
+          pendingInputs(store.events(session.id)).map((input) => input.id),
+          ['second'],
+        );
+        await runner.run(session);
+      } else await runner.run(session, 'initial request');
+      assert.equal(calls, interrupted ? 4 : 3);
+      assert.equal(pendingInputs(store.events(session.id)).length, 0);
+      assert.equal(
+        store.events(session.id).filter((e) => e.type === 'user' && e.payload.queuedInputId).length,
+        2,
+      );
+    } finally {
+      store.close();
+      if (previousHome === undefined) delete process.env.BRUIN_HOME;
+      else process.env.BRUIN_HOME = previousHome;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('pause reports do not acknowledge admitted input or drain the next message', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-queue-pause-'));
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, { alias: 'test', provider: 'openai', model: 'mock' });
+    for (const id of ['one', 'two'])
+      enqueueInput(store, session.id, { id, mode: 'steer', text: id, attachments: [] });
+    assert.deepEqual(consumeInputs(store, session.id, false), ['one']);
+    store.append(session.id, 'assistant', { text: 'paused', calls: [] });
+    store.append(session.id, 'turn_paused', { report: 'paused' });
+    assert.deepEqual(consumeInputs(store, session.id, false), []);
+    store.append(session.id, 'assistant', { text: 'actual model answer', calls: [] });
+    assert.deepEqual(consumeInputs(store, session.id, true), ['two']);
+  } finally {
+    store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

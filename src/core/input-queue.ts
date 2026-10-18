@@ -31,17 +31,34 @@ export function enqueueInput(store: EventStore, sessionId: string, input: Queued
   store.append(sessionId, 'input_queued', { ...input });
 }
 
+/** An admitted message must reach the model before another queued input replaces
+ * its current attachments. Pause reports are UI output, not model responses. */
+function hasUnansweredInput(events: ReturnType<EventStore['events']>): boolean {
+  let unanswered = false;
+  for (const [index, event] of events.entries()) {
+    if (event.type === 'user') unanswered = true;
+    if (event.type === 'assistant') {
+      const next = events[index + 1];
+      const pauseReport =
+        event.payload.synthetic === 'pause_report' ||
+        (next?.type === 'turn_paused' && next.payload.report === event.payload.text);
+      if (!pauseReport) unanswered = false;
+    }
+  }
+  return unanswered;
+}
+
 /** The user event is both model input and durable receipt: no separate ack crash gap. */
 export function consumeInputs(store: EventStore, sessionId: string, settled: boolean): string[] {
-  const inputs = pendingInputs(store.events(sessionId)).filter(
-    (input) => input.mode === 'steer' || settled,
-  );
-  for (const input of inputs)
-    store.append(sessionId, 'user', {
-      text: input.text,
-      attachments: input.attachments,
-      quote: input.quote,
-      queuedInputId: input.id,
-    });
-  return inputs.map((input) => input.id);
+  const events = store.events(sessionId);
+  if (hasUnansweredInput(events)) return [];
+  const input = pendingInputs(events).find((input) => input.mode === 'steer' || settled);
+  if (!input) return [];
+  store.append(sessionId, 'user', {
+    text: input.text,
+    attachments: input.attachments,
+    quote: input.quote,
+    queuedInputId: input.id,
+  });
+  return [input.id];
 }

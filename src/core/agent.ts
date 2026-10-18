@@ -397,7 +397,11 @@ export class AgentRunner {
     const warnedTools = new Set<string>();
     const pause = (reason: 'step_limit' | 'time_limit') => {
       const report = stepLimitReport(this.store.events(session.id), maxSteps, reason);
-      this.store.append(session.id, 'assistant', { text: report.text, calls: [] });
+      this.store.append(session.id, 'assistant', {
+        text: report.text,
+        calls: [],
+        synthetic: 'pause_report',
+      });
       this.store.append(session.id, 'turn_paused', {
         reason,
         limit: maxSteps,
