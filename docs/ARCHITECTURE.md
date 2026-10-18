@@ -50,6 +50,8 @@ Agent 后台进程掌握模型密钥、权限判断和事件事务；工具子�
 
 SQLite 适合单机 CLI：零外部服务、事件与会话同库事务、容易备份。单机写入仍需注意 WAL、SHM 文件与数据库文件整体备份；建议使用 SQLite backup API 或暂停客户端后复制完整数据库相关文件。恢复时不要只复制运行中的 `.sqlite` 主文件。
 
+`backup create/inspect/restore` 已提供离线一致性备份、逐文件校验、恢复预演与保留旧数据目录的恢复流程；当前只支持 schema 8 和原 BRUIN_HOME 路径。EventStore 生命周期登记与独占维护门禁阻止新版实例在恢复时持有数据库。独立迁移管理器仍未实现，边界见 [运维文档](OPERATIONS.md)。
+
 ### PostgreSQL 替换路径
 
 实现 `EventStore` 接口，并保持以下不变量：同一会话内事件序号严格递增；事件插入与会话 `updated_at` 更新原子完成；`setProfile` 的资料变更与 `model_switched` 事件在同一事务完成；恢复扫描看到一致快照。多进程写同一会话时用行锁或会话租约序列化。迁移数据时保留 `session_id`、`seq`、事件类型和原始 JSON，按会话核对数量与最大序号。不要让 CLI 或 AgentRunner 直接依赖 SQLite SQL。

@@ -7,3 +7,5 @@
 Cron 仍是五段表达式，使用进程时区；`--timezone` 接受 IANA 时区名。创建任务与执行服务应使用相同时区，现有任务的首个已保存时间点不会因切换时区重写。服务每 15 秒检查一次，忙时等待；错过多个时间点仅执行一次，再计算下一次时间，不逐个补跑。
 
 每次派发与 `cron_started` 事件在同一 SQLite 事务提交，记录 runId、jobId、预定时间与时区；结束通过 `cron_finished` 记录状态。未结算执行在失去租约且派发超过 30 秒后标为 `needs_review`，阻止后续自动调度，且不会重放副作用。查看 `node dist/cli.js cron list` 和 `sessions show SESSION_ID`，检查工作区及工具事件后，用 `cron review JOB_ID --confirm` 解锁后续到期执行。尚无逐任务时区或暂停/启用界面。
+
+每次启动任务前仍核对未结算工具调用。Cron 显式确认写入 `cron_reviewed`，仅确认截至当时的未知结果序号；后来出现的未知结果仍会阻止执行。确认不会补跑旧工具或绕过新工具审批。

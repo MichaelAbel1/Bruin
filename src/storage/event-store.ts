@@ -5,6 +5,7 @@ import path from 'node:path';
 import { CronExpressionParser } from 'cron-parser';
 import { deleteAttachments } from '../core/attachments.js';
 import type { EventType, ModelProfile, Session, SessionEvent } from '../core/types.js';
+import { registerDatabaseUse } from './database-access.js';
 
 export interface TaskNode {
   id: string;
@@ -89,19 +90,22 @@ export interface EventStore {
   close(): void;
 }
 export class SqliteEventStore implements EventStore {
-  private db: Database.Database;
+  private db!: Database.Database;
+  private releaseAccess: () => void;
   constructor(filename: string) {
     fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
-    this.db = new Database(filename);
-    fs.chmodSync(filename, 0o600);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = FULL');
-    this.db.pragma('secure_delete = ON');
-    this.db.pragma('foreign_keys = ON');
-    this.db.pragma('busy_timeout = 5000');
-    const schemaVersion = this.db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 8) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
-    this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
+    this.releaseAccess = registerDatabaseUse(filename);
+    try {
+      this.db = new Database(filename);
+      fs.chmodSync(filename, 0o600);
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = FULL');
+      this.db.pragma('secure_delete = ON');
+      this.db.pragma('foreign_keys = ON');
+      this.db.pragma('busy_timeout = 5000');
+      const schemaVersion = this.db.pragma('user_version', { simple: true }) as number;
+      if (schemaVersion > 8) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY, workspace TEXT NOT NULL, profile_json TEXT NOT NULL,
       managed_workspace INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -141,25 +145,30 @@ export class SqliteEventStore implements EventStore {
       id TEXT PRIMARY KEY, content TEXT NOT NULL, source_session_id TEXT NOT NULL,
       created_at TEXT NOT NULL
     );`);
-    if (schemaVersion < 6)
-      this.db.transaction(() => {
-        this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
+      if (schemaVersion < 6)
+        this.db.transaction(() => {
+          this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
         (id, workspace, origin_session_id, title, description, dependencies_json, status, owner, expires_at, created_at, updated_at)
         SELECT t.id, s.workspace, t.session_id, t.title, '', t.dependencies_json,
           t.status, t.owner, t.expires_at, t.created_at, t.created_at
         FROM task_nodes t JOIN sessions s ON s.id = t.session_id`);
-        this.db.pragma('user_version = 6');
-      })();
-    if (schemaVersion < 7) this.db.pragma('user_version = 7');
-    if (schemaVersion < 8)
-      this.db.transaction(() => {
-        const columns = this.db.pragma('table_info(sessions)') as Array<{ name: string }>;
-        if (!columns.some((column) => column.name === 'managed_workspace'))
-          this.db.exec(
-            'ALTER TABLE sessions ADD COLUMN managed_workspace INTEGER NOT NULL DEFAULT 0',
-          );
-        this.db.pragma('user_version = 8');
-      })();
+          this.db.pragma('user_version = 6');
+        })();
+      if (schemaVersion < 7) this.db.pragma('user_version = 7');
+      if (schemaVersion < 8)
+        this.db.transaction(() => {
+          const columns = this.db.pragma('table_info(sessions)') as Array<{ name: string }>;
+          if (!columns.some((column) => column.name === 'managed_workspace'))
+            this.db.exec(
+              'ALTER TABLE sessions ADD COLUMN managed_workspace INTEGER NOT NULL DEFAULT 0',
+            );
+          this.db.pragma('user_version = 8');
+        })();
+    } catch (error) {
+      if (this.db?.open) this.db.close();
+      this.releaseAccess();
+      throw error;
+    }
   }
   createSession(workspace: string, profile: ModelProfile): Session {
     return this.insertSession(workspace, profile, false);
@@ -903,6 +912,10 @@ export class SqliteEventStore implements EventStore {
     return run();
   }
   close(): void {
-    this.db.close();
+    try {
+      if (this.db.open) this.db.close();
+    } finally {
+      this.releaseAccess();
+    }
   }
 }

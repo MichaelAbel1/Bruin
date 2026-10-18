@@ -22,6 +22,7 @@ import { loadConfig } from '../config.js';
 import { loadInstructions } from './instructions.js';
 import type { AttachmentRef } from './attachments.js';
 import { memoryContext } from './memory.js';
+import { recoverSession } from './recovery.js';
 
 function explicitPreferences(message: string): string[] {
   return message
@@ -283,59 +284,7 @@ export class AgentRunner {
   ) {}
   /** Reconcile incomplete tool calls. Never automatically repeat an uncertain external action. */
   recover(session: Session): number {
-    const events = this.store.events(session.id);
-    const pending = new Map<
-      string,
-      Array<{ call: ToolCall; recovery: 'not-started' | 'safe' | 'manual' }>
-    >();
-    for (const event of events) {
-      if (event.type === 'assistant')
-        for (const call of (event.payload.calls ?? []) as ToolCall[]) {
-          const queue = pending.get(call.id) ?? [];
-          queue.push({ call, recovery: 'not-started' });
-          pending.set(call.id, queue);
-        }
-      if (event.type === 'tool_started') {
-        const item = pending
-          .get(String(event.payload.callId))
-          ?.find((item) => item.recovery === 'not-started');
-        if (item)
-          item.recovery =
-            event.payload.recovery === 'safe' &&
-            toolDefinition(item.call.name)?.target === 'executor' &&
-            toolDefinition(item.call.name)?.replay === 'safe'
-              ? 'safe'
-              : 'manual';
-      }
-      if (['tool_finished', 'tool_unknown', 'tool_denied'].includes(event.type)) {
-        const queue = pending.get(String(event.payload.callId));
-        queue?.shift();
-        if (queue?.length === 0) pending.delete(String(event.payload.callId));
-      }
-    }
-    let unknown = 0;
-    for (const queue of pending.values())
-      for (const { call, recovery } of queue) {
-        const type =
-          recovery === 'not-started'
-            ? 'tool_denied'
-            : recovery === 'safe'
-              ? 'tool_finished'
-              : 'tool_unknown';
-        this.store.append(session.id, type, {
-          callId: call.id,
-          name: call.name,
-          ...(type === 'tool_finished' ? { isError: true } : {}),
-          output:
-            recovery === 'not-started'
-              ? 'Action was not started before interruption. It has not been replayed.'
-              : recovery === 'safe'
-                ? 'Read interrupted; no result is available. Inspect again if needed; this call has not been replayed.'
-                : 'Execution status unknown after interruption. Do not assume this action did or did not happen.',
-        });
-        if (type === 'tool_unknown') unknown++;
-      }
-    return unknown;
+    return recoverSession(this.store, session.id);
   }
   async run(
     session: Session,

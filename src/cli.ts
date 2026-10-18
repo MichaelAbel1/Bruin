@@ -36,6 +36,8 @@ import { searchSkillsSh, installSkillsSh } from './skills/skills-sh.js';
 import type { ModelProfile, ProviderKind, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
 import { runService } from './runtime/service.js';
+import { toolsForMode, toolDefinitions } from './core/tools.js';
+import { recoverSession } from './core/recovery.js';
 
 const help = `Bruin — local coding agent
 
@@ -46,6 +48,9 @@ bruin sessions list | show SESSION_ID
 bruin service run [--timezone IANA_ZONE]
 bruin acp [--model ALIAS]
 bruin cron list | review JOB_ID --confirm
+bruin backup create DIRECTORY | inspect DIRECTORY | restore DIRECTORY --confirm TOKEN
+bruin doctor
+bruin capabilities
 bruin skill list | show NAME | enable NAME | disable NAME | install-local DIR | install-github OWNER/REPO SUBDIR [REF] | update NAME | remove NAME
 bruin market add NAME OWNER/REPO | list | search NAME | install MARKET SKILL
 bruin market skills-sh-search QUERY | skills-sh-install OWNER/REPO/SKILL
@@ -79,6 +84,63 @@ async function main(): Promise<void> {
     if (args.length) throw new Error(help);
     const { runAcp } = await import('./runtime/acp.js');
     await runAcp(model);
+    return;
+  }
+  if (area === 'doctor') {
+    if (args.length) throw new Error(help);
+    const { doctor } = await import('./runtime/doctor.js');
+    const result = doctor();
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+  if (area === 'capabilities') {
+    if (args.length) throw new Error(help);
+    console.log(
+      JSON.stringify(
+        {
+          modes: {
+            cli: Object.keys(toolsForMode('full')),
+            desktop: Object.keys(toolsForMode('full')),
+            acp: Object.keys(toolsForMode('full')),
+            service: Object.keys(toolsForMode('full')),
+            subagent: Object.keys(toolsForMode('read-only')),
+          },
+          tools: Object.fromEntries(
+            Object.entries(toolDefinitions).map(([name, definition]) => [
+              name,
+              {
+                readOnly: definition.readOnly,
+                planning: definition.planning,
+                target: definition.target,
+                replay: definition.replay,
+              },
+            ]),
+          ),
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  if (area === 'backup') {
+    const action = args.shift();
+    const confirmation = takeFlag(args, '--confirm');
+    if (
+      args.length !== 1 ||
+      !['create', 'inspect', 'restore'].includes(action ?? '') ||
+      (action !== 'restore' && confirmation !== undefined)
+    )
+      throw new Error(help);
+    const backup = await import('./storage/backup.js');
+    const result =
+      action === 'create'
+        ? await backup.createBackup(dataDir(), args[0])
+        : action === 'inspect'
+          ? await backup.previewBackup(args[0])
+          : await backup.restoreBackup(dataDir(), args[0], confirmation ?? '');
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
   if (area === 'model') {
@@ -219,6 +281,13 @@ async function main(): Promise<void> {
       const owner = randomUUID();
       store.acquireLease(job.sessionId, owner, 10_000);
       try {
+        recoverSession(store, job.sessionId);
+        const throughSeq =
+          store
+            .events(job.sessionId)
+            .filter((event) => event.type === 'tool_unknown')
+            .at(-1)?.seq ?? 0;
+        store.append(job.sessionId, 'cron_reviewed', { jobId: job.id, throughSeq });
         store.markCronJob(job.id, 'reviewed');
       } finally {
         store.releaseLease(job.sessionId, owner);

@@ -55,7 +55,7 @@ node dist/cli.js chat --workspace /path/to/project
 
 ## MCP、Hook 与编排边界
 
-MCP stdio 服务器是用户配置的外部可执行程序。macOS 上使用 `sandbox-exec` 限制写入；Linux 有可用 `bwrap` 时限制写入，但当前 MCP 配置未隔离网络。Windows 或缺少沙箱时直接运行。Bruin 只传基础环境和显式列出的环境变量；**不受沙箱约束的服务器仍拥有运行账户的本机权限，且可在工具调用之间继续运行**。模型发起的 MCP 工具请求逐次审批，审批不能限制已启动服务器自身的行为。HTTP MCP 服务器可能访问外部系统；调用结果为不可信内容。远端 URL 要求 HTTPS，本机 loopback 可用 HTTP。HTTP MCP 支持交互式 OAuth 授权，通过本机回调及 state/PKCE/issuer 校验完成；凭证仅保存在后台内存，真实授权服务器端到端验收仍需完成。
+MCP stdio 服务器是用户配置的外部可执行程序。macOS 上使用 `sandbox-exec` 限制写入；Linux 有可用 `bwrap` 时限制写入，但当前 MCP 配置未隔离网络。Windows 或缺少沙箱时直接运行。Bruin 只传基础环境和显式列出的环境变量；**不受沙箱约束的服务器仍拥有运行账户的本机权限，且可在工具调用之间继续运行**。模型发起的 MCP 工具请求逐次审批，审批不能限制已启动服务器自身的行为。HTTP MCP 服务器可能访问外部系统；调用结果为不可信内容。远端 URL 要求 HTTPS，本机 loopback 可用 HTTP。HTTP MCP 支持交互式 OAuth 授权，通过本机回调及 state/PKCE/issuer 校验完成；桌面凭证经系统加密保存并绑定服务器配置，真实授权服务器及系统密钥环端到端验收仍需完成。
 
 Hook 是静态 Shell 命令，用户启用后按配置时机运行，不逐次弹窗；因此 Hook 必须使用可用的 Shell 沙箱，缺少沙箱时拒绝执行。规划模式未获批准时不运行 Hook。后台 Shell 由模型提出时需要审批，之后复用 Shell 执行模式；重启不保证继续执行，也无法撤销已产生的副作用。只读子 Agent 通过工具白名单限制；这不构成操作系统级进程隔离。
 
@@ -77,4 +77,4 @@ Hook 是静态 Shell 命令，用户启用后按配置时机运行，不逐次�
 
 ## 快照与 OAuth
 
-`search_repository`、`list_snapshots` 是只读工作区查询（会写入本机索引缓存）；`restore_snapshot` 必须审批，回滚新建文件会删除它，存在后续修改时拒绝回滚。快照含原始源码，保存在 BRUIN_HOME 的私有目录，不应提交到仓库。OAuth 凭证只保存在后台内存，state/PKCE/issuer 校验沿用 SDK 和本机回调保护；退出清除本机凭证，不代表撤销服务端授权。详见 [实现边界](REPOSITORY_RECOVERY_AUTH.md)。
+`search_repository`、`list_snapshots` 是只读工作区查询（会写入本机索引缓存）；`restore_snapshot` 必须审批，回滚新建文件会删除它，存在后续修改时拒绝回滚。快照含原始源码，保存在 BRUIN_HOME 的私有目录，不应提交到仓库。OAuth 的 state/PKCE/issuer 校验沿用 SDK 和本机回调保护；桌面凭证由主进程经系统加密保存，不发送至渲染进程。正常退出保留，退出登录清除；不代表撤销服务端授权。详见 [实现边界](REPOSITORY_RECOVERY_AUTH.md)。

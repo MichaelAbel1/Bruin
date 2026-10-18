@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SqliteEventStore } from '../storage/event-store.js';
 import { recoverCronJobs } from '../runtime/cron.js';
+import { recoverSession, needsUnknownReview } from '../core/recovery.js';
 
 test('cron claims are durable, leased sessions are deferred, abandoned runs require review', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-cron-'));
@@ -35,6 +36,38 @@ test('cron claims are durable, leased sessions are deferred, abandoned runs requ
     );
     store.markCronJob(job.id, 'reviewed');
     assert.equal(store.takeDueCronJobs(job.nextRunAt + 120_000).length, 1);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('explicit cron review acknowledges only unknown results already reconciled at confirmation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-cron-review-'));
+  const store = new SqliteEventStore(path.join(dir, 'sessions.sqlite'));
+  const session = store.createSession(dir, { alias: 'test', provider: 'openai', model: 'mock' });
+  try {
+    const interrupted = (id: string) => {
+      store.append(session.id, 'assistant', {
+        text: '',
+        calls: [{ id, name: 'shell', input: { command: 'external side effect' } }],
+      });
+      store.append(session.id, 'tool_started', { callId: id, name: 'shell', recovery: 'manual' });
+    };
+    interrupted('first');
+    assert.equal(recoverSession(store, session.id), 1);
+    assert.equal(recoverSession(store, session.id), 0);
+    assert.equal(needsUnknownReview(store.events(session.id)), true);
+    const throughSeq = store.events(session.id).at(-1)!.seq;
+    store.append(session.id, 'cron_reviewed', { jobId: 'job', throughSeq });
+    assert.equal(needsUnknownReview(store.events(session.id)), false);
+    interrupted('later');
+    recoverSession(store, session.id);
+    assert.equal(needsUnknownReview(store.events(session.id)), true);
+    assert.equal(
+      store.events(session.id).filter((event) => event.type === 'tool_started').length,
+      2,
+    );
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

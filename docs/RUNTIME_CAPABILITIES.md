@@ -1,6 +1,6 @@
 # Bruin 桌面 Agent 扩展能力
 
-本页描述桌面客户端的 MCP、子 Agent、Git 工作树、后台任务、Hook 和规划模式。这些能力从 Electron 主窗口经 `desktop-host.ts` 进入同一个 `AgentRunner`，状态写入 SQLite 会话事件。CLI 目前使用基础工具集，不暴露这些桌面扩展工具。
+本页描述 MCP、子 Agent、Git 工作树、后台任务、Hook 和规划模式。桌面从 Electron 主窗口经 `desktop-host.ts` 进入 `AgentRunner`，CLI chat 与 ACP 也使用完整工具网关和同一运行时服务；状态写入 SQLite 会话事件。只读子 Agent 使用缩小的工具集。独立调度入口见 [本机后台服务](SERVICE.md)，各入口差异和动态能力清单见 [运维与诊断](OPERATIONS.md)。
 
 ## 工作区记忆检索
 

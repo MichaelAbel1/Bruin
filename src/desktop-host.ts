@@ -38,6 +38,7 @@ import {
 import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
 import { recoverCronJobs } from './runtime/cron.js';
+import { needsUnknownReview } from './core/recovery.js';
 import {
   listWorkspaceEntries,
   readWorkspaceFile,
@@ -191,15 +192,7 @@ function getSession(id: unknown): Session {
   return session;
 }
 function needsReview(id: string): boolean {
-  const events = store.events(id);
-  const lastCompleted = [...events].reverse().find((e) => e.type === 'turn_completed')?.seq ?? 0;
-  const uncompletedUnknowns = events.filter(
-    (e) => e.seq > lastCompleted && e.type === 'tool_unknown',
-  );
-  if (!uncompletedUnknowns.length) return false;
-  const lastUnknownSeq = uncompletedUnknowns.at(-1)!.seq;
-  const reviewedSeq = reviewedUnknownSeq.get(id) ?? -1;
-  return lastUnknownSeq > reviewedSeq;
+  return needsUnknownReview(store.events(id), reviewedUnknownSeq.get(id));
 }
 function viewSession(session: Session) {
   const events = store.events(session.id);
@@ -251,6 +244,8 @@ async function startRun(
   const controller = new AbortController();
   const lease = services.sessionLeases.retain(session.id, controller);
   try {
+    runner.recover(session);
+    if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认继续');
     store.append(session.id, 'run_configured', runSettings);
   } catch (error) {
     lease.release();
@@ -952,7 +947,7 @@ async function scheduleTick() {
         const last = store.events(session.id).at(-1);
         store.markCronJob(job.id, last?.type === 'turn_completed' ? 'completed' : 'needs_review');
       } catch (error) {
-        store.markCronJob(job.id, 'skipped_busy');
+        store.markCronJob(job.id, needsReview(session.id) ? 'needs_review' : 'skipped_busy');
         event('notice', {
           sessionId: session.id,
           message: `定时任务未启动: ${error instanceof Error ? error.message : String(error)}`,

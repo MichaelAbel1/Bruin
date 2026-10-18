@@ -43,7 +43,8 @@ export type EventType =
   | 'hook_finished'
   | 'mcp_capabilities'
   | 'cron_started'
-  | 'cron_finished';
+  | 'cron_finished'
+  | 'cron_reviewed';
 export interface SessionEvent {
   sessionId: string;
   seq: number;

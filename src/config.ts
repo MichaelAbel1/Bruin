@@ -90,6 +90,9 @@ const configSchema = z.object({
     .default([]),
 });
 export type AppConfig = z.infer<typeof configSchema>;
+export function parseConfig(value: unknown): AppConfig {
+  return configSchema.parse(value);
+}
 export function dataDir(): string {
   return process.env.BRUIN_HOME ?? path.join(os.homedir(), '.bruin');
 }
