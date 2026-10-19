@@ -183,7 +183,7 @@ export class AcpServer {
       return {
         protocolVersion: 1,
         agentCapabilities: { loadSession: false, promptCapabilities: {}, mcpCapabilities: {} },
-        agentInfo: { name: 'bruin', version: '0.12.0' },
+        agentInfo: { name: 'bruin', version: '0.12.1' },
         authMethods: [],
       };
     }
