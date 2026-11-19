@@ -14,6 +14,11 @@ export class SessionLeases {
   private held = new Map<string, HeldLease>();
   constructor(private store: Pick<EventStore, 'acquireLease' | 'renewLease' | 'releaseLease'>) {}
 
+  hasLocalLease(id: string): boolean {
+    const entry = this.held.get(id);
+    return Boolean(entry && !entry.controller.signal.aborted);
+  }
+
   retain(id: string, controller: AbortController): { owner: string; release(): void } {
     if (controller.signal.aborted) throw new Error('已取消');
     let entry = this.held.get(id);

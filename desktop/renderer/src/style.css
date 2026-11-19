@@ -2653,6 +2653,14 @@ pre {
   color: #d4ddd0;
   cursor: pointer;
 }
+.patch-candidates {
+  max-height: 180px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+.patch-candidates label {
+  margin: 6px 0;
+}
 .runtime-output {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

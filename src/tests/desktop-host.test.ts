@@ -358,6 +358,10 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     const pauseStore = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
     pauseStore.append(created.session.id, 'turn_paused', { reason: 'step_limit', limit: 2 });
     pauseStore.acquireLease(created.session.id, 'external-process', 30_000);
+    pauseStore.append(created.session.id, 'background_finished', {
+      id: 'late-background',
+      status: 'completed',
+    });
     await assert.rejects(request('finishPausedTurn', { sessionId: created.session.id }), /运行/);
     pauseStore.releaseLease(created.session.id, 'external-process');
     pauseStore.close();
@@ -501,24 +505,65 @@ test('desktop reviewUnknown precisely acknowledges specific sequence and require
     const open1 = await request('openSession', { sessionId: session.id });
     assert.equal(open1.needsReview, true);
 
-    const reviewed = await request('reviewUnknown', { sessionId: session.id });
-    assert.equal(reviewed.needsReview, false);
+    const firstUnknown = open1.events.find((event: any) => event.type === 'tool_unknown').seq;
+    await assert.rejects(
+      request('reviewUnknown', { sessionId: session.id, throughSeq: firstUnknown + 100 }),
+      /已显示的未知工具结果/,
+    );
 
-    // Simulate another process or action producing a newer tool_unknown
+    // Another process records a result after the view was opened.
     const store2 = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
     store2.append(session.id, 'assistant', {
       text: '',
       calls: [{ id: 'c2', name: 'shell', input: {} }],
     });
-    store2.append(session.id, 'tool_unknown', {
+    const newer = store2.append(session.id, 'tool_unknown', {
       callId: 'c2',
       name: 'shell',
       output: 'interrupted 2',
     });
+    store2.append(session.id, 'turn_paused', { reason: 'time_limit' });
+    store2.acquireLease(session.id, 'external-owner', 30_000);
+    try {
+      await assert.rejects(
+        request('reviewUnknown', { sessionId: session.id, throughSeq: firstUnknown }),
+        /运行/,
+      );
+    } finally {
+      store2.releaseLease(session.id, 'external-owner');
+    }
     store2.close();
 
-    const open2 = await request('openSession', { sessionId: session.id });
-    assert.equal(open2.needsReview, true);
+    await assert.rejects(request('finishPausedTurn', { sessionId: session.id }), /先检查/);
+
+    const partial = await request('reviewUnknown', {
+      sessionId: session.id,
+      throughSeq: firstUnknown,
+    });
+    assert.equal(partial.needsReview, true);
+    assert.equal(partial.events.at(-1)?.payload.throughSeq, firstUnknown);
+    const reviewed = await request('reviewUnknown', {
+      sessionId: session.id,
+      throughSeq: newer.seq,
+    });
+    assert.equal(reviewed.needsReview, false);
+    await request('reviewUnknown', { sessionId: session.id, throughSeq: newer.seq });
+    const reopenedStore = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
+    try {
+      const receipts = reopenedStore
+        .events(session.id)
+        .filter((event) => event.type === 'unknown_reviewed');
+      assert.deepEqual(
+        receipts.map((event) => event.payload),
+        [
+          { source: 'desktop', throughSeq: firstUnknown },
+          { source: 'desktop', throughSeq: newer.seq },
+        ],
+      );
+      assert.equal(reopenedStore.isLeased(session.id), false);
+    } finally {
+      reopenedStore.close();
+    }
   } finally {
     child.stdin.end();
     await new Promise<void>((resolve) => {

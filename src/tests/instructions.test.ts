@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { loadInstructions } from '../core/instructions.js';
+import { loadInstructions, scopedInstructions } from '../core/instructions.js';
 
 test('non-regular instruction files are rejected before opening them', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-instructions-'));
@@ -44,6 +44,42 @@ test('instruction files require valid UTF-8 and enforce their byte limit', () =>
   } finally {
     if (previous === undefined) delete process.env.BRUIN_HOME;
     else process.env.BRUIN_HOME = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nested instructions follow directory ancestry within the selected workspace', () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-scoped-instructions-')));
+  try {
+    const workspace = path.join(dir, 'workspace');
+    const outside = path.join(dir, 'outside');
+    fs.mkdirSync(path.join(workspace, 'alpha', 'core'), { recursive: true });
+    fs.mkdirSync(path.join(workspace, 'beta'));
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(workspace, 'alpha', 'AGENTS.md'), 'alpha convention');
+    const nested = path.join(workspace, 'alpha', 'core', 'AGENTS.md');
+    fs.writeFileSync(nested, 'more specific convention');
+    fs.writeFileSync(path.join(workspace, 'beta', 'AGENTS.md'), 'irrelevant beta convention');
+    fs.writeFileSync(path.join(outside, 'AGENTS.md'), 'outside workspace');
+    const target = { path: 'alpha/core/file.txt', directory: false };
+    const scope = () =>
+      scopedInstructions(workspace, [target, { path: '../outside', directory: true }]);
+    assert.deepEqual(
+      scope().map(({ scope, text }) => [scope, text]),
+      [
+        ['alpha', 'alpha convention'],
+        ['alpha/core', 'more specific convention'],
+      ],
+    );
+    if (process.platform !== 'win32') {
+      fs.unlinkSync(nested);
+      fs.symlinkSync(path.join(outside, 'AGENTS.md'), nested);
+      fs.symlinkSync(outside, path.join(workspace, 'linked'), 'dir');
+      assert.match(scope().at(-1)?.error ?? '', /不允许符号链接/);
+      assert.doesNotMatch(JSON.stringify(scope()), /outside workspace/);
+      assert.deepEqual(scopedInstructions(workspace, [{ path: 'linked', directory: true }]), []);
+    }
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

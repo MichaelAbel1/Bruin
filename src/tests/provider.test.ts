@@ -3,6 +3,116 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AiSdkGateway, modelProtocol, resolveApiKey } from '../providers/gateway.js';
 import { setRuntimeApiKey } from '../config.js';
+import type { ModelMessage } from 'ai';
+
+test('Anthropic resumes after an assistant reply without prefilling its next reply', async (t) => {
+  const requestMessages: Array<
+    Array<{ role: string; content: Array<{ type: string; text?: string }> }>
+  > = [];
+  t.mock.method(globalThis, 'fetch', async (_url: string, options: RequestInit) => {
+    const messages = JSON.parse(String(options.body)).messages;
+    requestMessages.push(messages);
+    if (messages.at(-1)?.role === 'assistant')
+      return Response.json(
+        {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'Assistant prefill unsupported' },
+        },
+        { status: 400 },
+      );
+    const message = {
+      id: 'msg_test',
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model: 'claude-sonnet-4-6',
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 0 },
+    };
+    const events = [
+      { type: 'message_start', message },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'Summary ready' },
+      },
+      { type: 'content_block_stop', index: 0 },
+      {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: 2 },
+      },
+      { type: 'message_stop' },
+    ];
+    return new Response(
+      events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+      {
+        headers: { 'content-type': 'text/event-stream' },
+      },
+    );
+  });
+  const profile = {
+    alias: 'anthropic-continue',
+    provider: 'anthropic' as const,
+    model: 'claude-sonnet-4-6',
+    baseUrl: 'https://fixture.invalid/v1',
+  };
+  setRuntimeApiKey(profile.alias, 'test-only-key');
+  try {
+    const gateway = new AiSdkGateway();
+    const complete = (messages: ModelMessage[]) =>
+      gateway.complete(profile, messages, new AbortController().signal, () => {});
+    const previous: ModelMessage[] = [
+      { role: 'user', content: 'Summarize the research' },
+      { role: 'assistant', content: 'Waiting for research' },
+    ];
+    assert.equal((await complete(previous)).text, 'Summary ready');
+    assert.equal(previous.length, 2);
+    assert.deepEqual(
+      requestMessages[0].map((message) => message.role),
+      ['user', 'assistant', 'user'],
+    );
+    assert.equal(requestMessages[0][1].content[0].text, 'Waiting for research');
+    await complete([...previous, { role: 'user', content: 'Include the command output' }]);
+    assert.equal(requestMessages[1].at(-1)?.content[0].text, 'Include the command output');
+    await complete([
+      previous[0],
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'read-note',
+            toolName: 'read_file',
+            input: { path: 'note.txt' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'read-note',
+            toolName: 'read_file',
+            output: { type: 'text', value: 'recorded tool output' },
+          },
+        ],
+      },
+    ]);
+    const last = requestMessages[2].at(-1);
+    assert.equal(last?.role, 'user');
+    assert.deepEqual(
+      last?.content.map((block) => block.type),
+      ['tool_result'],
+    );
+    assert.match(JSON.stringify(last), /recorded tool output/);
+  } finally {
+    setRuntimeApiKey(profile.alias, undefined);
+  }
+});
 
 test('gateway leaves transient HTTP retries to AgentRunner', async () => {
   let requests = 0;
@@ -29,6 +139,20 @@ test('gateway leaves transient HTTP retries to AgentRunner', async () => {
       ),
     );
     assert.equal(requests, 1);
+    await assert.rejects(
+      new AiSdkGateway().summarize(
+        {
+          alias: 'retry-test',
+          provider: 'openai-compatible',
+          model: 'mock',
+          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        },
+        'Summarize these test events.',
+        256,
+        new AbortController().signal,
+      ),
+    );
+    assert.equal(requests, 2);
   } finally {
     server.close();
   }

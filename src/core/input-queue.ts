@@ -1,5 +1,6 @@
 import type { EventStore } from '../storage/event-store.js';
 import type { AttachmentRef } from './attachments.js';
+import { isPauseReport } from './pause-report.js';
 
 export type QueuedInput = {
   id: string;
@@ -8,6 +9,26 @@ export type QueuedInput = {
   attachments: AttachmentRef[];
   quote?: { text: string; seq: number };
 };
+
+// Notifications only wake the local run; SQLite events remain the durable queue.
+const steeringWaiters = new WeakMap<EventStore, Map<string, Set<() => void>>>();
+
+export function onSteeringInput(
+  store: EventStore,
+  sessionId: string,
+  wake: () => void,
+): () => void {
+  let sessions = steeringWaiters.get(store);
+  if (!sessions) steeringWaiters.set(store, (sessions = new Map()));
+  let listeners = sessions.get(sessionId);
+  if (!listeners) sessions.set(sessionId, (listeners = new Set()));
+  listeners.add(wake);
+  return () => {
+    if (!listeners.delete(wake)) return;
+    if (!listeners.size) sessions.delete(sessionId);
+    if (!sessions.size) steeringWaiters.delete(store);
+  };
+}
 
 export function pendingInputs(
   events: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>,
@@ -29,6 +50,8 @@ export function enqueueInput(store: EventStore, sessionId: string, input: Queued
   if (pendingInputs(store.events(sessionId)).length >= 50)
     throw new Error('待处理消息最多 50 条，请等待当前队列处理');
   store.append(sessionId, 'input_queued', { ...input });
+  if (input.mode === 'steer')
+    for (const wake of steeringWaiters.get(store)?.get(sessionId) ?? []) wake();
 }
 
 /** An admitted message must reach the model before another queued input replaces
@@ -37,13 +60,8 @@ function hasUnansweredInput(events: ReturnType<EventStore['events']>): boolean {
   let unanswered = false;
   for (const [index, event] of events.entries()) {
     if (event.type === 'user') unanswered = true;
-    if (event.type === 'assistant') {
-      const next = events[index + 1];
-      const pauseReport =
-        event.payload.synthetic === 'pause_report' ||
-        (next?.type === 'turn_paused' && next.payload.report === event.payload.text);
-      if (!pauseReport) unanswered = false;
-    }
+    if (event.type === 'turn_completed') unanswered = false;
+    if (event.type === 'assistant' && !isPauseReport(event, events[index + 1])) unanswered = false;
   }
   return unanswered;
 }

@@ -24,14 +24,20 @@ function fixture() {
   return {
     root,
     dir,
-    run(name: ToolName, input: Record<string, unknown>) {
+    run(
+      name: ToolName,
+      input: Record<string, unknown>,
+      workspace = root,
+      expectedFileVersion?: string,
+    ) {
       return executor.execute({
         requestId: String(++count),
         name,
         input,
-        workspace: root,
+        workspace,
         timeoutMs: 5000,
         maxOutputBytes: 100_000,
+        expectedFileVersion,
       });
     },
     async close() {
@@ -63,6 +69,124 @@ test('repository index detects same-size edits, deletions, new files and git ign
     const result = await f.run('search_repository', { query: 'fresh' });
     assert.equal(result.isError, false);
     assert.equal(JSON.parse(result.output).results[0].path, 'new.py');
+  } finally {
+    await f.close();
+  }
+});
+test('repository index keeps Git filtering when its candidate listing exceeds the byte limit', async () => {
+  const f = fixture();
+  try {
+    const git = (args: string[], input?: string) =>
+      execFileSync('git', args, { cwd: f.root, input, encoding: 'utf8', stdio: 'pipe' });
+    git(['init', '-q']);
+    fs.writeFileSync(path.join(f.root, '.gitignore'), 'ignored.ts\n');
+    fs.writeFileSync(path.join(f.root, '00-visible.ts'), 'function publicSymbol() {}');
+    fs.writeFileSync(path.join(f.root, 'ignored.ts'), 'function ignoredSymbol() {}');
+    const blob = git(['hash-object', '-w', '--stdin'], 'fixture content').trim();
+    // Populate a real index without creating thousands of working-tree files.
+    const indexRecords = Array.from(
+      { length: 9000 },
+      (_, index) =>
+        `100644 ${blob}\tpadding/${'p'.repeat(232)}${index.toString().padStart(4, '0')}\n`,
+    );
+    git(['update-index', '--index-info'], indexRecords.join(''));
+    const result = searchRepository(f.root, 'Symbol');
+    assert.equal(result.gitIgnore, true);
+    assert.equal(result.truncated, true);
+    assert.deepEqual(
+      result.results.map((item) => item.path),
+      ['00-visible.ts'],
+    );
+    assert.deepEqual(result.results[0].symbols, [{ name: 'publicSymbol', line: 1 }]);
+  } finally {
+    await f.close();
+  }
+});
+
+test('repository search returns results when its optional cache cannot be written', async () => {
+  const f = fixture();
+  try {
+    const blocked = path.join(f.dir, 'home', 'repository-index');
+    fs.mkdirSync(path.dirname(blocked), { recursive: true });
+    fs.writeFileSync(blocked, 'fixture blocks the cache directory');
+    fs.writeFileSync(path.join(f.root, 'code.ts'), 'function freshSymbol() {}');
+    const result = await f.run('search_repository', { query: 'freshSymbol' });
+    assert.equal(result.isError, false, result.output);
+    const index = JSON.parse(result.output);
+    assert.deepEqual(index.results[0].symbols, [{ name: 'freshSymbol', line: 1 }]);
+    assert.equal(fs.readFileSync(blocked, 'utf8'), 'fixture blocks the cache directory');
+  } finally {
+    await f.close();
+  }
+});
+
+test('repository search preserves file paths when an oversized symbol exceeds the response budget', async () => {
+  const f = fixture();
+  try {
+    fs.writeFileSync(
+      path.join(f.root, '00-large.ts'),
+      `function target${'中'.repeat(40_000)}() {}\nfunction targetExact() {}\n`,
+    );
+    fs.writeFileSync(path.join(f.root, '01-normal.ts'), 'function targetNormal() {}');
+
+    for (const limit of [2, 1]) {
+      const result = await f.run('search_repository', { query: 'target', limit });
+      assert.equal(result.isError, false, result.output);
+      assert.equal(result.truncated, true);
+      assert.ok(Buffer.byteLength(result.output) <= 100_000);
+      const index = JSON.parse(result.output) as ReturnType<typeof searchRepository>;
+      assert.equal(index.truncated, true);
+      assert.equal(index.hasMore, limit === 1);
+      assert.deepEqual(
+        index.results.map(({ path, symbols }) => ({ path, symbols })),
+        [
+          { path: '00-large.ts', symbols: [{ name: 'targetExact', line: 2 }] },
+          { path: '01-normal.ts', symbols: [{ name: 'targetNormal', line: 1 }] },
+        ].slice(0, limit),
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test('repository index scopes managed workspaces without scanning the private data directory', async () => {
+  const f = fixture();
+  try {
+    const home = path.join(f.dir, 'home');
+    if (process.platform !== 'win32') {
+      const canonicalHome = path.join(f.dir, 'real-home');
+      fs.mkdirSync(canonicalHome);
+      fs.symlinkSync(canonicalHome, home, 'dir');
+    }
+    const workspaces = path.join(home, 'workspaces');
+    const project = path.join(workspaces, 'session-one');
+    const sibling = path.join(workspaces, 'session-two');
+    fs.mkdirSync(project, { recursive: true });
+    fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(home, 'private.ts'), 'function privateState() {}');
+    fs.writeFileSync(path.join(project, 'code.ts'), 'export function projectSymbol() {}');
+    fs.writeFileSync(path.join(sibling, 'other.ts'), 'function otherProject() {}');
+    fs.writeFileSync(path.join(f.root, 'outside.ts'), 'function outsideProject() {}');
+    if (process.platform !== 'win32')
+      fs.symlinkSync(path.join(sibling, 'other.ts'), path.join(project, 'sibling-link.ts'));
+
+    const search = async (workspace: string, query = '') => {
+      const result = await f.run('search_repository', { query }, workspace);
+      assert.equal(result.isError, false, result.output);
+      return JSON.parse(result.output) as ReturnType<typeof searchRepository>;
+    };
+    const own = await search(project, 'projectSymbol');
+    assert.equal(own.indexedFiles, 1);
+    assert.equal(own.results[0]?.path, 'code.ts');
+    assert.deepEqual(own.results[0]?.symbols, [{ name: 'projectSymbol', line: 1 }]);
+    for (const workspace of [home, workspaces])
+      assert.equal((await search(workspace)).indexedFiles, 0);
+    const enclosing = await search(f.dir);
+    assert.deepEqual(
+      enclosing.results.map((item) => item.path),
+      [path.join('repo', 'outside.ts')],
+    );
   } finally {
     await f.close();
   }
@@ -113,8 +237,17 @@ test('file writes and desktop saves make snapshots; restoring preserves bytes an
     const file = path.join(f.root, 'script.txt');
     const original = Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x0d, 0x0a]);
     fs.writeFileSync(file, original, { mode: 0o755 });
+    const read = await f.run('read_file', { path: 'script.txt' });
+    assert.ok(read.fileVersion);
     assert.equal(
-      (await f.run('write_file', { path: 'script.txt', content: 'changed' })).isError,
+      (
+        await f.run(
+          'write_file',
+          { path: 'script.txt', content: 'changed' },
+          f.root,
+          read.fileVersion,
+        )
+      ).isError,
       false,
     );
     const snapshot = listSnapshots(f.root)[0];
@@ -180,7 +313,15 @@ test(
     try {
       const target = path.join(f.root, 'file.txt');
       fs.writeFileSync(target, 'original');
-      await f.run('write_file', { path: 'file.txt', content: 'after' });
+      const read = await f.run('read_file', { path: 'file.txt' });
+      assert.ok(read.fileVersion);
+      const write = await f.run(
+        'write_file',
+        { path: 'file.txt', content: 'after' },
+        f.root,
+        read.fileVersion,
+      );
+      assert.equal(write.isError, false, write.output);
       const snapshot = listSnapshots(f.root)[0];
       const key = createHash('sha256').update(fs.realpathSync(f.root)).digest('hex');
       const metadata = path.join(f.dir, 'home', 'snapshots', key, `${snapshot.id}.json`);

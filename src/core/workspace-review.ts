@@ -36,18 +36,88 @@ function recordedWrites(events: Event[]) {
   }
   return writes;
 }
-function git(workspace: string, args: string[]) {
-  return execFileSync('git', args, {
+function git(
+  workspace: string,
+  args: string[],
+  options: { input?: string; strictText?: boolean } = {},
+) {
+  const output = execFileSync('git', args, {
     cwd: workspace,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
+    input: options.input,
+    stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'],
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
     timeout: 5000,
     maxBuffer: 2_000_000,
   });
+  return options.strictText
+    ? new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(output)
+    : output.toString('utf8');
 }
-export function listWorkspaceChanges(workspace: string, events: Event[]): WorkspaceChange[] {
+function listChangesFromCommit(
+  root: string,
+  events: Event[],
+  baseCommit: string,
+): WorkspaceChange[] {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(baseCommit))
+    throw new Error('子任务缺少有效的启动提交，无法审核工作树');
+  const tracked = git(root, [
+    'diff',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--no-renames',
+    '--relative',
+    '--name-status',
+    '-z',
+    baseCommit,
+    '--',
+    '.',
+  ]).split('\0');
+  const untracked = git(root, ['ls-files', '-z', '--others', '--exclude-standard', '--', '.']);
+  const agentPaths = new Set(
+    [...recordedWrites(events).keys()].map((file) => path.resolve(root, file)),
+  );
+  const changes = new Map<string, WorkspaceChange>();
+  const add = (file: string, status: WorkspaceChange['status']) => {
+    if (!file) return;
+    const fromAgent = agentPaths.has(path.resolve(root, file));
+    if (!fromAgent && file.split('/').some((part) => part === '.bruin' || part === 'node_modules'))
+      return;
+    changes.set(file, { path: file, status, source: fromAgent ? 'agent' : 'workspace' });
+  };
+  for (let i = 0; i + 1 < tracked.length; i += 2) {
+    const [state, file] = [tracked[i], tracked[i + 1]];
+    add(file, state === 'A' ? 'added' : state === 'D' ? 'deleted' : 'modified');
+  }
+  for (const file of untracked.split('\0')) add(file, changes.has(file) ? 'modified' : 'added');
+  // Keep explicitly written files even when Git ignores them. Unrelated ignored
+  // outputs stay out of the proposal, and tracked files restored to base stay out.
+  const possibleIgnored = [...agentPaths]
+    .filter((file) => file.startsWith(root + path.sep) && fs.existsSync(file))
+    .map((file) => path.relative(root, file).split(path.sep).join('/'))
+    .filter((file) => changes.get(file)?.status === 'deleted' || !changes.has(file));
+  if (possibleIgnored.length) {
+    try {
+      const ignored = git(root, ['check-ignore', '-z', '--stdin'], {
+        input: possibleIgnored.map((file) => `./${file}\0`).join(''),
+      });
+      for (const entry of ignored.split('\0')) {
+        const file = entry.slice(2);
+        add(file, changes.has(file) ? 'modified' : 'added');
+      }
+    } catch (error) {
+      if ((error as { status?: number }).status !== 1) throw error;
+    }
+  }
+  return [...changes.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+export function listWorkspaceChanges(
+  workspace: string,
+  events: Event[],
+  baseCommit?: string,
+): WorkspaceChange[] {
   if (!fs.existsSync(workspace)) return [];
   const root = fs.realpathSync(workspace);
+  if (baseCommit !== undefined) return listChangesFromCommit(root, events, baseCommit);
   const changes = new Map<string, WorkspaceChange>();
   const writes = recordedWrites(events);
   let snapshots: ReturnType<typeof listSnapshots> = [];
@@ -121,22 +191,43 @@ export function listWorkspaceChanges(workspace: string, events: Event[]): Worksp
   }
   return [...changes.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
-export function readWorkspaceReview(workspace: string, relative: string, events: Event[]) {
-  const change = listWorkspaceChanges(workspace, events).find((item) => item.path === relative);
+export function readWorkspaceReview(
+  workspace: string,
+  relative: string,
+  events: Event[],
+  baseCommit?: string,
+) {
+  const change = listWorkspaceChanges(workspace, events, baseCommit).find(
+    (item) => item.path === relative,
+  );
   if (!change) throw new Error('文件不在当前变更列表中');
   let baseline: string | undefined;
-  const writes = recordedWrites(events);
-  const range = [...writes].find(
-    ([file]) => path.resolve(workspace, file) === path.resolve(workspace, relative),
-  )?.[1];
-  if (range) {
-    try {
-      const snapshot = listSnapshots(workspace)
-        .filter((item) => item.path === relative && item.at >= range.from && item.at <= range.to)
-        .at(-1);
-      if (snapshot) baseline = previewSnapshot(workspace, snapshot.id);
-    } catch {
-      /* Fall back to Git when snapshots were pruned or are unavailable. */
+  if (baseCommit !== undefined) {
+    baseline = '';
+    if (change.status !== 'added') {
+      try {
+        baseline = git(workspace, ['cat-file', 'blob', `${baseCommit}:./${relative}`], {
+          strictText: true,
+        });
+      } catch {
+        throw new Error('无法读取启动提交中的文本版本');
+      }
+      if (Buffer.byteLength(baseline) > 256_000) throw new Error('基线文件超过预览上限');
+      if (baseline.includes('\0')) throw new Error('二进制文件暂不支持预览');
+    }
+  } else {
+    const range = [...recordedWrites(events)].find(
+      ([file]) => path.resolve(workspace, file) === path.resolve(workspace, relative),
+    )?.[1];
+    if (range) {
+      try {
+        const snapshot = listSnapshots(workspace)
+          .filter((item) => item.path === relative && item.at >= range.from && item.at <= range.to)
+          .at(-1);
+        if (snapshot) baseline = previewSnapshot(workspace, snapshot.id);
+      } catch {
+        /* Fall back to Git when snapshots were pruned or are unavailable. */
+      }
     }
   }
   if (change.status === 'deleted') {

@@ -374,8 +374,8 @@ export class SqliteEventStore implements EventStore {
   }
   private syncTaskFiles(workspace: string): void {
     const tasks = this.taskRows(workspace);
-    const directory = this.ensureTaskDirectory(workspace);
     if (!tasks.length) return;
+    const directory = this.ensureTaskDirectory(workspace);
     for (const task of tasks) {
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(task.id)) throw new Error('任务 ID 无法用作快照文件名');
       const realDir = fs.realpathSync(directory);
@@ -569,7 +569,15 @@ export class SqliteEventStore implements EventStore {
       return candidate.id;
     })();
     this.repairTaskFiles(workspace);
-    return id ? this.taskRows(workspace).find((task) => task.id === id) : undefined;
+    if (!id) return undefined;
+    // Snapshot I/O can outlast the lease. Return only the current owner's claim.
+    const claimed = this.taskRows(workspace).find((task) => task.id === id);
+    return claimed?.status === 'running' &&
+      claimed.owner === owner &&
+      claimed.expiresAt !== undefined &&
+      claimed.expiresAt >= Date.now()
+      ? claimed
+      : undefined;
   }
   renewTask(id: string, owner: string, ttlMs: number): boolean {
     if (ttlMs < 1000 || ttlMs > 3600000) throw new Error('无效任务租约');
@@ -708,15 +716,18 @@ export class SqliteEventStore implements EventStore {
     if (!result.changes) throw new Error('定时任务不存在');
   }
   takeDueCronJobs(now: number): CronJob[] {
-    return this.db.transaction(() => {
+    const claim = this.db.transaction(() => {
       while (true) {
         const row = this.db
           .prepare(
             `SELECT * FROM cron_jobs WHERE next_run_at <= ?
-            AND COALESCE(last_status, '') NOT IN ('dispatched', 'needs_review')
-            AND NOT EXISTS (SELECT 1 FROM session_leases l
-              WHERE l.session_id = cron_jobs.session_id AND l.expires_at >= ?)
-            ORDER BY next_run_at LIMIT 1`,
+          AND COALESCE(last_status, '') NOT IN ('dispatched', 'needs_review')
+          AND NOT EXISTS (SELECT 1 FROM session_leases l
+            WHERE l.session_id = cron_jobs.session_id AND l.expires_at >= ?)
+          AND NOT EXISTS (SELECT 1 FROM cron_jobs inflight
+            WHERE inflight.session_id = cron_jobs.session_id
+              AND inflight.last_status = 'dispatched')
+          ORDER BY next_run_at LIMIT 1`,
           )
           .get(now, Date.now()) as any;
         if (!row) return [];
@@ -745,7 +756,8 @@ export class SqliteEventStore implements EventStore {
           .run(next, job.id);
         return [job];
       }
-    })();
+    });
+    return claim.immediate();
   }
   markCronJob(id: string, status: string): void {
     this.db.transaction(() => {

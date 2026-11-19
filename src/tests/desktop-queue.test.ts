@@ -7,24 +7,33 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pendingInputs } from '../core/input-queue.js';
+import { canResumeTurn, turnState } from '../core/turn-state.js';
 
-// Intercept only the model transport. Host RPC, attachment loading, SDK stream
-// parsing, event persistence and queue scheduling run normally, without sockets.
+// Stub the model transport and hold one hook open. Host RPC, SDK stream parsing,
+// attachment loading and the durable queue run normally.
 const provider = `
 import fs from 'node:fs';
+import { ProcessExecutor } from ${JSON.stringify(new URL('../executor/client.js', import.meta.url).href)};
 let calls = 0;
+async function waitForRelease(suffix) {
+  fs.writeFileSync(process.env.BRUIN_TEST_READY + suffix, 'ready');
+  const deadline = Date.now() + 10000;
+  while (!fs.existsSync(process.env.BRUIN_TEST_RELEASE + suffix)) {
+    if (Date.now() > deadline) throw new Error('Test gate was not released');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+const execute = ProcessExecutor.prototype.execute;
+ProcessExecutor.prototype.execute = async function(request, signal) {
+  if (request.input.command !== 'verify after the turn') return execute.call(this, request, signal);
+  await waitForRelease('-hook');
+  return { output: 'verified', isError: false };
+};
 globalThis.fetch = async (url, init) => {
   if (String(url) !== 'http://localhost:9999/v1/chat/completions') throw new Error('Unexpected provider URL');
   const body = JSON.parse(init.body);
   fs.appendFileSync(process.env.BRUIN_TEST_TRACE, JSON.stringify(body) + '\\n');
-  if (++calls === 1) {
-    fs.writeFileSync(process.env.BRUIN_TEST_READY, 'ready');
-    const deadline = Date.now() + 10000;
-    while (!fs.existsSync(process.env.BRUIN_TEST_RELEASE)) {
-      if (Date.now() > deadline) throw new Error('Mock provider was not released');
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
-  }
+  if (++calls === 1) await waitForRelease('');
   const chunk = (delta, finish_reason) => 'data: ' + JSON.stringify({
     id: 'reply-' + calls, object: 'chat.completion.chunk', created: 1, model: 'mock',
     choices: [{ index: 0, delta, finish_reason }],
@@ -35,7 +44,7 @@ globalThis.fetch = async (url, init) => {
 `;
 
 test(
-  'desktop RPC queues image inputs, rejects cross-session delivery and settles once',
+  'desktop RPC queues image inputs and resumes a message received during the finishing hook',
   { timeout: 15000 },
   async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-desktop-queue-'));
@@ -71,6 +80,7 @@ test(
     let stderr = '';
     let queueUpdates = 0;
     let completions = 0;
+    let latestEvents: any[] = [];
     let finish: (events: any[]) => void;
     let fail: (error: Error) => void;
     const done = new Promise<any[]>((resolve, reject) => {
@@ -105,6 +115,7 @@ test(
       if (message.type === 'queueUpdated') queueUpdates++;
       if (message.type === 'runFinished') {
         completions++;
+        latestEvents = message.events;
         finish(message.events);
       }
       if (message.type === 'runFailed' || message.type === 'approval')
@@ -116,6 +127,13 @@ test(
         waiting.set(id, { resolve, reject });
         child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
       });
+    };
+    const waitUntil = async (ready: () => boolean, description: string) => {
+      const deadline = Date.now() + 5000;
+      while (!ready()) {
+        assert.ok(Date.now() < deadline, stderr || description);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
     };
     try {
       await request('saveProfile', {
@@ -134,11 +152,7 @@ test(
         (await request('send', { sessionId: session.id, prompt: 'INITIAL_REQUEST' })).started,
         true,
       );
-      const deadline = Date.now() + 5000;
-      while (!fs.existsSync(ready)) {
-        assert.ok(Date.now() < deadline, stderr || 'Provider did not start');
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
+      await waitUntil(() => fs.existsSync(ready), 'Provider did not start');
       await assert.rejects(
         request('send', { sessionId: other.session.id, prompt: 'other', delivery: 'steer' }),
         /其他会话/,
@@ -179,9 +193,48 @@ test(
         );
       }
       assert.doesNotMatch(JSON.stringify(requests[1]), /SECOND_QUEUED_IMAGE/);
+
+      await request('saveHook', {
+        name: 'verify',
+        event: 'turn_finished',
+        command: 'verify after the turn',
+        enabled: true,
+      });
+      await request('send', { sessionId: session.id, prompt: 'FINISH_BEFORE_QUEUED' });
+      await waitUntil(() => fs.existsSync(ready + '-hook'), 'Finishing hook did not start');
+      const late = await request('send', {
+        sessionId: session.id,
+        prompt: 'FOLLOW_UP_AFTER_HOOK',
+        delivery: 'follow-up',
+      });
+      assert.equal(late.queued, true);
+      fs.writeFileSync(release + '-hook', 'go');
+      await waitUntil(() => completions === 2, 'First turn did not finish');
+      assert.equal(turnState(latestEvents), 'completed');
+      assert.equal(canResumeTurn(latestEvents), true);
+      assert.equal(pendingInputs(latestEvents).length, 1);
+
+      assert.equal((await request('resume', { sessionId: session.id })).started, true);
+      await waitUntil(() => completions === 3, 'Queued follow-up did not finish');
+      const latestRequests = fs
+        .readFileSync(trace, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      assert.equal(latestRequests.length, 5);
+      assert.match(
+        JSON.stringify(
+          latestRequests[4].messages.filter((m: { role: string }) => m.role === 'user').at(-1),
+        ),
+        /FOLLOW_UP_AFTER_HOOK/,
+      );
+      assert.equal(pendingInputs(latestEvents).length, 0);
+      assert.equal(canResumeTurn(latestEvents), false);
+      assert.equal(latestEvents.filter((event) => event.type === 'hook_finished').length, 2);
     } finally {
       clearTimeout(deadlineTimer);
       fs.writeFileSync(release, 'go');
+      fs.writeFileSync(release + '-hook', 'go');
       child.stdin.end();
       const timer = setTimeout(() => child.kill('SIGKILL'), 3000);
       try {

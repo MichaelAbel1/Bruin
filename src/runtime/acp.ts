@@ -9,6 +9,10 @@ import type { Session, SessionEvent, ToolCall } from '../core/types.js';
 import { ProcessExecutor, type ToolExecutor } from '../executor/client.js';
 import { AiSdkGateway, type ModelGateway } from '../providers/gateway.js';
 import { RuntimeServices } from './services.js';
+import { createSubagentRunner } from './subagent.js';
+import type { ToolMode } from '../core/tools.js';
+import { needsUnknownReview } from '../core/unknown-review.js';
+import { turnState } from '../core/turn-state.js';
 
 const sessionParams = z.object({ sessionId: z.string().min(1) });
 const newParams = z.object({
@@ -60,8 +64,8 @@ export class AcpServer {
     private executor: ToolExecutor,
     private send: (message: unknown) => void,
     private modelAlias?: string,
-    private gateway: (readOnly: boolean) => ModelGateway = (readOnly) =>
-      new AiSdkGateway(readOnly ? 'read-only' : 'full'),
+    private gateway: (readOnly: boolean, mode?: ToolMode) => ModelGateway = (readOnly, mode) =>
+      new AiSdkGateway(mode ?? (readOnly ? 'read-only' : 'full')),
   ) {}
   private update(sessionId: string, update: Record<string, unknown>) {
     this.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
@@ -87,21 +91,20 @@ export class AcpServer {
         : {}),
     });
   }
-  private approve(sessionId: string, call: ToolCall): Promise<boolean> {
-    const entry = this.entries.get(sessionId)!;
-    if (entry.controller?.signal.aborted || this.closing) return Promise.resolve(false);
+  private approve(sessionId: string, call: ToolCall, signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted || this.closing) return Promise.resolve(false);
     const id = `permission-${++this.nextId}`;
     return new Promise((resolve) => {
       const finish = (approved: boolean) => {
         clearTimeout(timer);
-        entry.controller?.signal.removeEventListener('abort', abort);
+        signal.removeEventListener('abort', abort);
         this.permissions.delete(id);
         resolve(approved);
       };
       const abort = () => finish(false);
       const timer = setTimeout(abort, 120_000);
       this.permissions.set(id, { sessionId, resolve: finish });
-      entry.controller?.signal.addEventListener('abort', abort, { once: true });
+      signal.addEventListener('abort', abort, { once: true });
       this.send({
         jsonrpc: '2.0',
         id,
@@ -183,7 +186,7 @@ export class AcpServer {
       return {
         protocolVersion: 1,
         agentCapabilities: { loadSession: false, promptCapabilities: {}, mcpCapabilities: {} },
-        agentInfo: { name: 'bruin', version: '0.12.1' },
+        agentInfo: { name: 'bruin', version: '1.0.0' },
         authMethods: [],
       };
     }
@@ -221,21 +224,9 @@ export class AcpServer {
       const services = new RuntimeServices(
         view,
         this.executor,
-        (child, prompt, signal) =>
-          new AgentRunner(
-            view,
-            this.gateway(true),
-            this.executor,
-            {
-              text() {},
-              notice() {},
-              async approve() {
-                return false;
-              },
-            },
-            undefined,
-            true,
-          ).run(child, prompt, signal),
+        createSubagentRunner(view, this.executor, (mode) =>
+          this.gateway(mode === 'read-only', mode),
+        ),
         {
           servers: [
             ...loadConfig().mcpServers.filter(
@@ -263,7 +254,7 @@ export class AcpServer {
                 content: { type: 'text', text: `\n${text}\n` },
               });
           },
-          approve: (call) => this.approve(session.id, call),
+          approve: (call, _reason, signal) => this.approve(session.id, call, signal),
         },
         services,
       );
@@ -293,12 +284,18 @@ export class AcpServer {
     const controller = new AbortController();
     const lease = entry.services.sessionLeases.retain(entry.session.id, controller);
     entry.controller = controller;
-    entry.run = entry.runner.run(entry.session, prompt, controller.signal);
     try {
+      entry.runner.recover(entry.session);
+      if (needsUnknownReview(this.store.events(entry.session.id)))
+        throw new RpcError(
+          -32603,
+          'Session has uncertain tool results; inspect the local session and workspace before continuing',
+        );
+      entry.run = entry.runner.run(entry.session, prompt, controller.signal);
       await entry.run;
       return {
         stopReason:
-          this.store.events(entry.session.id).at(-1)?.type === 'turn_paused'
+          turnState(this.store.events(entry.session.id)) === 'paused'
             ? 'max_turn_requests'
             : 'end_turn',
       };

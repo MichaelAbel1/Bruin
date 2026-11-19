@@ -150,7 +150,7 @@ export class McpManager {
     const existing = this.clients.get(server.name);
     if (existing?.signature === signature) return existing.client;
     if (existing) await this.disconnectConnected(server.name);
-    const client = new Client({ name: 'bruin', version: '0.12.1' });
+    const client = new Client({ name: 'bruin', version: '1.0.0' });
 
     let transport: StdioClientTransport | StreamableHTTPClientTransport;
     if (server.transport === 'stdio') {

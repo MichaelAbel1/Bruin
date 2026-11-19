@@ -262,6 +262,14 @@ test('pause reports do not acknowledge admitted input or drain the next message'
     assert.deepEqual(consumeInputs(store, session.id, false), []);
     store.append(session.id, 'assistant', { text: 'actual model answer', calls: [] });
     assert.deepEqual(consumeInputs(store, session.id, true), ['two']);
+    enqueueInput(store, session.id, {
+      id: 'three',
+      mode: 'follow-up',
+      text: 'three',
+      attachments: [],
+    });
+    store.append(session.id, 'turn_completed', { stoppedByUser: true });
+    assert.deepEqual(consumeInputs(store, session.id, true), ['three']);
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

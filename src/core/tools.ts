@@ -77,7 +77,8 @@ export const toolDefinitions = {
     planning: false,
     parallel: false,
     replay: 'manual' as const,
-    description: 'Create or replace a UTF-8 file inside the workspace',
+    description:
+      'Create a UTF-8 file or replace an existing file after using read_file on its current version in this run. If the version changes, read again and incorporate the changes before retrying.',
     inputSchema: z.object({ path: z.string(), content: z.string() }),
   },
   edit_file: {
@@ -151,8 +152,13 @@ export const toolDefinitions = {
     planning: false,
     parallel: false,
     replay: 'manual' as const,
-    description: 'Start a read-only subagent for a bounded research task',
-    inputSchema: z.object({ prompt: z.string(), worktree: z.string().optional() }),
+    description:
+      'Start a bounded subagent. Default read-only researches the current workspace. Mode worktree creates a dedicated worktree at HEAD for edits using inherited permissions; changes are retained for review, never automatically merged.',
+    inputSchema: z.object({
+      prompt: z.string(),
+      worktree: z.string().optional(),
+      mode: z.enum(['read-only', 'worktree']).optional(),
+    }),
   },
   subagent_status: {
     target: 'runtime' as const,
@@ -162,6 +168,28 @@ export const toolDefinitions = {
     parallel: false,
     replay: 'manual' as const,
     description: 'Read a subagent result by ID',
+    inputSchema: z.object({ id: z.string() }),
+  },
+  subagent_review: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Review one changed file in a child worktree by child ID and relative path. Does not apply changes.',
+    inputSchema: z.object({ id: z.string(), path: z.string().min(1) }),
+  },
+  cancel_subagent: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'manual' as const,
+    description:
+      'Request cancellation of a child running in this process. Check its status after it settles. Retains its worktree and changes for review.',
     inputSchema: z.object({ id: z.string() }),
   },
   create_worktree: {
@@ -352,7 +380,7 @@ export const toolDefinitions = {
   },
 };
 
-export type ToolMode = 'basic' | 'full' | 'read-only';
+export type ToolMode = 'basic' | 'full' | 'read-only' | 'worktree';
 export const toolSchemas = Object.fromEntries(
   Object.entries(toolDefinitions).map(([name, { description, inputSchema }]) => [
     name,
@@ -369,7 +397,14 @@ export function toolsForMode(mode: ToolMode) {
   return Object.fromEntries(
     Object.entries(toolSchemas).filter(([name]) => {
       const definition = toolDefinitions[name as keyof typeof toolDefinitions];
-      return mode === 'full' || (mode === 'read-only' ? definition.readOnly : definition.basic);
+      return (
+        mode === 'full' ||
+        (mode === 'worktree'
+          ? definition.readOnly || ['write_file', 'edit_file', 'shell'].includes(name)
+          : mode === 'read-only'
+            ? definition.readOnly
+            : definition.basic)
+      );
     }),
   );
 }

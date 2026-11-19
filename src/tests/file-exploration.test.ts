@@ -70,6 +70,46 @@ test('search fallback reports omitted matches and preserves complete UTF-8 outpu
   }
 });
 
+test(
+  'ripgrep exit code 1 means no matches only if the search was not interrupted',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-ripgrep-interruption-'));
+    fs.writeFileSync(
+      path.join(dir, 'rg'),
+      '#!/bin/sh\nif [ "$5" = "hold-pipe" ]; then /bin/sleep 5 & fi\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const oldPath = process.env.PATH;
+    process.env.PATH = dir;
+    const executor = new ProcessExecutor();
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
+    const search = (pattern: string, timeoutMs: number) =>
+      executor.execute({
+        requestId: pattern,
+        name: 'search',
+        input: { pattern },
+        workspace: dir,
+        timeoutMs,
+        maxOutputBytes: 100,
+      });
+    try {
+      const empty = await search('no-matches', 5000);
+      assert.equal(empty.exitCode, 1);
+      assert.equal(empty.isError, false);
+      assert.equal(empty.output, '');
+      const interrupted = await search('hold-pipe', 500);
+      assert.equal(interrupted.exitCode, 1);
+      assert.equal(interrupted.isError, true);
+      assert.match(interrupted.output, /超时/);
+    } finally {
+      await executor.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
 test('search fallback handles cancellation, timeouts and stream read errors', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-search-interruption-'));
   try {

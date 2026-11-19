@@ -23,6 +23,7 @@ export type EventType =
   | 'tool_started'
   | 'tool_finished'
   | 'tool_unknown'
+  | 'unknown_reviewed'
   | 'turn_completed'
   | 'turn_paused'
   | 'turn_checkpoint'
@@ -65,6 +66,7 @@ export interface ToolResult {
   isError: boolean;
   exitCode?: number;
   truncated?: boolean;
+  fileVersion?: string;
 }
 export interface ToolRequest {
   requestId: string;
@@ -73,8 +75,12 @@ export interface ToolRequest {
   workspace: string;
   timeoutMs: number;
   maxOutputBytes: number;
+  /** Version returned by an earlier read in the current run. */
+  expectedFileVersion?: string;
   /** Unattended commands such as Hooks must not fall back to an unsandboxed host shell. */
   requireSandbox?: boolean;
+  /** Sandbox shell writes into the disposable workspace or a container's private scratch space. */
+  workspaceOnlyWrites?: boolean;
 }
 export interface ToolResponse {
   requestId: string;

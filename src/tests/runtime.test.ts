@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
 import { SqliteEventStore } from '../storage/event-store.js';
 import { AgentRunner } from '../core/agent.js';
+import { recoverSession } from '../core/recovery.js';
 import { RuntimeServices } from '../runtime/services.js';
 import {
   approvePlan,
@@ -201,6 +202,277 @@ for (const outcome of ['completed', 'failed', 'cancelled', 'synchronous-error'] 
   });
 }
 
+test('a failed result write waits for siblings and leaves the completed child available for recovery', async (t) => {
+  const f = fixture();
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  let finishSibling!: () => void;
+  const siblingGate = new Promise<void>((resolve) => {
+    finishSibling = resolve;
+  });
+  const services = new RuntimeServices(
+    f.store,
+    {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    },
+    async (child, prompt) => {
+      f.store.append(child.id, 'user', { text: prompt });
+      await (prompt === 'inspect' ? gate : siblingGate);
+      f.store.append(child.id, 'assistant', {
+        text: prompt === 'inspect' ? 'verified result' : 'sibling result',
+        calls: [],
+      });
+      f.store.append(child.id, 'turn_completed', {});
+    },
+  );
+  const append = f.store.append.bind(f.store);
+  let attempts = 0;
+  let failWrites = true;
+  t.mock.method(f.store, 'append', (...args: Parameters<typeof append>) => {
+    if (failWrites && args[1] === 'subagent_finished' && args[2].answer === 'verified result') {
+      attempts++;
+      throw new Error('injected receipt write failure');
+    }
+    return append(...args);
+  });
+  const signal = new AbortController().signal;
+  try {
+    const spawned = await services.execute(
+      { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+      f.session,
+      signal,
+    );
+    const id = spawned.output.split(': ')[1];
+    const sibling = await services.execute(
+      { id: 'spawn-sibling', name: 'spawn_subagent', input: { prompt: 'verify' } },
+      f.session,
+      signal,
+    );
+    assert.equal(sibling.isError, false);
+    const siblingId = sibling.output.split(': ')[1];
+    const waiting = services.waitForSubagents(f.session.id, signal);
+    let settledEarly = false;
+    void waiting.then(
+      () => {
+        settledEarly = true;
+      },
+      () => {
+        settledEarly = true;
+      },
+    );
+    finish();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(attempts, 2);
+    assert.equal(f.store.isLeased(id), false);
+    assert.equal(f.store.isLeased(siblingId), true);
+    assert.equal(f.store.isLeased(f.session.id), true);
+    assert.equal(settledEarly, false);
+    finishSibling();
+    await assert.rejects(waiting, /injected receipt write failure/);
+    assert.equal(f.store.isLeased(siblingId), false);
+    assert.equal(f.store.isLeased(f.session.id), false);
+    assert.equal(
+      f.store
+        .events(f.session.id)
+        .some((event) => event.type === 'subagent_finished' && event.payload.childId === id),
+      false,
+    );
+    assert.equal(
+      f.store
+        .events(f.session.id)
+        .find((event) => event.type === 'subagent_finished' && event.payload.childId === siblingId)
+        ?.payload.answer,
+      'sibling result',
+    );
+    const status = { id: 'status', name: 'subagent_status' as const, input: { id } };
+    assert.equal(
+      JSON.parse((await services.execute(status, f.session, signal)).output).status,
+      'unknown',
+    );
+    const cancel = { id: 'cancel', name: 'cancel_subagent' as const, input: { id } };
+    const uncertain = await services.execute(cancel, f.session, signal);
+    assert.equal(uncertain.isError, true);
+    assert.match(uncertain.output, /缺少完成记录/);
+    failWrites = false;
+    f.store.acquireLease(f.session.id, 'test-recover', 30_000);
+    try {
+      recoverSession(f.store, f.session.id);
+    } finally {
+      f.store.releaseLease(f.session.id, 'test-recover');
+    }
+    const recovered = JSON.parse((await services.execute(status, f.session, signal)).output);
+    assert.equal(recovered.status, 'completed');
+    assert.equal(recovered.answer, 'verified result');
+    const settled = await services.execute(cancel, f.session, signal);
+    assert.equal(settled.isError, false);
+    assert.equal(JSON.parse(settled.output).status, 'completed');
+  } finally {
+    finish();
+    finishSibling();
+    await services.close();
+    f.close();
+  }
+});
+
+for (const committed of [false, true]) {
+  test(`the parent continues after a transient child receipt error (committed=${committed})`, async (t) => {
+    const f = fixture();
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const executor = {
+      async execute() {
+        throw new Error('unexpected executor call');
+      },
+      async close() {},
+    };
+    const services = new RuntimeServices(f.store, executor, async (child, prompt) => {
+      f.store.append(child.id, 'user', { text: prompt });
+      await gate;
+      f.store.append(child.id, 'assistant', { text: 'child verification', calls: [] });
+      f.store.append(child.id, 'turn_completed', {});
+    });
+    const append = f.store.append.bind(f.store);
+    let writes = 0;
+    t.mock.method(f.store, 'append', (...args: Parameters<typeof append>) => {
+      if (args[1] === 'subagent_finished' && ++writes === 1) {
+        if (committed) append(...args);
+        throw new Error('temporary receipt failure');
+      }
+      return append(...args);
+    });
+    let calls = 0;
+    const runner = new AgentRunner(
+      f.store,
+      {
+        async complete(_profile, messages) {
+          if (++calls === 1) {
+            setImmediate(finish);
+            return { text: 'waiting for verification', calls: [] };
+          }
+          assert.match(JSON.stringify(messages[0]), /child verification/);
+          return { text: 'summarized verification', calls: [] };
+        },
+      },
+      executor,
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return true;
+        },
+      },
+      services,
+    );
+    const controller = new AbortController();
+    const parent = services.sessionLeases.retain(f.session.id, controller);
+    try {
+      const launched = await services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'verify the patch' } },
+        f.session,
+        controller.signal,
+      );
+      assert.equal(launched.isError, false);
+      await runner.run(f.session, 'Report the verification', controller.signal);
+      const events = f.store.events(f.session.id);
+      const receipts = events.filter((event) => event.type === 'subagent_finished');
+      assert.equal(calls, 2);
+      assert.equal(receipts.length, 1);
+      assert.equal(receipts[0].payload.status, 'completed');
+      assert.equal(receipts[0].payload.answer, 'child verification');
+      assert.equal(writes, committed ? 1 : 2);
+      assert.equal(events.at(-1)?.type, 'turn_completed');
+    } finally {
+      finish();
+      parent.release();
+      await services.close();
+      f.close();
+    }
+  });
+}
+
+for (const duringReceipt of [false, true]) {
+  test(`a displaced subagent owner leaves recovery to the new parent lease holder (during write=${duringReceipt})`, async (t) => {
+    const f = fixture();
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const services = new RuntimeServices(
+      f.store,
+      {
+        async execute() {
+          throw new Error('unused');
+        },
+        async close() {},
+      },
+      async (child, prompt) => {
+        f.store.append(child.id, 'user', { text: prompt });
+        await gate;
+        f.store.append(child.id, 'assistant', { text: 'recovered from child turn', calls: [] });
+        f.store.append(child.id, 'turn_completed', {});
+      },
+    );
+    const signal = new AbortController().signal;
+    const foreground = services.sessionLeases.retain(f.session.id, new AbortController());
+    const observerStore = new SqliteEventStore(path.join(f.dir, 'home', 'db.sqlite'));
+    try {
+      const spawned = await services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+        f.session,
+        signal,
+      );
+      const id = spawned.output.split(': ')[1];
+      const waiting = services.waitForSubagents(f.session.id, signal);
+      const transferLease = () => {
+        observerStore.releaseLease(f.session.id, foreground.owner);
+        observerStore.acquireLease(f.session.id, 'new-owner', 30_000);
+      };
+      if (duringReceipt) {
+        const append = f.store.append.bind(f.store);
+        let transferred = false;
+        t.mock.method(f.store, 'append', (...args: Parameters<typeof append>) => {
+          if (args[1] === 'subagent_finished' && !transferred) {
+            transferred = true;
+            transferLease();
+            throw new Error('receipt failed after lease transfer');
+          }
+          return append(...args);
+        });
+      } else transferLease();
+      finish();
+      await assert.rejects(waiting, /租约已失效/);
+      assert.equal(observerStore.isLeased(id), false);
+      assert.equal(
+        observerStore.events(f.session.id).some((event) => event.type === 'subagent_finished'),
+        false,
+      );
+      foreground.release();
+      assert.equal(observerStore.renewLease(f.session.id, 'new-owner', 30_000), true);
+      recoverSession(observerStore, f.session.id);
+      const events = observerStore
+        .events(f.session.id)
+        .filter((event) => event.type === 'subagent_finished');
+      assert.equal(events.length, 1);
+      assert.equal(events[0].payload.status, 'completed');
+      assert.equal(events[0].payload.answer, 'recovered from child turn');
+    } finally {
+      finish();
+      foreground.release();
+      observerStore.releaseLease(f.session.id, 'new-owner');
+      observerStore.close();
+      await services.close();
+      f.close();
+    }
+  });
+}
+
 test('paused subagent is reported as incomplete and its error survives host recreation', async () => {
   const f = fixture();
   const executor: ToolExecutor = {
@@ -211,6 +483,12 @@ test('paused subagent is reported as incomplete and its error survives host recr
   };
   const services = new RuntimeServices(f.store, executor, async (child) => {
     f.store.append(child.id, 'assistant', { text: 'unfinished research', calls: [] });
+    f.store.append(child.id, 'assistant', { text: '', calls: [] });
+    f.store.append(child.id, 'assistant', {
+      text: 'pause report',
+      calls: [],
+      synthetic: 'pause_report',
+    });
     f.store.append(child.id, 'turn_paused', { reason: 'step_limit' });
   });
   let restored: RuntimeServices | undefined;
@@ -222,6 +500,7 @@ test('paused subagent is reported as incomplete and its error survives host recr
     );
     const id = result.output.split(': ')[1];
     await new Promise((resolve) => setImmediate(resolve));
+    f.store.deleteSession(id);
     for (const service of [
       services,
       (restored = new RuntimeServices(f.store, executor, async () => {})),
@@ -250,6 +529,279 @@ test('paused subagent is reported as incomplete and its error survives host recr
     f.close();
   }
 });
+
+for (const outcome of [
+  'missing-completion',
+  'cancelled-before-start',
+  'cancelled-at-finish',
+] as const) {
+  test(`subagent does not report false completion: ${outcome}`, async (t) => {
+    const f = fixture();
+    let runs = 0;
+    let signal: AbortSignal | undefined;
+    let childController: AbortController | undefined;
+    const services = new RuntimeServices(
+      f.store,
+      {
+        async execute() {
+          throw new Error('unused');
+        },
+        async close() {},
+      },
+      async (child, _prompt, childSignal) => {
+        runs++;
+        signal = childSignal;
+        if (outcome === 'cancelled-at-finish') {
+          // A provider may resolve even after lease loss has cancelled its signal.
+          f.store.append(child.id, 'turn_completed', {});
+          childController!.abort();
+        }
+      },
+    );
+    try {
+      const retain = services.sessionLeases.retain.bind(services.sessionLeases);
+      t.mock.method(services.sessionLeases, 'retain', (id: string, controller: AbortController) => {
+        const lease = retain(id, controller);
+        if (id !== f.session.id) {
+          childController = controller;
+          // Simulate lease loss before the scheduled child callback runs.
+          if (outcome === 'cancelled-before-start') controller.abort();
+        }
+        return lease;
+      });
+      const result = await services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+        f.session,
+        new AbortController().signal,
+      );
+      const id = result.output.split(': ')[1];
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const status = JSON.parse(
+        (
+          await services.execute(
+            { id: 'status', name: 'subagent_status', input: { id } },
+            f.session,
+            new AbortController().signal,
+          )
+        ).output,
+      );
+      assert.equal(status.status, 'failed');
+      assert.match(status.error, outcome === 'missing-completion' ? /未正常完成/ : /已取消/);
+      assert.equal(runs, outcome === 'cancelled-before-start' ? 0 : 1);
+      if (outcome === 'cancelled-at-finish') assert.equal(signal?.aborted, true);
+      assert.equal(f.store.isLeased(id), false);
+      assert.equal(f.store.isLeased(f.session.id), false);
+    } finally {
+      await services.close();
+      f.close();
+    }
+  });
+}
+
+for (const change of ['deleted', 'continued'] as const) {
+  test(`subagent status keeps the durable answer after the child session is ${change}`, async () => {
+    const f = fixture();
+    const executor: ToolExecutor = {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    };
+    const services = new RuntimeServices(f.store, executor, async (child) => {
+      f.store.append(child.id, 'assistant', { text: 'durable finding', calls: [] });
+      f.store.append(child.id, 'turn_completed', {});
+    });
+    let restored: RuntimeServices | undefined;
+    try {
+      const result = await services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+        f.session,
+        new AbortController().signal,
+      );
+      const id = result.output.split(': ')[1];
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (change === 'deleted') f.store.deleteSession(id);
+      else {
+        f.store.append(id, 'user', { text: 'an unrelated follow-up' });
+        f.store.append(id, 'assistant', { text: 'unrelated answer', calls: [] });
+        f.store.append(id, 'turn_completed', {});
+      }
+      restored = new RuntimeServices(f.store, executor, async () => {});
+      for (const runtime of [services, restored]) {
+        const status = JSON.parse(
+          (
+            await runtime.execute(
+              { id: 'status', name: 'subagent_status', input: { id } },
+              f.session,
+              new AbortController().signal,
+            )
+          ).output,
+        );
+        assert.equal(status.status, 'completed');
+        assert.equal(status.answer, 'durable finding');
+      }
+    } finally {
+      await restored?.close();
+      await services.close();
+      f.close();
+    }
+  });
+}
+
+for (const timing of ['before-start', 'late-success', 'late-error'] as const) {
+  test(`background lease cancellation is durable: ${timing}`, async (t) => {
+    const f = fixture();
+    let runs = 0;
+    let controller!: AbortController;
+    let finish!: () => void;
+    const executor: ToolExecutor = {
+      async execute() {
+        runs++;
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        if (timing === 'late-error') throw new Error('cancelled command');
+        return { output: 'late result', isError: false };
+      },
+      async close() {},
+    };
+    const services = new RuntimeServices(f.store, executor, async () => {});
+    let restored: RuntimeServices | undefined;
+    const retain = services.sessionLeases.retain.bind(services.sessionLeases);
+    t.mock.method(services.sessionLeases, 'retain', (id: string, value: AbortController) => {
+      controller = value;
+      const lease = retain(id, value);
+      if (timing === 'before-start') value.abort();
+      return lease;
+    });
+    try {
+      const started = await services.execute(
+        { id: 'start', name: 'start_background', input: { command: 'test command' } },
+        f.session,
+        new AbortController().signal,
+      );
+      const id = started.output.split(': ')[1];
+      controller.abort();
+      finish?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(runs, timing === 'before-start' ? 0 : 1);
+      assert.equal(f.store.isLeased(f.session.id), false);
+      restored = new RuntimeServices(f.store, executor, async () => {});
+      for (const runtime of [services, restored]) {
+        const status = JSON.parse(
+          (
+            await runtime.execute(
+              { id: 'status', name: 'background_status', input: { id } },
+              f.session,
+              new AbortController().signal,
+            )
+          ).output,
+        );
+        assert.equal(status.status, 'cancelled');
+      }
+      assert.equal(
+        f.store.events(f.session.id).filter((event) => event.type === 'background_finished').length,
+        1,
+      );
+    } finally {
+      finish?.();
+      await restored?.close();
+      await services.close();
+      f.close();
+    }
+  });
+}
+
+for (const status of ['completed', 'failed'] as const) {
+  test(`a late child callback preserves an existing ${status} parent receipt`, async () => {
+    const f = fixture();
+    const services = new RuntimeServices(
+      f.store,
+      {
+        async execute() {
+          throw new Error('unused');
+        },
+        async close() {},
+      },
+      async (child) => {
+        f.store.append(child.id, 'assistant', { text: 'late callback answer', calls: [] });
+        f.store.append(child.id, 'turn_completed', {});
+        f.store.append(f.session.id, 'subagent_finished', {
+          childId: child.id,
+          status,
+          answer: 'durable original result',
+          ...(status === 'failed' ? { error: 'recorded cancellation' } : {}),
+        });
+      },
+    );
+    try {
+      const started = await services.execute(
+        { id: 'spawn', name: 'spawn_subagent', input: { prompt: 'inspect' } },
+        f.session,
+        new AbortController().signal,
+      );
+      const id = started.output.split(': ')[1];
+      await services.waitForSubagents(f.session.id, new AbortController().signal);
+      const receipts = f.store
+        .events(f.session.id)
+        .filter((event) => event.type === 'subagent_finished');
+      assert.equal(receipts.length, 1);
+      const result = JSON.parse(
+        (
+          await services.execute(
+            { id: 'status', name: 'subagent_status', input: { id } },
+            f.session,
+            new AbortController().signal,
+          )
+        ).output,
+      );
+      assert.equal(result.status, status);
+      assert.equal(result.answer, 'durable original result');
+      if (status === 'failed') assert.equal(result.error, 'recorded cancellation');
+    } finally {
+      await services.close();
+      f.close();
+    }
+  });
+}
+
+for (const kind of ['turn_started', 'before_tool', 'after_tool', 'turn_finished'] as const) {
+  test(`hook transport errors are recorded and propagated at ${kind}`, async () => {
+    const f = fixture();
+    let executions = 0;
+    const services = new RuntimeServices(
+      f.store,
+      {
+        async execute() {
+          executions++;
+          throw new Error('hook worker disconnected');
+        },
+        async close() {},
+      },
+      async () => {},
+    );
+    try {
+      await assert.rejects(
+        services.runHooks(kind, f.session, new AbortController().signal, [
+          { name: 'first', event: kind, command: 'verify', enabled: true },
+          { name: 'second', event: kind, command: 'do-not-run', enabled: true },
+        ]),
+        /hook worker disconnected/,
+      );
+      assert.equal(executions, 1);
+      const hooks = f.store.events(f.session.id).filter((event) => event.type === 'hook_finished');
+      assert.equal(hooks.length, 1);
+      assert.equal(hooks[0].payload.event, kind);
+      assert.equal(hooks[0].payload.name, 'first');
+      assert.equal(hooks[0].payload.isError, true);
+      assert.equal(hooks[0].payload.executionUnknown, true);
+      assert.match(String(hooks[0].payload.output), /hook worker disconnected/);
+    } finally {
+      await services.close();
+      f.close();
+    }
+  });
+}
 
 test('cancelled runtime operations do not save memory or spawn a child', async () => {
   const f = fixture();
@@ -474,6 +1026,7 @@ test('worktree, hooks, background task and read-only subagent use durable events
   const services = new RuntimeServices(f.store, executor, async (child) => {
     runChild++;
     f.store.append(child.id, 'assistant', { text: 'research complete', calls: [] });
+    f.store.append(child.id, 'turn_completed', {});
   });
   try {
     execFileSync('git', ['init', '-q'], { cwd: f.dir });
@@ -513,6 +1066,7 @@ test('worktree, hooks, background task and read-only subagent use durable events
       f.session,
       new AbortController().signal,
     );
+    assert.equal(JSON.parse(childStatus.output).status, 'completed');
     assert.match(childStatus.output, /research complete/);
     assert.equal(runChild, 1);
     const background = await services.execute(

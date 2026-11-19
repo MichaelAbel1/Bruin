@@ -35,10 +35,13 @@ import { EventCard, ToolActivity, MarkdownMessage } from './conversation/Message
 import { date } from './formatting.js';
 import { connectorTemplates } from './connectors.js';
 import type { AttachmentRef } from '../../../src/core/attachments.js';
+import type { PatchPreflight } from '../../../src/core/workspace-patch.js';
 import './style.css';
 import { recordedUsage, recordedTokenLabel } from '../../../src/core/usage.js';
 import { pendingInputs } from '../../../src/core/input-queue.js';
 import { acceptsEventSnapshot } from '../../../src/core/event-snapshot.js';
+import { canResumeTurn, turnState } from '../../../src/core/turn-state.js';
+import { needsUnknownReview, unreviewedUnknownTools } from '../../../src/core/unknown-review.js';
 import bearWhite from '../../assets/icon-white.png';
 import bearBlack from '../../assets/icon-black.png';
 import bearSage from '../../assets/icon-sage.png';
@@ -287,7 +290,7 @@ function App() {
       const next = await api<SessionView>(method, { ...params, sessionId: view.session.id });
       if (!isCurrentView(revision, view.session.id)) return false;
       setView(next);
-      return true;
+      return next;
     } catch (error) {
       if (!isCurrentView(revision, view.session.id)) return false;
       throw error;
@@ -484,13 +487,7 @@ function App() {
               ? {
                   ...previous!,
                   events: message.events!,
-                  needsReview: message.events!.some(
-                    (e) =>
-                      e.type === 'tool_unknown' &&
-                      e.seq >
-                        (message.events!.filter((x) => x.type === 'turn_completed').at(-1)?.seq ??
-                          0),
-                  ),
+                  needsReview: needsUnknownReview(message.events!),
                 }
               : previous,
           );
@@ -729,8 +726,16 @@ function App() {
   }
   async function acknowledge() {
     if (!view) return;
+    const throughSeq = unreviewedUnknownTools(view.events).at(-1)?.seq;
+    if (throughSeq === undefined) return;
     try {
-      if (await refreshView('reviewUnknown')) setNotice('已确认检查工作区。可继续会话。');
+      const next = await refreshView('reviewUnknown', { throughSeq });
+      if (next)
+        setNotice(
+          next.needsReview
+            ? '还有新的未知工具结果，请检查后确认。'
+            : '已确认检查工作区。可继续会话。',
+        );
     } catch (err) {
       fail(err);
     }
@@ -744,13 +749,14 @@ function App() {
     }
   }
   const usage = useMemo(() => recordedUsage(view?.events ?? []), [view?.events]);
-  const lastEvent = view?.events.at(-1);
-  const canResume = Boolean(
-    view &&
-    view.events.some((e) => e.type === 'user') &&
-    lastEvent?.type !== 'turn_completed' &&
-    !busy,
-  );
+  const currentTurn = turnState(view?.events ?? []);
+  const canResume = Boolean(view && !busy && canResumeTurn(view.events));
+  const resumeLabel =
+    currentTurn === 'paused'
+      ? '继续任务'
+      : currentTurn === 'unfinished'
+        ? '继续未完成的运行'
+        : '处理队列中的消息';
 
   return (
     <div className="app-shell">
@@ -1047,7 +1053,9 @@ function App() {
                       <strong>有工具操作的结果未知</strong>
                       <p>上次运行可能在工具执行中中断。请检查项目文件，再继续执行。</p>
                     </div>
-                    <button onClick={() => void acknowledge()}>我已检查</button>
+                    <button disabled={busy} onClick={() => void acknowledge()}>
+                      我已检查
+                    </button>
                   </div>
                 )}
                 {(view.plan.enabled || view.plan.steps.length > 0) && (
@@ -1156,10 +1164,9 @@ function App() {
                 {canResume && !view.needsReview && (
                   <div className="resume-actions">
                     <button className="resume-button" onClick={() => void resume()}>
-                      <Sparkles size={16} />{' '}
-                      {lastEvent?.type === 'turn_paused' ? '继续任务' : '继续未完成的运行'}
+                      <Sparkles size={16} /> {resumeLabel}
                     </button>
-                    {lastEvent?.type === 'turn_paused' && (
+                    {currentTurn === 'paused' && (
                       <button className="secondary" onClick={() => void finishPausedTurn()}>
                         结束任务
                       </button>
@@ -1675,6 +1682,7 @@ function App() {
       )}
       {dialog === 'runtime' && (
         <RuntimeDialog
+          key={view ? `${view.session.id}:${view.session.workspace}` : undefined}
           config={config}
           session={view?.session}
           close={() => setDialog(null)}
@@ -1921,6 +1929,8 @@ function Modal({
     </div>
   );
 }
+type PatchCandidate = { id: string; prompt: string; baseCommit: string; running: boolean };
+
 function RuntimeDialog({
   config,
   session,
@@ -1955,6 +1965,12 @@ function RuntimeDialog({
   const [worktreeName, setWorktreeName] = useState('');
   const [worktreePath, setWorktreePath] = useState('');
   const [subagentPrompt, setSubagentPrompt] = useState('');
+  const [subagentMode, setSubagentMode] = useState<'read-only' | 'worktree'>('read-only');
+  const [subagentEdits, setSubagentEdits] = useState(false);
+  const [subagentReviewPath, setSubagentReviewPath] = useState('');
+  const [patchCandidates, setPatchCandidates] = useState<PatchCandidate[]>([]);
+  const [selectedPatches, setSelectedPatches] = useState<string[]>([]);
+  const [patchTestCommand, setPatchTestCommand] = useState('');
   const [backgroundCommand, setBackgroundCommand] = useState('');
   const [taskId, setTaskId] = useState('');
   const [cronExpression, setCronExpression] = useState('0 9 * * *');
@@ -1970,8 +1986,19 @@ function RuntimeDialog({
   const [memoryContent, setMemoryContent] = useState('');
   useEffect(() => {
     if (!session) return;
+    let active = true;
     void api<CronJob[]>('listCronJobs', { sessionId: session.id }).then(setCronJobs).catch(fail);
     void api<TaskNode[]>('listTasks', { sessionId: session.id }).then(setGraphTasks).catch(fail);
+    void api<PatchCandidate[]>('listSubagentPatches', { sessionId: session.id })
+      .then((candidates) => {
+        if (active) setPatchCandidates(candidates);
+      })
+      .catch((error) => {
+        if (active) fail(error);
+      });
+    return () => {
+      active = false;
+    };
   }, [session?.id]);
   const [output, setOutput] = useState('');
   const [working, setWorking] = useState(false);
@@ -1999,6 +2026,9 @@ function RuntimeDialog({
         sessionId: session.id,
         name,
         input,
+        ...(name === 'spawn_subagent'
+          ? { allowWorkspaceEdits: subagentMode === 'worktree' && subagentEdits }
+          : {}),
       });
       setOutput(result.output);
       if (name === 'list_snapshots') {
@@ -2012,7 +2042,78 @@ function RuntimeDialog({
       }
       if (name.endsWith('_task') || name === 'list_tasks')
         setGraphTasks(await api<TaskNode[]>('listTasks', { sessionId: session.id }));
+      if (name === 'spawn_subagent') await refreshPatchCandidates();
     } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function exportSubagentPatch() {
+    if (!session || !taskId.trim()) return;
+    setWorking(true);
+    try {
+      const result = await api<{ path: string; baseCommit: string } | null>('exportSubagentPatch', {
+        sessionId: session.id,
+        childId: taskId.trim(),
+      });
+      if (result) setOutput(`补丁已保存到 ${result.path}\n基线提交 ${result.baseCommit}`);
+    } catch (error) {
+      fail(error);
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function refreshPatchCandidates() {
+    if (!session) return;
+    const candidates = await api<PatchCandidate[]>('listSubagentPatches', {
+      sessionId: session.id,
+    });
+    setPatchCandidates(candidates);
+    setSelectedPatches((current) =>
+      current.filter((id) => candidates.some((item) => item.id === id && !item.running)),
+    );
+  }
+  async function preflightPatches(testCommand?: string) {
+    if (!session || selectedPatches.length < 2) return;
+    setWorking(true);
+    setOutput('正在临时工作树中检查补丁…');
+    try {
+      const result = await api<PatchPreflight | null>('preflightSubagentPatches', {
+        sessionId: session.id,
+        childIds: selectedPatches,
+        testCommand,
+      });
+      if (!result) {
+        setOutput('已取消本次预检。');
+        return;
+      }
+      const heading =
+        result.status === 'compatible'
+          ? `${result.checked.length} 份补丁可一起应用。`
+          : result.status === 'conflict'
+            ? `补丁发生冲突，子任务 ${result.failedChildId}。`
+            : `无法应用子任务 ${result.failedChildId} 的补丁。`;
+      setOutput(
+        [
+          heading,
+          `基线提交 ${result.baseCommit}`,
+          ...result.conflictPaths,
+          ...(result.detail ? ['', result.detail] : []),
+          ...(result.test
+            ? [
+                '',
+                result.test.isError ? '测试未通过。' : '测试通过。',
+                ...(result.test.exitCode !== undefined && result.test.exitCode >= 0
+                  ? [`退出码 ${result.test.exitCode}`]
+                  : []),
+                result.test.output,
+              ]
+            : []),
+        ].join('\n'),
+      );
+    } catch (error) {
+      setOutput('');
       fail(error);
     } finally {
       setWorking(false);
@@ -2549,23 +2650,49 @@ function RuntimeDialog({
           </button>
         </div>
         <div className="runtime-row">
+          <select
+            value={subagentMode}
+            onChange={(e) => setSubagentMode(e.target.value as 'read-only' | 'worktree')}
+            aria-label="子 Agent 模式"
+          >
+            <option value="read-only">只读研究</option>
+            <option value="worktree">独立工作树编码</option>
+          </select>
           <input
             value={subagentPrompt}
             onChange={(e) => setSubagentPrompt(e.target.value)}
-            placeholder="只读子 Agent 任务"
+            placeholder="子 Agent 的任务与验收要求"
           />
           <button
-            disabled={working || !session || !subagentPrompt.trim()}
+            disabled={
+              working ||
+              !session ||
+              !subagentPrompt.trim() ||
+              (subagentMode === 'worktree' && !subagentEdits)
+            }
             onClick={() =>
               void runtime('spawn_subagent', {
                 prompt: subagentPrompt,
-                ...(worktreePath.trim() ? { worktree: worktreePath.trim() } : {}),
+                mode: subagentMode,
+                ...(subagentMode === 'read-only' && worktreePath.trim()
+                  ? { worktree: worktreePath.trim() }
+                  : {}),
               })
             }
           >
             启动子 Agent
           </button>
         </div>
+        {subagentMode === 'worktree' && (
+          <label className="checkbox-line">
+            <input
+              type="checkbox"
+              checked={subagentEdits}
+              onChange={(e) => setSubagentEdits(e.target.checked)}
+            />
+            授权子任务修改独立工作树文件；从 HEAD 开始，不含当前未提交改动，结果保留供审核
+          </label>
+        )}
         <div className="runtime-row">
           <input
             value={backgroundCommand}
@@ -2593,6 +2720,12 @@ function RuntimeDialog({
           </button>
           <button
             disabled={working || !session || !taskId.trim()}
+            onClick={() => void runtime('cancel_subagent', { id: taskId })}
+          >
+            停止子 Agent
+          </button>
+          <button
+            disabled={working || !session || !taskId.trim()}
             onClick={() => void runtime('background_status', { id: taskId })}
           >
             后台状态
@@ -2604,7 +2737,101 @@ function RuntimeDialog({
             停止后台
           </button>
         </div>
-        {output && <pre className="runtime-output">{output}</pre>}
+        <div className="runtime-row">
+          <input
+            value={subagentReviewPath}
+            onChange={(e) => setSubagentReviewPath(e.target.value)}
+            placeholder="子任务变更文件的相对路径"
+          />
+          <button
+            disabled={working || !session || !taskId.trim() || !subagentReviewPath.trim()}
+            onClick={() =>
+              void runtime('subagent_review', { id: taskId, path: subagentReviewPath.trim() })
+            }
+          >
+            审核子任务文件
+          </button>
+          <button
+            disabled={working || !session || !taskId.trim()}
+            onClick={() => void exportSubagentPatch()}
+          >
+            导出子任务补丁
+          </button>
+        </div>
+        <h3>子任务联合预检</h3>
+        <div className="runtime-row">
+          <span>选择同一基线的 2 至 10 份补丁，检查能否一起应用。</span>
+          <button
+            disabled={working || !session}
+            onClick={() => {
+              setWorking(true);
+              void refreshPatchCandidates()
+                .catch(fail)
+                .finally(() => setWorking(false));
+            }}
+          >
+            刷新子任务
+          </button>
+          <button
+            disabled={working || !session || selectedPatches.length < 2}
+            onClick={() => void preflightPatches()}
+          >
+            联合预检{selectedPatches.length > 0 ? `（${selectedPatches.length}）` : ''}
+          </button>
+        </div>
+        {patchCandidates.length ? (
+          <div className="patch-candidates" role="group" aria-label="可选子任务补丁">
+            {patchCandidates.map((item) => {
+              const selected = selectedPatches.includes(item.id);
+              return (
+                <label key={item.id} className="checkbox-line">
+                  <input
+                    type="checkbox"
+                    checked={selected}
+                    disabled={
+                      working || item.running || (!selected && selectedPatches.length >= 10)
+                    }
+                    onChange={(e) =>
+                      setSelectedPatches((current) =>
+                        e.target.checked
+                          ? [...current, item.id]
+                          : current.filter((id) => id !== item.id),
+                      )
+                    }
+                  />
+                  <span title={item.id}>
+                    {item.prompt || item.id} · {item.id.slice(0, 8)} ·{' '}
+                    {item.baseCommit.slice(0, 12)}
+                    {item.running ? ' · 运行中' : ''}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        ) : (
+          <small>当前会话暂无编码子任务。</small>
+        )}
+        <div className="runtime-row">
+          <input
+            aria-label="临时工作树测试命令"
+            placeholder="测试命令，例如 npm test"
+            value={patchTestCommand}
+            maxLength={10_000}
+            disabled={working || !session}
+            onChange={(e) => setPatchTestCommand(e.target.value)}
+          />
+          <button
+            disabled={working || !session || selectedPatches.length < 2 || !patchTestCommand.trim()}
+            onClick={() => void preflightPatches(patchTestCommand)}
+          >
+            预检并测试
+          </button>
+        </div>
+        {output && (
+          <pre className="runtime-output" role="status">
+            {output}
+          </pre>
+        )}
       </div>
     </Modal>
   );

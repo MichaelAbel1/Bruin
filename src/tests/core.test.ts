@@ -490,6 +490,64 @@ test('workspace task files survive sessions and expose full task details', () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('checking for tasks in an empty workspace does not create snapshot files', () => {
+  const dir = temp();
+  const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
+  try {
+    const session = store.createSession(dir, profile);
+    assert.equal(store.claimTask(session.id, 'scheduler', 1000), undefined);
+    store.syncTasks(session.id);
+    assert.equal(fs.existsSync(path.join(dir, '.tasks')), false);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const takeover of [false, true]) {
+  test(`task claim checks ownership after snapshot sync (takeover=${takeover})`, (t) => {
+    const dir = fs.realpathSync(temp());
+    const filename = path.join(dir, 'db.sqlite');
+    const first = new SqliteEventStore(filename);
+    const second = new SqliteEventStore(filename);
+    try {
+      const session = first.createSession(dir, profile);
+      const task = first.createTask(session.id, 'Potentially side effecting', []);
+      const snapshot = path.join(dir, '.tasks', `${task.id}.json`);
+      const now = Date.now();
+      const clock = t.mock.method(Date, 'now', () => now);
+      const rename = fs.renameSync;
+      let delayed = false;
+      t.mock.method(fs, 'renameSync', (...[from, to]: Parameters<typeof rename>) => {
+        rename(from, to);
+        if (to !== snapshot || delayed) return;
+        delayed = true;
+        clock.mock.mockImplementation(() => now + 1100);
+        if (takeover) {
+          assert.equal(second.claimTask(session.id, 'second', 1000), undefined);
+          second.retryTask(session.id, task.id);
+          assert.equal(second.claimTask(session.id, 'second', 1000)?.owner, 'second');
+        }
+      });
+      const claim = first.claimTask(session.id, 'first', 1000);
+      assert.equal(delayed, true);
+      assert.equal(claim, undefined);
+      if (takeover) {
+        assert.equal(first.getTask(session.id, task.id)?.owner, 'second');
+        second.finishTask(task.id, 'second', true);
+      } else {
+        assert.equal(second.claimTask(session.id, 'second', 1000), undefined);
+        assert.equal(second.getTask(session.id, task.id)?.status, 'unknown');
+      }
+    } finally {
+      first.close();
+      second.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('task snapshots reject a symlinked .tasks directory', () => {
   const dir = temp();
   const outside = temp();
@@ -854,8 +912,9 @@ test('file tools replace content without losing permissions or changing files on
   try {
     const request = (
       id: string,
-      name: 'write_file' | 'edit_file',
+      name: 'read_file' | 'write_file' | 'edit_file',
       input: Record<string, unknown>,
+      expectedFileVersion?: string,
     ) =>
       executor.execute({
         requestId: id,
@@ -864,8 +923,16 @@ test('file tools replace content without losing permissions or changing files on
         workspace: dir,
         timeoutMs: 5000,
         maxOutputBytes: 100,
+        expectedFileVersion,
       });
-    const write = await request('write', 'write_file', { content: 'updated text\n' });
+    const read = await request('read', 'read_file', {});
+    assert.ok(read.fileVersion);
+    const write = await request(
+      'write',
+      'write_file',
+      { content: 'updated text\n' },
+      read.fileVersion,
+    );
     assert.equal(write.isError, false, write.output);
     assert.equal(write.output, '已写入 script.sh');
     assert.equal(fs.readFileSync(file, 'utf8'), 'updated text\n');
@@ -975,6 +1042,7 @@ test(
         'if [ "$1" = "run" ]; then\n' +
         '  shift\n' +
         '  while [ "$1" != "--name" ]; do shift; done\n' +
+        "  printf '甲乙'\n" +
         `  echo "run:$2" >> '${marker}'\n` +
         '  sleep 30\n' +
         'else\n' +
@@ -1001,7 +1069,7 @@ test(
           input: { command: 'sleep 30' },
           workspace: dir,
           timeoutMs: 5000,
-          maxOutputBytes: 100,
+          maxOutputBytes: 4,
         },
         controller.signal,
       );
@@ -1009,7 +1077,12 @@ test(
         await new Promise((resolve) => setTimeout(resolve, 10));
       assert.equal(fs.existsSync(marker), true);
       controller.abort();
-      assert.equal((await result).isError, true);
+      const cancelled = await result;
+      assert.equal(cancelled.isError, true);
+      assert.equal(cancelled.truncated, true);
+      assert.match(cancelled.output, /^甲\n/);
+      assert.doesNotMatch(cancelled.output, /\uFFFD/);
+      assert.match(cancelled.output, /取消/);
       const entries = fs.readFileSync(marker, 'utf8').trim().split('\n');
       const name = entries.find((entry) => entry.startsWith('run:'))?.slice(4);
       assert.ok(name?.startsWith('bruin-'));
@@ -1023,6 +1096,7 @@ test(
         maxOutputBytes: 100,
       });
       assert.equal(timedOut.isError, true);
+      assert.match(timedOut.output, /超时/);
       const afterTimeout = fs.readFileSync(marker, 'utf8').trim().split('\n');
       const timeoutName = afterTimeout
         .filter((entry) => entry.startsWith('run:'))
@@ -1698,8 +1772,13 @@ test('step limit pauses with a side-effect report and resumes without replaying 
   let stepCalls = 0;
   let writes = 0;
   const gateway: ModelGateway = {
-    async complete() {
+    async complete(_profile, prompt) {
       stepCalls++;
+      if (stepCalls > 2) {
+        assert.equal(prompt.at(-1)?.role, 'tool');
+        assert.match(JSON.stringify(prompt.at(-1)), /written/);
+        assert.doesNotMatch(JSON.stringify(prompt), /本段运行的 2 次模型调用上限/);
+      }
       return stepCalls <= 2
         ? {
             text: '',
@@ -1803,17 +1882,19 @@ test('long run continues past the normal 24-call limit and records a durable che
   }
 });
 
-test('long run time budget pauses after completed tools without replaying them', async () => {
+test('long run time budget pauses after completed tools without replaying them', async (t) => {
   const dir = temp();
   const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
   const session = store.createSession(dir, profile);
   fs.writeFileSync(path.join(dir, 'source.txt'), 'source');
   let calls = 0;
+  let executions = 0;
+  const started = Date.now();
+  const clock = t.mock.method(Date, 'now', () => started);
   const gateway: ModelGateway = {
     async complete() {
       calls++;
       if (calls === 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
         return {
           text: '',
           calls: [{ id: 'read-1', name: 'read_file', input: { path: 'source.txt' } }],
@@ -1824,6 +1905,8 @@ test('long run time budget pauses after completed tools without replaying them',
   };
   const executor: ToolExecutor = {
     async execute() {
+      executions++;
+      clock.mock.mockImplementation(() => started + 60_001);
       return { output: 'source', isError: false };
     },
     async close() {},
@@ -1838,12 +1921,17 @@ test('long run time budget pauses after completed tools without replaying them',
     });
     await runner.run(session, 'inspect', undefined, [], undefined, {
       maxModelCalls: 30,
-      maxDurationMs: 1,
+      maxDurationMs: 60_000,
     });
     assert.equal(calls, 1);
     assert.equal(store.events(session.id).at(-1)?.payload.reason, 'time_limit');
     await runner.run(session);
     assert.equal(calls, 2);
+    assert.equal(executions, 1);
+    assert.equal(
+      store.events(session.id).filter((event) => event.type === 'tool_finished').length,
+      1,
+    );
     assert.equal(store.events(session.id).at(-1)?.type, 'turn_completed');
   } finally {
     store.close();

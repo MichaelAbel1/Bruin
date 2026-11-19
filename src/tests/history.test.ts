@@ -90,6 +90,70 @@ test('single-turn compaction cuts after settled tools and retains recent model t
   assert.equal(historyCompactionRange(events.slice(0, 4)), undefined);
 });
 
+test('repeated compaction retains the active original request through queued corrections', () => {
+  const original = 'Keep the existing API and report verified results.';
+  for (const corrections of [1, 2]) {
+    const events: SessionEvent[] = [];
+    const add = (type: SessionEvent['type'], payload: Record<string, unknown>) =>
+      events.push({ sessionId: 'steered', seq: events.length + 1, type, at: '', payload });
+    const compact = () => {
+      const range = historyCompactionRange(events);
+      assert.ok(range);
+      add('summary', {
+        throughSeq: range.throughSeq,
+        keepUserSeq: range.keepUserSeq,
+        text: 'Earlier findings.',
+      });
+      return range.keepUserSeq;
+    };
+    add('user', { text: original });
+    for (let step = 0; step < 4; step++) add('assistant', { text: `Step ${step}` });
+    assert.equal(compact(), 1);
+
+    for (let correction = 0; correction < corrections; correction++) {
+      add('user', { text: `Correction ${correction}`, queuedInputId: `input-${correction}` });
+      for (let step = 0; step < 3; step++) add('assistant', { text: `Continued step ${step}` });
+    }
+    assert.equal(compact(), 1);
+    assert.ok(buildPrompt(events, 'rules').some((message) => message.content === original));
+
+    add('turn_completed', {});
+    add('user', { text: 'Independent new request' });
+    for (let step = 0; step < 3; step++) add('assistant', { text: `New step ${step}` });
+    compact();
+    assert.ok(buildPrompt(events, 'rules').every((message) => message.content !== original));
+  }
+});
+
+test('pause reports do not replace settled tool results or count as model replies', () => {
+  const events: SessionEvent[] = [];
+  const add = (type: SessionEvent['type'], payload: Record<string, unknown>) =>
+    events.push({ sessionId: 'pause', seq: events.length + 1, type, at: '', payload });
+  add('user', { text: 'run tests' });
+  for (const format of ['legacy', 'current']) {
+    add('assistant', {
+      calls: [{ id: format, name: 'read_file', input: { path: 'test.txt' } }],
+    });
+    add('tool_finished', { callId: format, name: 'read_file', output: format + ' result' });
+    const report = format + ' pause report for the user';
+    add('assistant', {
+      text: report,
+      calls: [],
+      ...(format === 'current' ? { synthetic: 'pause_report' } : {}),
+    });
+    add('turn_paused', { report });
+  }
+
+  const prompt = buildPrompt(events, 'rules');
+  assert.deepEqual(
+    prompt.map((message) => message.role),
+    ['system', 'user', 'assistant', 'tool', 'assistant', 'tool'],
+  );
+  assert.doesNotMatch(JSON.stringify(prompt), /pause report for the user/);
+  assert.match(JSON.stringify(prompt.at(-1)), /current result/);
+  assert.equal(historyCompactionRange(events), undefined);
+});
+
 test('history previews retain terminal error status at the end of large tool output', () => {
   const events: SessionEvent[] = [
     { sessionId: 'tail', seq: 1, type: 'user', at: '', payload: { text: 'run tests' } },
@@ -174,6 +238,39 @@ test('a long single turn retains the actual request alongside compacted activity
   );
 });
 
+test('compacted tool activity yields to system rules and an image request at the token limit', () => {
+  const required: ModelMessage[] = [
+    { role: 'system', content: 'Keep project rules.' },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Compare the changes against this screenshot.' },
+        {
+          type: 'image',
+          image: new URL('data:image/png;base64,AAAA'),
+          mediaType: 'image/png',
+        },
+      ],
+    },
+  ];
+  const overheadTokens = 6144 - promptTokens(required);
+  const messages = [...required, ...toolPair('read', '文件内容'.repeat(5000))];
+  assert.deepEqual(budgetPrompt(messages, 8192, { overheadTokens }), required);
+});
+
+test('a request that fits stays intact when recent tool activity fills the remaining budget', () => {
+  const required: ModelMessage[] = [
+    { role: 'system', content: 'Keep project rules.' },
+    {
+      role: 'user',
+      content: `${'Review the affected code. '.repeat(50)}Preserve the cache key. ${'Run the tests. '.repeat(50)}`,
+    },
+  ];
+  const overheadTokens = 6144 - promptTokens(required) - 20;
+  const messages = [...required, ...toolPair('read', '文件内容'.repeat(5000))];
+  assert.deepEqual(budgetPrompt(messages, 8192, { overheadTokens }), required);
+});
+
 test('insufficient budgets reject instead of silently truncating system rules or dropping images', () => {
   const messages: ModelMessage[] = [
     { role: 'system', content: 'global rule\n' + '中'.repeat(10000) + '\nproject rule' },
@@ -229,6 +326,59 @@ test('model switch before a checkpoint still prevents replaying old provider mes
   );
   assert.match(JSON.stringify(result), /neutral answer/);
   assert.doesNotMatch(JSON.stringify(result), /stale provider state/);
+});
+
+test('model history preserves the recorded shell exit code even with empty output', () => {
+  const event = (
+    seq: number,
+    type: SessionEvent['type'],
+    payload: Record<string, unknown>,
+  ): SessionEvent => ({ sessionId: 'shell-context', seq, type, at: '', payload });
+  const messages = buildPrompt(
+    [
+      event(1, 'user', { text: 'Run the checks' }),
+      event(2, 'assistant', {
+        calls: [{ id: 'check', name: 'shell', input: { command: 'npm test' } }],
+      }),
+      event(3, 'tool_finished', {
+        callId: 'check',
+        name: 'shell',
+        output: '',
+        exitCode: 2,
+        isError: true,
+      }),
+    ],
+    'rules',
+  );
+  assert.equal(messages.at(-1)?.role, 'tool');
+  assert.match(JSON.stringify(messages.at(-1)), /ERROR: Exit code: 2/);
+});
+
+test('standalone desktop tool receipts do not enter model history as orphaned tool results', () => {
+  const events: SessionEvent[] = [];
+  const add = (type: SessionEvent['type'], payload: Record<string, unknown>) =>
+    events.push({ sessionId: 'desktop', seq: events.length + 1, type, at: '', payload });
+  add('tool_requested', { callId: 'manual-child', name: 'spawn_subagent', source: 'desktop' });
+  add('tool_finished', { callId: 'manual-child', name: 'spawn_subagent', output: 'child started' });
+  add('user', { text: 'Verify the output' });
+  add('assistant', {
+    calls: [{ id: 'model-read', name: 'read_file', input: { path: 'test.txt' } }],
+  });
+  add('tool_requested', { callId: 'manual-status', name: 'subagent_status', source: 'desktop' });
+  add('tool_finished', {
+    callId: 'manual-status',
+    name: 'subagent_status',
+    output: 'child running',
+  });
+  add('tool_finished', { callId: 'model-read', name: 'read_file', output: 'model result' });
+
+  const prompt = buildPrompt(events, 'rules');
+  assert.deepEqual(
+    prompt.map((message) => message.role),
+    ['system', 'user', 'assistant', 'tool'],
+  );
+  assert.doesNotMatch(JSON.stringify(prompt), /manual-child|manual-status/);
+  assert.match(JSON.stringify(prompt.at(-1)), /model result/);
 });
 
 test('tool result reconstruction falls back to pending call name or "tool" when payload.name is missing', () => {

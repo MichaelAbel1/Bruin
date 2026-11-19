@@ -1,4 +1,61 @@
+import path from 'node:path';
 import type { MemoryPage } from '../storage/event-store.js';
+import { instructionTarget } from './instructions.js';
+import type { SessionEvent } from './types.js';
+
+const continuation =
+  /^(?:请\s*)?(?:继续(?:吧|一下|执行|当前任务|上一个任务)?|接着(?:做|改|来)?|按(?:上面|之前|刚才)(?:的)?(?:改|做|继续))$|^(?:please\s+)?(?:continue|go on|resume)(?:\s+the (?:task|work|analysis))?$/iu;
+const topicReset =
+  /^(?:换(?:个|一个)(?:项目|话题|任务)|新任务|switch (?:topics?|projects?)|new task)$/iu;
+const stopWords = new Set(
+  'a an the to for of in on this that please check fix update review task project workspace src test tests ts js 检查 排查 修复 更新 查看 继续 项目 任务 工作 这个 当前'.split(
+    ' ',
+  ),
+);
+
+/** Follow short continuations within the current workspace, using durable user and tool events. */
+export function workspaceMemoryQuery(workspace: string, events: readonly SessionEvent[]): string {
+  const paths = new Set<string>();
+  const results = new Map<string, boolean[]>();
+  const pathHints = () => [...paths].join(' ');
+  for (let index = events.length - 1; index >= 0; index--) {
+    const { type, payload } = events[index];
+    if (type === 'workspace_changed') break;
+    if (type === 'user') {
+      const text = String(payload.text ?? '').trim();
+      const command = text
+        .normalize('NFKC')
+        .replace(/[.!?。！？]+$/u, '')
+        .trim();
+      if (topicReset.test(command)) return pathHints();
+      const quote = payload.quote as { text?: string } | undefined;
+      const quotedText = typeof quote?.text === 'string' ? quote.text.slice(0, 2000) : '';
+      const attachments = Array.isArray(payload.attachments) && payload.attachments.length > 0;
+      const task = continuation.test(command) ? '' : command;
+      if (task || quotedText || attachments)
+        return [task.slice(0, 6000), quotedText, pathHints()].filter(Boolean).join('\n');
+    }
+    if (paths.size >= 12 || typeof payload.callId !== 'string') continue;
+    if (type === 'tool_finished' || type === 'tool_denied' || type === 'tool_unknown') {
+      const queue = results.get(payload.callId) ?? [];
+      queue.push(type === 'tool_finished' && payload.isError === false);
+      results.set(payload.callId, queue);
+    }
+    if (type === 'tool_requested' && results.get(payload.callId)?.shift()) {
+      const target = instructionTarget(payload.name, payload.input);
+      if (!target) continue;
+      const relative = path.relative(workspace, path.resolve(workspace, target.path));
+      if (
+        relative &&
+        relative !== '..' &&
+        !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative)
+      )
+        paths.add(relative.replace(/[\\/_.-]+/g, ' '));
+    }
+  }
+  return pathHints();
+}
 
 function terms(text: string): string[] {
   const normalized = text.normalize('NFKC').toLowerCase();
@@ -11,10 +68,12 @@ function terms(text: string): string[] {
           : [word],
       ),
     ),
-  ].slice(0, 256);
+  ]
+    .filter((term) => !stopWords.has(term))
+    .slice(0, 256);
 }
 
-/** Rank the existing bounded workspace pages without changing the storage contract. */
+/** Rank matching notes, and give unmatched topics only an index entry. */
 export function memoryContext(pages: MemoryPage[], query: string, maxChars = 8000): string {
   const keywords = terms(query);
   const ranked = pages
@@ -30,17 +89,16 @@ export function memoryContext(pages: MemoryPage[], query: string, maxChars = 800
     .sort((a, b) => b.score - a.score || a.index - b.index);
   const selected: string[] = [];
   let remaining = Math.max(0, Math.floor(maxChars));
-  for (const { page } of ranked) {
-    const heading = `${JSON.stringify({ key: page.key, updatedAt: page.updatedAt })}\n`;
+  for (const { page, score } of ranked) {
+    const heading = JSON.stringify({ key: page.key, updatedAt: page.updatedAt });
     const separator = selected.length ? '\n\n' : '';
-    const available = remaining - heading.length - separator.length;
-    if (available <= 0) continue;
-    const truncated = page.content.length > available;
+    if (remaining < heading.length + separator.length) continue;
+    const available = Math.min(2000, remaining - heading.length - separator.length - 1);
     const marker = '\n[truncated; use list_memory for the complete page]';
-    if (truncated && available <= marker.length) continue;
-    const content = truncated
-      ? page.content.slice(0, available - marker.length) + marker
-      : page.content;
+    let content = '';
+    if (score > 0 && page.content.length <= available) content = '\n' + page.content;
+    else if (score > 0 && available > marker.length)
+      content = '\n' + page.content.slice(0, available - marker.length) + marker;
     const entry = separator + heading + content;
     selected.push(entry);
     remaining -= entry.length;

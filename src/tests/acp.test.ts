@@ -57,6 +57,159 @@ function fixture(gateway: ModelGateway) {
   };
 }
 
+test('ACP checks uncertain effects before another prompt and honors an explicit local review', async () => {
+  let calls = 0;
+  const f = fixture({
+    async complete() {
+      calls++;
+      return { text: 'checked history', calls: [] };
+    },
+  });
+  try {
+    await f.request('initialize', { protocolVersion: 1 });
+    const sessionId = (await f.request('session/new', { cwd: f.dir, mcpServers: [] })).result
+      .sessionId;
+    f.store.append(sessionId, 'assistant', {
+      text: '',
+      calls: [{ id: 'uncertain', name: 'shell', input: { command: 'external side effect' } }],
+    });
+    f.store.append(sessionId, 'tool_started', {
+      callId: 'uncertain',
+      name: 'shell',
+      recovery: 'manual',
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const reply = await f.request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'continue' }],
+      });
+      assert.equal(reply.error?.code, -32603);
+      assert.match(reply.error.message, /uncertain tool results/);
+      assert.equal(f.store.isLeased(sessionId), false);
+    }
+    assert.equal(calls, 0);
+    assert.equal(f.effects(), 0);
+    const events = f.store.events(sessionId);
+    assert.equal(events.filter((event) => event.type === 'tool_unknown').length, 1);
+    assert.equal(events.filter((event) => event.type === 'user').length, 0);
+    const reviewedThrough = events.find((event) => event.type === 'tool_unknown')!.seq;
+    f.store.append(sessionId, 'unknown_reviewed', {
+      throughSeq: reviewedThrough,
+      source: 'desktop',
+    });
+    const resumed = await f.request('session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: 'continue after review' }],
+    });
+    assert.equal(resumed.result?.stopReason, 'end_turn');
+    assert.equal(calls, 1);
+    assert.equal(f.effects(), 0);
+    assert.equal(f.store.isLeased(sessionId), false);
+  } finally {
+    await f.close();
+  }
+});
+
+test('ACP reconciles interrupted reads and completed child receipts without replaying tools', async () => {
+  const f = fixture({
+    async complete(_profile, prompt) {
+      assert.match(JSON.stringify(prompt), /Read interrupted/);
+      assert.match(String(prompt[0].content), /recovered child finding/);
+      return { text: 'reviewed history', calls: [] };
+    },
+  });
+  try {
+    await f.request('initialize', { protocolVersion: 1 });
+    const sessionId = (await f.request('session/new', { cwd: f.dir, mcpServers: [] })).result
+      .sessionId;
+    const parent = f.store.getSession(sessionId)!;
+    f.store.append(sessionId, 'assistant', {
+      text: '',
+      calls: [{ id: 'read', name: 'read_file', input: { path: 'source.txt' } }],
+    });
+    f.store.append(sessionId, 'tool_started', {
+      callId: 'read',
+      name: 'read_file',
+      recovery: 'safe',
+    });
+    const child = f.store.createSession(f.dir, parent.profile);
+    f.store.append(sessionId, 'subagent_started', {
+      childId: child.id,
+      prompt: 'inspect',
+      workspace: f.dir,
+      mode: 'read-only',
+    });
+    f.store.append(child.id, 'user', { text: 'inspect' });
+    f.store.append(child.id, 'assistant', { text: 'recovered child finding', calls: [] });
+    f.store.append(child.id, 'turn_completed', {});
+    const result = await f.request('session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: 'continue' }],
+    });
+    assert.equal(result.result?.stopReason, 'end_turn', JSON.stringify(result));
+    assert.equal(f.effects(), 0);
+    assert.equal(f.store.isLeased(sessionId), false);
+    const events = f.store.events(sessionId);
+    assert.equal(
+      events.filter((event) => event.type === 'tool_finished' && event.payload.callId === 'read')
+        .length,
+      1,
+    );
+    assert.equal(
+      events.filter((event) => event.type === 'subagent_finished' && event.payload.recovered)
+        .length,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+for (const lateType of [
+  'background_finished',
+  'subagent_finished',
+  'model_switched',
+  'hook_finished',
+] as const) {
+  test(`ACP preserves the budget stop reason after ${lateType}`, async (t) => {
+    const previous = process.env.BRUIN_MAX_STEPS;
+    process.env.BRUIN_MAX_STEPS = '1';
+    const f = fixture({
+      async complete() {
+        return {
+          text: '',
+          calls: [{ id: 'read', name: 'read_file', input: { path: 'source.txt' } }],
+        };
+      },
+    });
+    const append = f.store.append.bind(f.store);
+    t.mock.method(f.store, 'append', (...args: Parameters<typeof append>) => {
+      const result = append(...args);
+      if (args[1] === 'turn_paused')
+        append(args[0], lateType, { id: 'late', childId: 'late-child', status: 'completed' });
+      return result;
+    });
+    try {
+      fs.writeFileSync(path.join(f.dir, 'source.txt'), 'source');
+      await f.request('initialize', { protocolVersion: 1 });
+      const sessionId = (await f.request('session/new', { cwd: f.dir, mcpServers: [] })).result
+        .sessionId;
+      const response = await f.request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'inspect' }],
+      });
+      assert.equal(response.result?.stopReason, 'max_turn_requests', JSON.stringify(response));
+      assert.equal(f.effects(), 1);
+      assert.equal(f.store.events(sessionId).at(-1)?.type, lateType);
+      assert.equal(f.store.isLeased(sessionId), false);
+    } finally {
+      await f.close();
+      if (previous === undefined) delete process.env.BRUIN_MAX_STEPS;
+      else process.env.BRUIN_MAX_STEPS = previous;
+    }
+  });
+}
+
 test('ACP negotiates v1, validates capabilities, preserves streams and records normal sessions', async () => {
   const f = fixture({
     async complete(_profile, prompt, _signal, onText) {

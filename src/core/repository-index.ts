@@ -12,9 +12,21 @@ type Entry = {
   symbols: Array<{ name: string; line: number }>;
 };
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
+const gitListingBytes = 2_000_000;
+const maxCandidates = 10_000;
 export function searchRepository(workspace: string, query: string, limit = 20) {
   const root = fs.realpathSync(workspace);
-  const directory = path.join(dataDir(), 'repository-index');
+  const dataPath = path.resolve(dataDir());
+  const privateRoot = fs.existsSync(dataPath) ? fs.realpathSync(dataPath) : dataPath;
+  const [group, project] = path.relative(privateRoot, root).split(path.sep);
+  // Only a selected project (or one of its subdirectories) has indexable data here.
+  const managedProject = Boolean(project) && (group === 'workspaces' || group === 'worktrees');
+  const excludePrivatePath = (file: string) => {
+    if (managedProject) return false;
+    const relative = path.relative(privateRoot, file);
+    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  };
+  const directory = path.join(privateRoot, 'repository-index');
   const cacheFile = path.join(directory, `${digest(root)}.json`);
   let previous: Entry[] = [];
   try {
@@ -33,23 +45,39 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
   const deadline = Date.now() + 20_000;
   let visited = 0;
   let truncated = false;
-  let gitIgnore = true;
+  let gitFiles: Buffer | undefined;
   try {
-    const files = execFileSync(
+    gitFiles = execFileSync(
       'git',
       ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', '.'],
       {
         cwd: root,
-        maxBuffer: 2_000_000,
+        maxBuffer: gitListingBytes,
         timeout: 5000,
-        encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
       },
     );
-    paths.push(...files.split('\0').filter(Boolean).slice(0, 10_000));
-    truncated = files.split('\0').filter(Boolean).length > 10_000;
-  } catch {
-    gitIgnore = false;
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { stdout?: unknown };
+    if (failure.code === 'ENOBUFS' || failure.code === 'ETIMEDOUT') {
+      gitFiles = Buffer.isBuffer(failure.stdout)
+        ? failure.stdout.subarray(0, gitListingBytes)
+        : Buffer.alloc(0);
+      truncated = true;
+    }
+  }
+  if (gitFiles) {
+    // The final field may be a partial path when Git is interrupted.
+    const files = gitFiles.toString('utf8').split('\0');
+    files.pop();
+    const candidates = [
+      ...new Set(
+        files.filter((relative) => relative && !excludePrivatePath(path.resolve(root, relative))),
+      ),
+    ];
+    paths.push(...candidates.slice(0, maxCandidates));
+    truncated ||= candidates.length > maxCandidates;
+  } else {
     const walk = (relative: string) => {
       if (++visited > 10_000 || Date.now() > deadline) {
         truncated = true;
@@ -59,7 +87,8 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
         const entries = listWorkspaceEntries(root, relative, offset, 300);
         for (const entry of entries) {
           if (['.git', 'node_modules', '.bruin'].includes(entry.name)) continue;
-          if (paths.length >= 10_000) {
+          if (excludePrivatePath(path.resolve(root, entry.path))) continue;
+          if (paths.length >= maxCandidates) {
             truncated = true;
             return;
           }
@@ -79,8 +108,6 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
       break;
     }
     const file = path.resolve(root, relative);
-    const privateRoot = path.resolve(dataDir());
-    if (file === privateRoot || file.startsWith(privateRoot + path.sep)) continue;
     if (!file.startsWith(root + path.sep)) continue;
     try {
       let current = root;
@@ -144,11 +171,13 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
       /* Unreadable or changing files are omitted. */
     }
   }
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const temp = `${cacheFile}.${randomUUID()}.tmp`;
   try {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     fs.writeFileSync(temp, JSON.stringify(entries), { flag: 'wx', mode: 0o600 });
     fs.renameSync(temp, cacheFile);
+  } catch {
+    /* Current results are usable even when the optional cache cannot be written. */
   } finally {
     try {
       fs.unlinkSync(temp);
@@ -171,7 +200,7 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
   return {
     indexedFiles: entries.length,
     truncated,
-    gitIgnore,
+    gitIgnore: gitFiles !== undefined,
     results: results.slice(0, limit),
     hasMore: results.length > limit,
   };

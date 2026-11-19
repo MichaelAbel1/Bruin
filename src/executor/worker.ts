@@ -7,7 +7,13 @@ import readline from 'node:readline';
 import { finished } from 'node:stream/promises';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
 import { listWorkspaceEntries } from '../core/workspace-files.js';
-import { recordSnapshot, listSnapshots, restoreSnapshot } from '../core/snapshots.js';
+import {
+  fileContentHash,
+  listSnapshots,
+  recordSnapshot,
+  restoreSnapshot,
+  snapshotMaxBytes,
+} from '../core/snapshots.js';
 import { searchRepository } from '../core/repository-index.js';
 
 let macSandboxAvailable: boolean | undefined;
@@ -93,13 +99,27 @@ function readBytes(fd: number, max: number): Buffer {
   }
   return buffer.subarray(0, count);
 }
+function readVersion(fd: number, initial: fs.Stats, preview?: Buffer): string | undefined {
+  if (initial.size > snapshotMaxBytes) return undefined;
+  const bytes = preview?.length === initial.size ? preview : readBytes(fd, snapshotMaxBytes);
+  const current = fs.fstatSync(fd);
+  if (
+    bytes.length !== initial.size ||
+    current.size !== initial.size ||
+    current.mtimeMs !== initial.mtimeMs ||
+    current.ctimeMs !== initial.ctimeMs
+  )
+    throw new Error('读取期间文件发生变化，请重新读取');
+  return fileContentHash(bytes);
+}
 function readBounded(file: string, max: number): ToolResult {
   const fd = fs.openSync(
     file,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
   );
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new Error('只能读取普通文件');
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('只能读取普通文件');
     const buffer = readBytes(fd, max);
     const truncated = buffer.length > max;
     let text: string;
@@ -118,6 +138,7 @@ function readBounded(file: string, max: number): ToolResult {
       output: text + (truncated ? '\n[输出已截断]' : ''),
       isError: false,
       truncated,
+      fileVersion: readVersion(fd, stat, buffer),
     };
   } finally {
     fs.closeSync(fd);
@@ -138,7 +159,8 @@ function readFilePage(file: string, req: ToolRequest): ToolResult {
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
   );
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new Error('只能读取普通文件');
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('只能读取普通文件');
     const buffer = Buffer.alloc(64_000);
     const chunks: Buffer[] = [];
     const deadline = Date.now() + req.timeoutMs;
@@ -199,6 +221,7 @@ function readFilePage(file: string, req: ToolRequest): ToolResult {
         : `[起始行 ${start} 超出文件范围或文件为空]`,
       isError: false,
       truncated: byteTruncated || more,
+      fileVersion: last || !stat.size ? readVersion(fd, stat) : undefined,
     };
   } finally {
     fs.closeSync(fd);
@@ -233,6 +256,7 @@ function replaceFile(
   content: Buffer,
   mode: number,
   expected: fs.Stats | null,
+  expectedFileVersion?: string,
 ): void {
   const parent = path.dirname(file);
   const parentStat = fs.lstatSync(parent);
@@ -253,7 +277,7 @@ function replaceFile(
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    recordSnapshot(root, file, content);
+    recordSnapshot(root, file, content, expectedFileVersion);
     checkedPath(root, file, true);
     const currentParent = fs.lstatSync(parent);
     if (
@@ -277,7 +301,8 @@ function replaceFile(
           current.dev !== expected.dev ||
           current.ino !== expected.ino ||
           current.size !== expected.size ||
-          current.mtimeMs !== expected.mtimeMs))
+          current.mtimeMs !== expected.mtimeMs ||
+          current.ctimeMs !== expected.ctimeMs))
     )
       throw new Error('写入期间目标文件发生变化');
     fs.renameSync(temp, file);
@@ -356,7 +381,7 @@ async function command(
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: req.workspace,
-        TMPDIR: process.env.TMPDIR ?? '/tmp',
+        TMPDIR: req.workspaceOnlyWrites ? req.workspace : (process.env.TMPDIR ?? '/tmp'),
         LANG: process.env.LANG ?? 'C',
         ...(process.platform === 'win32'
           ? {
@@ -376,7 +401,7 @@ async function command(
     let size = 0;
     let truncated = false;
     let done = false;
-    let interrupted = false;
+    let interruption: 'timeout' | 'cancelled' | undefined;
     let markSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
       markSettled = resolve;
@@ -396,9 +421,9 @@ async function command(
     child.stdout?.on('data', add);
     child.stderr?.on('data', add);
     let killStarted: Promise<void> | undefined;
-    const kill = () =>
+    const kill = (reason: 'timeout' | 'cancelled' = 'cancelled') =>
       (killStarted ??= (async () => {
-        interrupted = true;
+        interruption = reason;
         const forceClose = setTimeout(() => {
           child.kill('SIGKILL');
           child.stdout?.destroy();
@@ -421,7 +446,7 @@ async function command(
       })());
     active.set(req.requestId, kill);
     const timer = setTimeout(() => {
-      void kill();
+      void kill('timeout');
     }, req.timeoutMs);
     child.on('error', (err) => {
       if (!done) {
@@ -432,24 +457,35 @@ async function command(
         markSettled();
       }
     });
-    child.on('close', async (code) => {
+    child.on('close', async (code, signal) => {
       if (!done) {
         done = true;
         active.delete(req.requestId);
         clearTimeout(timer);
         // A second removal closes the race between Docker creating the container and cancellation.
         const cleaned =
-          dockerName && (interrupted || code !== 0)
+          dockerName && (interruption || code !== 0)
             ? await removeDockerContainer(dockerName)
             : true;
+        const interruptionText = { timeout: '\n[命令执行超时]', cancelled: '\n[命令已取消]' };
+        const termination = interruption
+          ? interruptionText[interruption]
+          : signal
+            ? `\n[命令被 ${signal} 终止]`
+            : '';
+        // ripgrep uses exit code 1 for a search that finished with no matches.
+        const validExit = code === 0 || (req.name === 'search' && code === 1);
         resolve({
           output:
-            Buffer.concat(chunks).toString('utf8') +
+            new TextDecoder('utf-8', { ignoreBOM: true }).decode(Buffer.concat(chunks), {
+              stream: truncated,
+            }) +
             (truncated ? '\n[输出已截断]' : '') +
+            termination +
             (!cleaned ? '\n[Docker 容器清理未确认]' : ''),
           truncated,
           exitCode: code ?? -1,
-          isError: code !== 0 || interrupted || !cleaned,
+          isError: !validExit || Boolean(interruption) || !cleaned,
         });
         markSettled();
       }
@@ -619,6 +655,43 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
     active.delete(req.requestId);
   }
 }
+function fitRepositoryResults(
+  result: ReturnType<typeof searchRepository>,
+  maxOutputBytes: number,
+): ToolResult {
+  const candidates = result.results;
+  result.results = [];
+  let remaining = maxOutputBytes - Buffer.byteLength(JSON.stringify(result));
+  const reserve = (value: object, needsComma: boolean) => {
+    const bytes = Buffer.byteLength(JSON.stringify(value)) + Number(needsComma);
+    if (bytes > remaining) return false;
+    remaining -= bytes;
+    return true;
+  };
+
+  // Keep paths first so a long symbol cannot displace other useful matches.
+  const included = [];
+  for (const candidate of candidates) {
+    const entry = { ...candidate, symbols: [] as typeof candidate.symbols };
+    if (!reserve(entry, result.results.length > 0)) {
+      result.hasMore = true;
+      continue;
+    }
+    result.results.push(entry);
+    included.push({ entry, symbols: candidate.symbols });
+  }
+  for (const { entry, symbols } of included) {
+    for (const symbol of symbols) {
+      if (reserve(symbol, entry.symbols.length > 0)) entry.symbols.push(symbol);
+      else result.truncated = true;
+    }
+  }
+
+  const output = JSON.stringify(result);
+  if (Buffer.byteLength(output) > maxOutputBytes) throw new Error('输出预算过小，无法显示索引结果');
+  return { output, isError: false, truncated: result.truncated || result.hasMore };
+}
+
 async function handle(req: ToolRequest): Promise<ToolResult> {
   if (Buffer.byteLength(JSON.stringify(req.input)) > 1_000_000) throw new Error('工具输入过大');
   if (!fs.statSync(req.workspace).isDirectory()) throw new Error('工作区不是目录');
@@ -629,16 +702,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         String(req.input.query ?? ''),
         integerOption(req.input.limit, 20, 1, 100),
       );
-      while (Buffer.byteLength(JSON.stringify(result)) > req.maxOutputBytes) {
-        if (!result.results.length) throw new Error('输出预算过小，无法显示索引结果');
-        result.results.pop();
-        result.hasMore = true;
-      }
-      return {
-        output: JSON.stringify(result),
-        isError: false,
-        truncated: result.truncated || result.hasMore,
-      };
+      return fitRepositoryResults(result, req.maxOutputBytes);
     }
     case 'list_snapshots': {
       const offset = integerOption(req.input.offset, 0, 0, Number.MAX_SAFE_INTEGER);
@@ -681,9 +745,22 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       return listFiles(req);
     case 'write_file': {
       const file = checkedPath(req.workspace, req.input.path, true);
-      if (file === fs.realpathSync(req.workspace)) throw new Error('路径不能是工作区根目录');
-      const parent = path.dirname(file);
       const root = fs.realpathSync(req.workspace);
+      if (file === root) throw new Error('路径不能是工作区根目录');
+      const parent = path.dirname(file);
+      let expected: fs.Stats | null = null;
+      try {
+        expected = fs.lstatSync(file);
+        if (!expected.isFile() || expected.isSymbolicLink()) throw new Error('只能写入普通文件');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (expected && expected.size > snapshotMaxBytes)
+        throw new Error('整体覆盖仅支持不超过 10 MB 的已有文件');
+      if (expected && req.expectedFileVersion === undefined)
+        throw new Error('覆盖已有文件前请先用 read_file 读取该文件，再重新提交写入');
+      if (!expected && req.expectedFileVersion !== undefined)
+        throw new Error('文件自上次读取后已删除，请检查工作区后再继续');
       let current = root;
       for (const component of path.relative(root, parent).split(path.sep).filter(Boolean)) {
         current = path.join(current, component);
@@ -697,17 +774,14 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
           throw new Error('父路径不是工作区内的真实目录');
       }
       checkedPath(req.workspace, parent);
-      let mode = 0o600;
-      let expected: fs.Stats | null = null;
-      try {
-        const stat = fs.lstatSync(file);
-        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('只能写入普通文件');
-        mode = stat.mode & 0o777;
-        expected = stat;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
-      replaceFile(root, file, Buffer.from(String(req.input.content ?? '')), mode, expected);
+      replaceFile(
+        root,
+        file,
+        Buffer.from(String(req.input.content ?? '')),
+        expected ? expected.mode & 0o777 : 0o600,
+        expected,
+        req.expectedFileVersion,
+      );
       return { output: `已写入 ${path.relative(root, file)}`, isError: false };
     }
     case 'edit_file': {
@@ -755,10 +829,7 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       const args = ['-n', '--max-count', '100'];
       if (typeof req.input.glob === 'string' && req.input.glob) args.push('--glob', req.input.glob);
       args.push('--', String(req.input.pattern ?? ''));
-      const result = await command('rg', args, req);
-      // ripgrep uses exit code 1 for a valid search with no matches.
-      if (result.exitCode === 1) return { ...result, isError: false };
-      return result;
+      return command('rg', args, req);
     }
     case 'shell': {
       const shell = String(req.input.command ?? '');
@@ -805,18 +876,18 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         );
       }
       if (process.platform === 'darwin' && isMacSandboxAvailable()) {
-        const root = fs.realpathSync(req.workspace).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-        const tmpReal = fs
-          .realpathSync(os.tmpdir())
-          .replaceAll('\\', '\\\\')
-          .replaceAll('"', '\\"');
-        const profile = `(version 1) (allow default) (deny network*) (deny file-write*) (allow file-write* (subpath "${root}")) (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath "${tmpReal}"))`;
+        const root = JSON.stringify(fs.realpathSync(req.workspace));
+        const scratch = req.workspaceOnlyWrites
+          ? ''
+          : ` (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath ${JSON.stringify(fs.realpathSync(os.tmpdir()))}))`;
+        const profile = `(version 1) (allow default) (deny network*) (deny file-write*) (allow file-write* (subpath ${root}))${scratch}`;
         return command('/usr/bin/sandbox-exec', ['-p', profile, '/bin/sh', '-lc', shell], req);
       }
       const bwrap = findBwrap();
       if (bwrap) {
         const root = fs.realpathSync(req.workspace);
         const tmpReal = fs.realpathSync(os.tmpdir());
+        const sharedScratch = req.workspaceOnlyWrites ? [] : ['--bind', tmpReal, tmpReal];
         return command(
           bwrap,
           [
@@ -826,15 +897,12 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
             '--bind',
             root,
             root,
-            '--bind',
-            tmpReal,
-            tmpReal,
+            ...sharedScratch,
             '--dev',
             '/dev',
             '--proc',
             '/proc',
-            '--tmpfs',
-            '/tmp',
+            ...(req.workspaceOnlyWrites ? [] : ['--tmpfs', '/tmp']),
             '--unshare-net',
             '--die-with-parent',
             '--chdir',
@@ -846,7 +914,11 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
           req,
         );
       }
-      if (req.requireSandbox || process.env.BRUIN_ENFORCE_SANDBOX === '1') {
+      if (
+        req.requireSandbox ||
+        req.workspaceOnlyWrites ||
+        process.env.BRUIN_ENFORCE_SANDBOX === '1'
+      ) {
         throw new Error(
           '当前平台缺少可用的 Shell 沙箱，自动执行的 Hook 或强制沙箱模式不能直接运行宿主命令。请配置 Docker 或安装 bwrap。',
         );

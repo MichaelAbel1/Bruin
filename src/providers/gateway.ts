@@ -121,7 +121,8 @@ export class AiSdkGateway implements ModelGateway {
       prompt: source,
       maxOutputTokens,
       abortSignal: signal,
-      maxRetries: 1,
+      // AgentRunner counts consecutive summary failures across compaction passes.
+      maxRetries: 0,
     });
     return result.text.trim();
   }
@@ -131,9 +132,18 @@ export class AiSdkGateway implements ModelGateway {
     signal: AbortSignal,
     onText: (text: string) => void,
   ): Promise<ModelReply> {
+    // Some Claude models reject assistant prefills. An SDK tool result already
+    // becomes a user message, so a continuation is only needed after an assistant message.
+    const messages: ModelMessage[] =
+      profile.provider === 'anthropic' && prompt.at(-1)?.role === 'assistant'
+        ? [
+            ...prompt,
+            { role: 'user', content: 'Continue the current task from the recorded results.' },
+          ]
+        : prompt;
     const result = streamText({
       model: providerModel(profile),
-      messages: prompt,
+      messages,
       tools: toolsForMode(this.mode),
       abortSignal: signal,
       // AgentRunner owns retries, notices and cancellation. Avoid multiplying attempts.

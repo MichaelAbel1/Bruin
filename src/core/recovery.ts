@@ -1,32 +1,101 @@
 import type { EventStore } from '../storage/event-store.js';
 import type { SessionEvent, ToolCall } from './types.js';
 import { toolDefinition } from './tools.js';
+import { originalSubagentTurn } from './subagent-results.js';
 
-/** Reconcile interruption evidence without replaying external actions. */
+/** Project only recorded receipts; an absent receipt is not proof of success or failure. */
+export function pendingSubagents(events: readonly SessionEvent[]): SessionEvent[] {
+  const pending = new Map<string, SessionEvent>();
+  for (const event of events) {
+    if (typeof event.payload.childId !== 'string') continue;
+    if (event.type === 'subagent_started') pending.set(event.payload.childId, event);
+    if (event.type === 'subagent_finished') pending.delete(event.payload.childId);
+  }
+  return [...pending.values()];
+}
+
+function recordedChildResult(started: SessionEvent, events: readonly SessionEvent[]) {
+  const { user, terminal, answer } = originalSubagentTurn(events);
+  if (!terminal || !user || user.payload.text !== started.payload.prompt) return;
+  return {
+    status: terminal.type === 'turn_completed' ? 'completed' : 'failed',
+    answer,
+    ...(terminal.type === 'turn_paused'
+      ? { error: '子 Agent 已达到运行预算并暂停，任务尚未完成；请检查子会话后继续' }
+      : {}),
+    throughSeq: terminal.seq,
+  };
+}
+
+function recoverChildResults(
+  store: EventStore,
+  sessionId: string,
+  events: readonly SessionEvent[],
+): void {
+  for (const started of pendingSubagents(events)) {
+    const childId = String(started.payload.childId);
+    if (!store.getSession(childId) || store.isLeased(childId)) continue;
+    const result = recordedChildResult(started, store.events(childId));
+    if (!result) continue;
+    store.append(sessionId, 'subagent_finished', {
+      childId,
+      ...result,
+      workspace: started.payload.workspace,
+      mode: started.payload.mode,
+      baseCommit: started.payload.baseCommit,
+      recovered: true,
+    });
+  }
+}
+
+/** Reconcile interruption evidence without replaying external actions.
+ * Callers hold the parent session lease while appending recovery receipts. */
 export function recoverSession(store: EventStore, sessionId: string): number {
   const events = store.events(sessionId);
+  type CallIdentity = Pick<ToolCall, 'id' | 'name'>;
   const pending = new Map<
     string,
-    Array<{ call: ToolCall; recovery: 'not-started' | 'safe' | 'manual' }>
+    Array<{ call: CallIdentity; recovery: 'not-started' | 'safe' | 'manual'; startedSeq?: number }>
   >();
+  const delegations = new Map<number, string>();
+  const trackCall = (call: CallIdentity) => {
+    const queue = pending.get(call.id) ?? [];
+    queue.push({ call, recovery: 'not-started' });
+    pending.set(call.id, queue);
+  };
   for (const event of events) {
     if (event.type === 'assistant')
-      for (const call of (event.payload.calls ?? []) as ToolCall[]) {
-        const queue = pending.get(call.id) ?? [];
-        queue.push({ call, recovery: 'not-started' });
-        pending.set(call.id, queue);
-      }
+      for (const call of (event.payload.calls ?? []) as ToolCall[]) trackCall(call);
+    if (
+      event.type === 'tool_requested' &&
+      event.payload.source === 'desktop' &&
+      event.payload.name === 'spawn_subagent' &&
+      typeof event.payload.callId === 'string'
+    )
+      trackCall({ id: event.payload.callId, name: 'spawn_subagent' });
     if (event.type === 'tool_started') {
       const item = pending
         .get(String(event.payload.callId))
         ?.find((item) => item.recovery === 'not-started');
-      if (item)
+      if (item) {
         item.recovery =
           event.payload.recovery === 'safe' &&
           toolDefinition(item.call.name)?.target === 'executor' &&
           toolDefinition(item.call.name)?.replay === 'safe'
             ? 'safe'
             : 'manual';
+        if (item.call.name === 'spawn_subagent' && event.payload.name === item.call.name)
+          item.startedSeq = event.seq;
+      }
+    }
+    if (event.type === 'subagent_started') {
+      const { toolStartedSeq, childId } = event.payload;
+      if (
+        typeof toolStartedSeq === 'number' &&
+        toolStartedSeq < event.seq &&
+        typeof childId === 'string'
+      )
+        delegations.set(toolStartedSeq, childId);
     }
     if (['tool_finished', 'tool_unknown', 'tool_denied'].includes(event.type)) {
       const queue = pending.get(String(event.payload.callId));
@@ -36,7 +105,17 @@ export function recoverSession(store: EventStore, sessionId: string): number {
   }
   let unknown = 0;
   for (const queue of pending.values())
-    for (const { call, recovery } of queue) {
+    for (const { call, recovery, startedSeq } of queue) {
+      const childId = startedSeq === undefined ? undefined : delegations.get(startedSeq);
+      if (childId) {
+        store.append(sessionId, 'tool_finished', {
+          callId: call.id,
+          name: call.name,
+          isError: false,
+          output: `已恢复子 Agent 启动记录: ${childId}。请用 subagent_status 查看任务状态。`,
+        });
+        continue;
+      }
       const type =
         recovery === 'not-started'
           ? 'tool_denied'
@@ -56,22 +135,6 @@ export function recoverSession(store: EventStore, sessionId: string): number {
       });
       if (type === 'tool_unknown') unknown++;
     }
+  recoverChildResults(store, sessionId, events);
   return unknown;
-}
-
-export function needsUnknownReview(events: SessionEvent[], reviewedThrough = -1): boolean {
-  const completed =
-    [...events].reverse().find((event) => event.type === 'turn_completed')?.seq ?? 0;
-  const unknown =
-    events.filter((event) => event.type === 'tool_unknown' && event.seq > completed).at(-1)?.seq ??
-    0;
-  const confirmed = events
-    .filter(
-      (event) => event.type === 'cron_reviewed' && Number.isSafeInteger(event.payload.throughSeq),
-    )
-    .reduce(
-      (seq, event) => Math.max(seq, Math.min(event.seq - 1, Number(event.payload.throughSeq))),
-      reviewedThrough,
-    );
-  return unknown > Math.max(0, confirmed);
 }

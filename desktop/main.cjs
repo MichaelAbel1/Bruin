@@ -328,6 +328,37 @@ function requestHost(method, params) {
   });
 }
 
+async function exportSubagentPatch(params) {
+  await hostReady;
+  const { baseCommit, contentBase64 } = await requestHost('prepareSubagentPatch', {
+    sessionId: params?.sessionId,
+    childId: params?.childId,
+  });
+  const shortId = String(params?.childId)
+    .slice(0, 8)
+    .replace(/[^a-f0-9]/gi, '');
+  const selected = await dialog.showSaveDialog(window, {
+    title: '导出子任务补丁',
+    defaultPath: `bruin-${shortId}-${baseCommit.slice(0, 12)}.patch`,
+    filters: [{ name: 'Git 补丁', extensions: ['patch'] }],
+  });
+  if (selected.canceled || !selected.filePath) return null;
+  const temporary = await fs.promises.mkdtemp(
+    path.join(path.dirname(selected.filePath), '.bruin-patch-'),
+  );
+  try {
+    const file = path.join(temporary, 'proposal.patch');
+    await fs.promises.writeFile(file, Buffer.from(contentBase64, 'base64'), { mode: 0o600 });
+    await fs.promises.copyFile(file, selected.filePath, fs.constants.COPYFILE_EXCL);
+  } catch (error) {
+    if (error?.code === 'EEXIST') throw new Error('目标文件已存在，请选择新的文件名');
+    throw error;
+  } finally {
+    await fs.promises.rm(temporary, { recursive: true, force: true });
+  }
+  return { path: selected.filePath, baseCommit };
+}
+
 function createWindow() {
   window = new BrowserWindow({
     width: 1440,
@@ -382,6 +413,23 @@ if (!gotSingleInstanceLock) {
         return dialog
           .showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
           .then((result) => (result.canceled ? null : result.filePaths[0]));
+      if (method === 'exportSubagentPatch') return exportSubagentPatch(params);
+      if (method === 'preflightSubagentPatches' && params?.testCommand !== undefined) {
+        const { sessionId, childIds, testCommand } = params;
+        if (typeof testCommand !== 'string' || !testCommand.trim() || testCommand.length > 10_000)
+          throw new Error('测试命令须为 1 至 10,000 字符的非空文本');
+        const { response } = await dialog.showMessageBox(window, {
+          type: 'warning',
+          buttons: ['取消', '运行测试'],
+          defaultId: 0,
+          cancelId: 0,
+          message: '在临时工作树中运行这条命令？',
+          detail: `补丁全部应用后，命令将在临时仓库根目录的 Shell 沙箱中运行。\n\n${testCommand}`,
+        });
+        if (response !== 1) return null;
+        await hostReady;
+        return requestHost(method, { sessionId, childIds, testCommand });
+      }
       if (method === 'chooseAttachments') {
         const selection = await dialog.showOpenDialog(window, {
           properties:
@@ -403,7 +451,8 @@ if (!gotSingleInstanceLock) {
         method === 'restoreApiKeys' ||
         method === 'takeLegacyKeys' ||
         method === 'restoreMcpCredentials' ||
-        method === 'importAttachments'
+        method === 'importAttachments' ||
+        method === 'prepareSubagentPatch'
       )
         throw new Error('不支持此界面操作');
       await hostReady;

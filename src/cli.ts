@@ -35,9 +35,12 @@ import {
 import { searchSkillsSh, installSkillsSh } from './skills/skills-sh.js';
 import type { ModelProfile, ProviderKind, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
+import { createSubagentRunner } from './runtime/subagent.js';
+import { canResumeTurn, turnState } from './core/turn-state.js';
 import { runService } from './runtime/service.js';
 import { toolsForMode, toolDefinitions } from './core/tools.js';
 import { recoverSession } from './core/recovery.js';
+import { recordUnknownReview, unreviewedUnknownTools } from './core/unknown-review.js';
 
 const help = `Bruin — local coding agent
 
@@ -56,6 +59,7 @@ bruin market add NAME OWNER/REPO | list | search NAME | install MARKET SKILL
 bruin market skills-sh-search QUERY | skills-sh-install OWNER/REPO/SKILL
 
 PROVIDER: openai, anthropic, google, openai-compatible.
+For non-interactive chat, pass a prompt as arguments or on stdin (UTF-8, up to 1 MB).
 API keys are read from environment variables and never stored in the session database.`;
 function takeFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -64,6 +68,56 @@ function takeFlag(args: string[], name: string): string | undefined {
   if (!value) throw new Error(`${name} 缺少值`);
   args.splice(i, 2);
   return value;
+}
+async function readChatPrompt(positional: string): Promise<string> {
+  const argument = positional.trim() ? positional : '';
+  if (stdin.isTTY) return argument;
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > 1_000_000) throw new Error('stdin 提示词超过 1 MB');
+    chunks.push(bytes);
+  }
+  let piped: string;
+  try {
+    piped = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, size));
+  } catch {
+    throw new Error('stdin 提示词必须是有效的 UTF-8 文本');
+  }
+  if (!piped.trim()) return argument;
+  if (argument) throw new Error('请只通过 stdin 或位置参数提供提示词');
+  return piped;
+}
+async function chatOptions(args: string[]) {
+  const modelAlias = takeFlag(args, '--model');
+  const workspaceArg = takeFlag(args, '--workspace');
+  const resume = takeFlag(args, '--resume');
+  const maxCallsArg = takeFlag(args, '--max-model-calls');
+  const maxModelCalls = maxCallsArg === undefined ? 24 : Number(maxCallsArg);
+  const allowWorkspaceEdits = args.includes('--allow-workspace-edits');
+  if (allowWorkspaceEdits) args.splice(args.indexOf('--allow-workspace-edits'), 1);
+  const unattended = args.includes('--unattended');
+  if (unattended) args.splice(args.indexOf('--unattended'), 1);
+  if (![24, 96, 240, 480].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
+  if (allowWorkspaceEdits && maxModelCalls === 24)
+    throw new Error('--allow-workspace-edits 需要长任务调用预算');
+  if (unattended && maxModelCalls === 24) throw new Error('--unattended 需要长任务调用预算');
+  if (maxModelCalls === 480 && !unattended) throw new Error('480 次模型调用需要 --unattended');
+  const effectiveUnattended = unattended || !stdin.isTTY;
+  const prompt = await readChatPrompt(args.join(' '));
+  if (effectiveUnattended && !resume && !prompt)
+    throw new Error('非交互式 chat 需要提示词或 --resume');
+  return {
+    modelAlias,
+    workspaceArg,
+    resume,
+    maxModelCalls,
+    allowWorkspaceEdits,
+    effectiveUnattended,
+    prompt,
+  };
 }
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -105,6 +159,7 @@ async function main(): Promise<void> {
             acp: Object.keys(toolsForMode('full')),
             service: Object.keys(toolsForMode('full')),
             subagent: Object.keys(toolsForMode('read-only')),
+            worktreeSubagent: Object.keys(toolsForMode('worktree')),
           },
           tools: Object.fromEntries(
             Object.entries(toolDefinitions).map(([name, definition]) => [
@@ -264,6 +319,7 @@ async function main(): Promise<void> {
     }
     throw new Error(help);
   }
+  const chat = area === 'chat' ? await chatOptions(args) : undefined;
   const store = new SqliteEventStore(path.join(dataDir(), 'sessions.sqlite'));
   try {
     if (area === 'cron') {
@@ -281,7 +337,11 @@ async function main(): Promise<void> {
       const owner = randomUUID();
       store.acquireLease(job.sessionId, owner, 10_000);
       try {
-        recoverSession(store, job.sessionId);
+        const revealed = recoverSession(store, job.sessionId);
+        if (revealed > 0)
+          throw new Error(
+            `新发现 ${revealed} 个结果未知的工具调用。请运行 bruin sessions show ${job.sessionId} 并检查工作区，再确认。`,
+          );
         const throughSeq =
           store
             .events(job.sessionId)
@@ -307,22 +367,16 @@ async function main(): Promise<void> {
       }
       throw new Error(help);
     }
-    if (area !== 'chat') throw new Error(help);
-    const modelAlias = takeFlag(args, '--model');
-    const workspaceArg = takeFlag(args, '--workspace');
-    const resume = takeFlag(args, '--resume');
-    const maxCallsArg = takeFlag(args, '--max-model-calls');
-    const maxModelCalls = maxCallsArg === undefined ? 24 : Number(maxCallsArg);
-    const allowWorkspaceEdits = args.includes('--allow-workspace-edits');
-    if (allowWorkspaceEdits) args.splice(args.indexOf('--allow-workspace-edits'), 1);
-    const unattended = args.includes('--unattended');
-    if (unattended) args.splice(args.indexOf('--unattended'), 1);
-    if (![24, 96, 240, 480].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
-    if (allowWorkspaceEdits && maxModelCalls === 24)
-      throw new Error('--allow-workspace-edits 需要长任务调用预算');
-    if (unattended && maxModelCalls === 24) throw new Error('--unattended 需要长任务调用预算');
-    if (maxModelCalls === 480 && !unattended) throw new Error('480 次模型调用需要 --unattended');
-    const effectiveUnattended = unattended || !stdin.isTTY;
+    if (!chat) throw new Error(help);
+    const {
+      modelAlias,
+      workspaceArg,
+      resume,
+      maxModelCalls,
+      allowWorkspaceEdits,
+      effectiveUnattended,
+      prompt,
+    } = chat;
     const workspace = fs.realpathSync(workspaceArg ?? process.cwd());
     let session = resume
       ? store.getSession(resume)
@@ -346,7 +400,7 @@ async function main(): Promise<void> {
     const io = {
       text: (delta: string) => stdout.write(delta),
       notice: (message: string) => console.log(`\n[工具] ${message}`),
-      approve: async (call: ToolCall, reason: string) => {
+      approve: async (call: ToolCall, reason: string, signal: AbortSignal) => {
         if (allowWorkspaceEdits && ['write_file', 'edit_file'].includes(call.name)) return true;
         const config = loadConfig();
         const command =
@@ -377,27 +431,12 @@ async function main(): Promise<void> {
           return '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。';
         const answer = await rl.question(
           `\n批准 ${call.name} ${JSON.stringify(call.input)}? ${reason} [y/N] `,
-          { signal: controller.signal },
+          { signal },
         );
         return /^y(es)?$/i.test(answer.trim());
       },
     };
-    const services = new RuntimeServices(store, executor, (childSession, childPrompt, signal) =>
-      new AgentRunner(
-        store,
-        new AiSdkGateway('read-only'),
-        executor,
-        {
-          text() {},
-          notice() {},
-          async approve() {
-            return false;
-          },
-        },
-        undefined,
-        true,
-      ).run(childSession, childPrompt, signal),
-    );
+    const services = new RuntimeServices(store, executor, createSubagentRunner(store, executor));
     const runner = new AgentRunner(store, new AiSdkGateway('full'), executor, io, services);
     const runOptions =
       maxModelCalls > 24
@@ -406,31 +445,40 @@ async function main(): Promise<void> {
             maxDurationMs: 8 * 60 * 60 * 1000,
             checkpointEvery: 24,
             unattended: effectiveUnattended,
+            allowWorkspaceEdits,
           }
-        : { unattended: effectiveUnattended };
+        : { unattended: effectiveUnattended, allowWorkspaceEdits };
     const controller = new AbortController();
     const leaseSessionId = session.id;
     let lease: ReturnType<RuntimeServices['sessionLeases']['retain']> | undefined;
     process.once('SIGINT', () => controller.abort());
     try {
       lease = services.sessionLeases.retain(leaseSessionId, controller);
-      const unknown = resume ? runner.recover(session) : 0;
-      if (unknown) {
+      if (resume) runner.recover(session);
+      while (true) {
+        const unknown = unreviewedUnknownTools(store.events(session.id));
+        const lastUnknown = unknown.at(-1);
+        if (!lastUnknown) break;
         if (effectiveUnattended) {
-          console.error(`发现 ${unknown} 个结果未知的工具调用；请检查工作区后交互式继续。`);
+          console.error(`发现 ${unknown.length} 个结果未知的工具调用；请检查工作区后交互式继续。`);
           process.exitCode = 3;
           return;
         }
         const answer = await rl.question(
-          `发现 ${unknown} 个结果未知的工具调用。请检查工作区后继续。[y/N] `,
+          `发现 ${unknown.length} 个结果未知的工具调用。请检查工作区后继续。[y/N] `,
           { signal: controller.signal },
         );
         if (!/^y(es)?$/i.test(answer.trim())) return;
+        const reviewLease = services.sessionLeases.retain(session.id, controller);
+        try {
+          recordUnknownReview(store, session.id, lastUnknown.seq, 'cli');
+        } finally {
+          reviewLease.release();
+        }
       }
       console.log(
         `会话 ${session.id} | 工作区 ${session.workspace} | 模型 ${session.profile.alias}`,
       );
-      let prompt = args.join(' ');
       if (prompt) {
         store.append(session.id, 'run_configured', {
           maxModelCalls,
@@ -439,11 +487,7 @@ async function main(): Promise<void> {
         });
         await runner.run(session, prompt, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
-      } else if (
-        resume &&
-        store.events(session.id).length &&
-        store.events(session.id).at(-1)?.type !== 'turn_completed'
-      ) {
+      } else if (resume && canResumeTurn(store.events(session.id))) {
         store.append(session.id, 'run_configured', {
           maxModelCalls,
           allowWorkspaceEdits,
@@ -452,14 +496,14 @@ async function main(): Promise<void> {
         await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
       }
-      if (effectiveUnattended && store.events(session.id).at(-1)?.type === 'turn_paused')
+      if (effectiveUnattended && turnState(store.events(session.id)) === 'paused')
         process.exitCode = 2;
       while (!effectiveUnattended && !controller.signal.aborted) {
         const line = await rl.question('\n你> ', { signal: controller.signal });
         if (controller.signal.aborted) throw new Error('已取消');
         if (line.trim() === '/exit') break;
         if (line.trim() === '/continue' || !line.trim()) {
-          if (store.events(session.id).at(-1)?.type === 'turn_paused') {
+          if (canResumeTurn(store.events(session.id))) {
             store.append(session.id, 'run_configured', {
               maxModelCalls,
               allowWorkspaceEdits,
@@ -470,7 +514,7 @@ async function main(): Promise<void> {
           continue;
         }
         if (line.trim() === '/stop') {
-          if (store.events(session.id).at(-1)?.type === 'turn_paused') {
+          if (turnState(store.events(session.id)) === 'paused') {
             store.append(session.id, 'turn_completed', { stoppedByUser: true });
             console.log('已结束暂停的任务');
           } else console.log('当前没有暂停的任务');

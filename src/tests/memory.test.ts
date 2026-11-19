@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { memoryContext } from '../core/memory.js';
+import { memoryContext, workspaceMemoryQuery } from '../core/memory.js';
+import type { SessionEvent } from '../core/types.js';
 
 const page = (key: string, content: string) => ({
   key,
@@ -12,14 +13,15 @@ test('relevant memory after a large unrelated page reaches the prompt with its s
   const result = memoryContext(
     [
       page('a-unrelated', 'unrelated '.repeat(1000)),
-      page('z-oauth', 'OAuth refresh requires a new access token.'),
+      page('z-oauth', 'OAuth refresh requires a new access token. ' + 'detail '.repeat(1000)),
     ],
     'Fix OAuth refresh',
   );
   assert.ok(result.indexOf('z-oauth') < result.indexOf('a-unrelated'));
   assert.match(result, /OAuth refresh requires/);
   assert.match(result, /updatedAt/);
-  assert.ok(result.length <= 8000);
+  assert.doesNotMatch(result, /unrelated /);
+  assert.ok(result.length < 2300);
   assert.match(result, /truncated; use list_memory/);
 });
 
@@ -36,8 +38,54 @@ test('empty or unmatched queries preserve source order without modifying pages',
   const pages = [page('a', 'first'), page('b', 'second')];
   const original = structuredClone(pages);
   assert.equal(memoryContext(pages, ''), memoryContext(pages, 'unknown'));
-  assert.ok(memoryContext(pages, '').indexOf('first') < memoryContext(pages, '').indexOf('second'));
+  assert.ok(memoryContext(pages, '').indexOf('"a"') < memoryContext(pages, '').indexOf('"b"'));
+  assert.doesNotMatch(memoryContext(pages, 'unknown'), /first|second/);
   assert.deepEqual(pages, original);
   assert.equal(memoryContext(pages, '', 0), '');
   assert.equal(memoryContext([], 'anything'), '');
+});
+
+test('memory query uses successful local file paths and excludes previous work and rejected paths', () => {
+  const workspace = process.cwd();
+  const events: SessionEvent[] = [];
+  const add = (type: SessionEvent['type'], payload: SessionEvent['payload']) =>
+    events.push({
+      sessionId: 'memory-test',
+      seq: events.length + 1,
+      at: '',
+      type,
+      payload,
+    });
+  add('user', { text: 'Check the older billing flow.' });
+  add('user', { text: 'Inspect the configuration' });
+  add('tool_requested', {
+    callId: 'read',
+    name: 'read_file',
+    input: { path: 'src/payments/reserve.ts' },
+  });
+  add('tool_finished', { callId: 'read', isError: false });
+  add('tool_requested', {
+    callId: 'read',
+    name: 'read_file',
+    input: { path: '../layout/private.ts' },
+  });
+  add('tool_denied', { callId: 'read' });
+  add('user', { text: 'Continue the task.' });
+  const query = workspaceMemoryQuery(workspace, events);
+  assert.match(query, /configuration/);
+  assert.match(query, /payments reserve/);
+  assert.doesNotMatch(query, /older billing|layout private/);
+  const memory = memoryContext(
+    [
+      page('billing', 'Old billing records'),
+      page('payments', 'PAYMENTS_RULE'),
+      page('other', 'Check and fix an unrelated tool'),
+    ],
+    query,
+  );
+  assert.match(memory, /PAYMENTS_RULE/);
+  assert.doesNotMatch(memory, /Old billing records|unrelated tool/);
+  add('workspace_changed', {});
+  add('user', { text: 'Continue' });
+  assert.equal(workspaceMemoryQuery(workspace, events), '');
 });

@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Bruin 系统架构",
+    "subtitle": "箭头表示发起调用的一方。入口汇总了四种启动方式，桌面进程链与工具返回路径见配套文档。",
+    "quality_profile": "showcase",
+    "viewBox": [1200, 660],
+    "visual_preset": "blueprint",
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "components": [
+    {
+      "id": "entry",
+      "type": "frontend",
+      "label": "使用入口",
+      "sublabel": "桌面 · CLI · IDE · 定时服务",
+      "pos": [55, 300],
+      "size": [185, 72]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "会话执行循环",
+      "sublabel": "AgentRunner",
+      "pos": [355, 300],
+      "size": [185, 72]
+    },
+    {
+      "id": "executor",
+      "type": "backend",
+      "label": "工具执行器",
+      "sublabel": "ProcessExecutor",
+      "pos": [655, 300],
+      "size": [185, 72]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "工具子进程",
+      "sublabel": "文件 · 搜索 · Shell",
+      "pos": [955, 300],
+      "size": [185, 72]
+    },
+    {
+      "id": "gateway",
+      "type": "backend",
+      "label": "模型适配",
+      "sublabel": "AiSdkGateway",
+      "pos": [355, 105],
+      "size": [185, 72]
+    },
+    {
+      "id": "models",
+      "type": "external",
+      "label": "模型服务",
+      "sublabel": "云端或本机",
+      "pos": [655, 105],
+      "size": [185, 72]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "会话存储",
+      "sublabel": "EventStore / SQLite",
+      "pos": [55, 500],
+      "size": [185, 72]
+    },
+    {
+      "id": "runtime",
+      "type": "backend",
+      "label": "运行时编排",
+      "sublabel": "RuntimeServices",
+      "pos": [355, 500],
+      "size": [185, 72]
+    },
+    {
+      "id": "extensions",
+      "type": "external",
+      "label": "MCP 服务",
+      "sublabel": "本机进程或远程端点",
+      "pos": [655, 500],
+      "size": [185, 72]
+    }
+  ],
+  "connections": [
+    {
+      "id": "entry-runner",
+      "from": "entry",
+      "to": "runner",
+      "label": "提交任务",
+      "variant": "emphasis"
+    },
+    {
+      "id": "runner-executor",
+      "from": "runner",
+      "to": "executor",
+      "label": "基础工具",
+      "variant": "emphasis"
+    },
+    {
+      "id": "executor-worker",
+      "from": "executor",
+      "to": "worker",
+      "label": "IPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "runner-gateway",
+      "from": "runner",
+      "to": "gateway",
+      "label": "模型请求"
+    },
+    {
+      "id": "gateway-models",
+      "from": "gateway",
+      "to": "models",
+      "label": "调用"
+    },
+    {
+      "id": "runner-store",
+      "from": "runner",
+      "to": "store"
+    },
+    {
+      "id": "runner-runtime",
+      "from": "runner",
+      "to": "runtime",
+      "label": "编排工具",
+      "labelAt": [448, 430]
+    },
+    {
+      "id": "runtime-extensions",
+      "from": "runtime",
+      "to": "extensions",
+      "label": "连接"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "从一次文件读取开始",
+      "items": [
+        "用户提交问题后，执行循环组织上下文，请模型选择下一步。",
+        "模型申请读取文件时，Bruin 检查权限，经工具执行器把请求发给子进程。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "结果怎样回到对话",
+      "items": [
+        "子进程把输出按请求 ID 交回。执行循环写入会话事件，再连同工具结果询问模型。",
+        "SQLite 还保存会话租约，让桌面、CLI 和定时服务协调同一会话的执行权。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "复杂任务由谁协调",
+      "items": [
+        "运行时管理计划、任务依赖、后台命令、子 Agent 和 MCP 连接。",
+        "后台命令和 Hook 也使用工具执行器。子 Agent 在自己的会话中运行。"
+      ]
+    }
+  ]
+}

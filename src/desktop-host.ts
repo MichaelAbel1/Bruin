@@ -16,7 +16,7 @@ import {
   mcpServerSchema,
   hookSchema,
 } from './config.js';
-import { SqliteEventStore } from './storage/event-store.js';
+import { SqliteEventStore, type CronJob } from './storage/event-store.js';
 import { AiSdkGateway, toolSchemas } from './providers/gateway.js';
 import { discoverModels } from './providers/catalog.js';
 import { ProcessExecutor } from './executor/client.js';
@@ -37,8 +37,10 @@ import {
 } from './skills/registry.js';
 import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
+import { createSubagentRunner } from './runtime/subagent.js';
+import { turnState } from './core/turn-state.js';
 import { recoverCronJobs } from './runtime/cron.js';
-import { needsUnknownReview } from './core/recovery.js';
+import { needsUnknownReview, recordUnknownReview } from './core/unknown-review.js';
 import {
   listWorkspaceEntries,
   readWorkspaceFile,
@@ -67,12 +69,11 @@ let active:
       unattended: boolean;
     }
   | undefined;
-let activeRun: Promise<unknown> | undefined;
+let activeRun: Promise<boolean> | undefined;
 const approvals = new Map<
   string,
   { resolve: (approved: boolean) => void; sessionId: string; call: ToolCall }
 >();
-const reviewedUnknownSeq = new Map<string, number>();
 
 // Remove secrets accidentally persisted by older desktop versions from session profiles.
 const startupConfig = loadConfig();
@@ -104,22 +105,7 @@ const legacyKeyCandidates = Object.fromEntries(
 );
 let legacyKeysTaken = false;
 
-const services = new RuntimeServices(store, executor, (session, prompt, signal) =>
-  new AgentRunner(
-    store,
-    new AiSdkGateway('read-only'),
-    executor,
-    {
-      text() {},
-      notice() {},
-      async approve() {
-        return false;
-      },
-    },
-    undefined,
-    true,
-  ).run(session, prompt, signal),
-);
+const services = new RuntimeServices(store, executor, createSubagentRunner(store, executor));
 services.mcp.onCredentials = (name, signature, state) => {
   if (process.env.BRUIN_SERVICE !== '1') event('oauthCredentials', { name, signature, state });
 };
@@ -140,10 +126,10 @@ const runner = new AgentRunner(
       if (sessionId)
         event('runCheckpoint', { sessionId, events: viewSession(getSession(sessionId)).events });
     },
-    approve: (call: ToolCall, reason: string) =>
+    approve: (call: ToolCall, reason: string, signal: AbortSignal) =>
       new Promise<boolean | string>((resolve) => {
         const sessionId = active?.sessionId;
-        if (!sessionId) return resolve(false);
+        if (!sessionId || signal.aborted) return resolve(false);
         if (
           active?.allowWorkspaceEdits &&
           (call.name === 'write_file' || call.name === 'edit_file')
@@ -180,7 +166,14 @@ const runner = new AgentRunner(
             '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。',
           );
         const approvalId = randomUUID();
-        approvals.set(approvalId, { resolve, sessionId, call });
+        const finish = (approved: boolean) => {
+          signal.removeEventListener('abort', abort);
+          approvals.delete(approvalId);
+          resolve(approved);
+        };
+        const abort = () => finish(false);
+        approvals.set(approvalId, { resolve: finish, sessionId, call });
+        signal.addEventListener('abort', abort, { once: true });
         event('approval', { sessionId, approvalId, call, reason });
       }),
   },
@@ -192,7 +185,7 @@ function getSession(id: unknown): Session {
   return session;
 }
 function needsReview(id: string): boolean {
-  return needsUnknownReview(store.events(id), reviewedUnknownSeq.get(id));
+  return needsUnknownReview(store.events(id));
 }
 function viewSession(session: Session) {
   const events = store.events(session.id);
@@ -201,7 +194,7 @@ function viewSession(session: Session) {
     events: redactEvents(events, session.profile.alias),
     plan: planState(events),
     tasks: store.listTasks(session.id),
-    needsReview: needsReview(session.id),
+    needsReview: needsUnknownReview(events),
   };
 }
 function redactEvents(events: ReturnType<typeof store.events>, alias: string) {
@@ -260,6 +253,7 @@ async function startRun(
   event('runStarted', { sessionId: session.id, longRun: runSettings.maxModelCalls > 24 });
   activeRun = runner
     .run(session, prompt, controller.signal, attachments, quote, {
+      allowWorkspaceEdits: runSettings.allowWorkspaceEdits,
       ...(runSettings.maxModelCalls > 24
         ? {
             maxModelCalls: runSettings.maxModelCalls,
@@ -269,16 +263,18 @@ async function startRun(
           }
         : {}),
     })
-    .then(() =>
-      event('runFinished', { sessionId: session.id, events: viewSession(session).events }),
-    )
-    .catch((error) =>
+    .then(() => {
+      event('runFinished', { sessionId: session.id, events: viewSession(session).events });
+      return true;
+    })
+    .catch((error) => {
       event('runFailed', {
         sessionId: session.id,
         message: error instanceof Error ? error.message : String(error),
         events: viewSession(session).events,
-      }),
-    )
+      });
+      return false;
+    })
     .finally(() => {
       try {
         lease.release();
@@ -291,6 +287,7 @@ async function startRun(
     })
     .catch(() => {
       event('runFailed', { sessionId: session.id, message: '运行收尾失败，请检查数据库状态' });
+      return false;
     });
   return { started: true };
 }
@@ -429,7 +426,6 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         ...config,
         approvedCommands: config.approvedCommands.filter((rule) => rule.sessionId !== session.id),
       }));
-      reviewedUnknownSeq.delete(session.id);
       return store.listSessions();
     }
     case 'createSession': {
@@ -462,19 +458,27 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         if (active.sessionId !== session.id) throw new Error('请等待当前任务完成');
         return { ...viewSession(session), recoveredUnknown: 0 };
       }
-      const unknown = store.isLeased(session.id) ? 0 : runner.recover(session);
+      let unknown = 0;
+      if (!store.isLeased(session.id)) {
+        const lease = services.sessionLeases.retain(session.id, new AbortController());
+        try {
+          unknown = runner.recover(session);
+        } finally {
+          lease.release();
+        }
+      }
       return { ...viewSession(session), recoveredUnknown: unknown };
     }
     case 'reviewUnknown': {
       const session = getSession(p.sessionId);
-      const events = store.events(session.id);
-      const lastCompleted =
-        [...events].reverse().find((e) => e.type === 'turn_completed')?.seq ?? 0;
-      const lastUnknown = events
-        .filter((e) => e.seq > lastCompleted && e.type === 'tool_unknown')
-        .at(-1);
-      if (lastUnknown) reviewedUnknownSeq.set(session.id, lastUnknown.seq);
-      return viewSession(session);
+      const owner = randomUUID();
+      store.acquireLease(session.id, owner, 10_000);
+      try {
+        recordUnknownReview(store, session.id, p.throughSeq, 'desktop');
+        return viewSession(session);
+      } finally {
+        store.releaseLease(session.id, owner);
+      }
     }
     case 'send': {
       const prompt = String(p.prompt ?? '').trim();
@@ -521,8 +525,9 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       const leaseOwner = randomUUID();
       store.acquireLease(session.id, leaseOwner, 10_000);
       try {
-        if (store.events(session.id).at(-1)?.type !== 'turn_paused')
+        if (turnState(store.events(session.id)) !== 'paused')
           throw new Error('当前任务未处于暂停状态');
+        if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认');
         store.append(session.id, 'turn_completed', { stoppedByUser: true });
         return viewSession(session);
       } finally {
@@ -713,12 +718,42 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       });
       return config.hooks;
     }
+    case 'prepareSubagentPatch': {
+      const session = getSession(p.sessionId);
+      return services.exportSubagentPatch(session.id, String(p.childId ?? ''));
+    }
+    case 'listSubagentPatches':
+      return services.listSubagentPatches(getSession(p.sessionId).id);
+    case 'preflightSubagentPatches': {
+      const session = getSession(p.sessionId);
+      if (!Array.isArray(p.childIds) || p.childIds.some((id) => typeof id !== 'string'))
+        throw new Error('子任务列表无效');
+      const testCommand = p.testCommand;
+      if (
+        testCommand !== undefined &&
+        (typeof testCommand !== 'string' || !testCommand.trim() || testCommand.length > 10_000)
+      )
+        throw new Error('测试命令须为 1 至 10,000 字符的非空文本');
+      return services.preflightSubagentPatches(session, p.childIds, testCommand);
+    }
     case 'runtimeTool': {
       const session = getSession(p.sessionId);
-      if (active?.sessionId === session.id)
-        throw new Error('当前会话正在运行任务，请等待完成后再执行操作');
-      if (store.isLeased(session.id)) throw new Error('此会话正在运行，请等待完成后再执行操作');
       const name = String(p.name ?? '') as ToolCall['name'];
+      const control = [
+        'subagent_status',
+        'subagent_review',
+        'cancel_subagent',
+        'background_status',
+        'cancel_background',
+      ].includes(name);
+      if (!control && active?.sessionId === session.id)
+        throw new Error('当前会话正在运行任务，请等待完成后再执行操作');
+      if (
+        !control &&
+        store.isLeased(session.id) &&
+        !(name === 'spawn_subagent' && services.sessionLeases.hasLocalLease(session.id))
+      )
+        throw new Error('此会话正在运行，请等待完成后再执行操作');
       if (
         ![
           'search_repository',
@@ -741,6 +776,8 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           'remember_preference',
           'spawn_subagent',
           'subagent_status',
+          'subagent_review',
+          'cancel_subagent',
         ].includes(name)
       )
         throw new Error('不支持此界面操作');
@@ -751,38 +788,50 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         name,
         input: parsed.data as Record<string, unknown>,
       };
-      if (planBlocks(call, planState(store.events(session.id))))
-        throw new Error('规划模式等待用户批准计划');
-      store.append(session.id, 'tool_requested', {
-        callId: call.id,
-        name,
-        input: call.input,
-        source: 'desktop',
-      });
-      store.append(session.id, 'tool_approved', {
-        callId: call.id,
-        name,
-        reason: '用户从桌面界面直接执行',
-      });
-      store.append(session.id, 'tool_started', { callId: call.id, name });
+      const controller = new AbortController();
+      const spawnLease =
+        name === 'spawn_subagent'
+          ? services.sessionLeases.retain(session.id, controller)
+          : undefined;
       try {
-        if (
-          ['create_task', 'update_task', 'start_background'].includes(name) &&
-          session.managedWorkspace &&
-          !fs.existsSync(session.workspace)
-        ) {
-          store.materializeWorkspace(session.id);
-        }
-        const result = await services.execute(call, session, new AbortController().signal);
-        store.append(session.id, 'tool_finished', { callId: call.id, name, ...result });
-        return result;
-      } catch (error) {
-        store.append(session.id, 'tool_unknown', {
+        if (planBlocks(call, planState(store.events(session.id))))
+          throw new Error('规划模式等待用户批准计划');
+        store.append(session.id, 'tool_requested', {
           callId: call.id,
           name,
-          output: error instanceof Error ? error.message : String(error),
+          input: call.input,
+          source: 'desktop',
         });
-        throw error;
+        store.append(session.id, 'tool_approved', {
+          callId: call.id,
+          name,
+          reason: '用户从桌面界面直接执行',
+        });
+        const toolStarted = store.append(session.id, 'tool_started', { callId: call.id, name });
+        try {
+          if (
+            ['create_task', 'update_task', 'start_background'].includes(name) &&
+            session.managedWorkspace &&
+            !fs.existsSync(session.workspace)
+          ) {
+            store.materializeWorkspace(session.id);
+          }
+          const result = await services.execute(call, session, controller.signal, {
+            toolStartedSeq: toolStarted.seq,
+            allowWorkspaceEdits: p.allowWorkspaceEdits === true,
+          });
+          store.append(session.id, 'tool_finished', { callId: call.id, name, ...result });
+          return result;
+        } catch (error) {
+          store.append(session.id, 'tool_unknown', {
+            callId: call.id,
+            name,
+            output: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
+      } finally {
+        spawnLease?.release();
       }
     }
     case 'saveProfile': {
@@ -924,35 +973,62 @@ async function dispatch(method: string, p: Record<string, unknown>) {
   }
 }
 
-let scheduling = false;
+async function runScheduledCron(job: CronJob) {
+  const session = store.getSession(job.sessionId);
+  if (!session) {
+    store.markCronJob(job.id, 'session_missing');
+    return;
+  }
+  const controller = new AbortController();
+  let lease: ReturnType<typeof services.sessionLeases.retain> | undefined;
+  try {
+    let throughSeq = 0;
+    try {
+      // The runner retains its own reference. Keep this one until the job receipt is durable.
+      lease = services.sessionLeases.retain(session.id, controller);
+      throughSeq = store.events(session.id).at(-1)?.seq ?? 0;
+      await startRun(session, job.prompt, [], undefined, {
+        maxModelCalls: 24,
+        allowWorkspaceEdits: false,
+        unattended: process.env.BRUIN_SERVICE === '1',
+      });
+    } catch (error) {
+      if (
+        !controller.signal.aborted &&
+        (!lease || store.renewLease(session.id, lease.owner, 30_000))
+      )
+        store.markCronJob(job.id, needsReview(session.id) ? 'needs_review' : 'skipped_busy');
+      event('notice', {
+        sessionId: session.id,
+        message: `定时任务未启动: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+    const succeeded = await activeRun;
+    const runEvents = store.events(session.id).filter((event) => event.seq > throughSeq);
+    const failedHook = runEvents.some(
+      (event) => event.type === 'hook_finished' && event.payload.isError,
+    );
+    if (controller.signal.aborted || !store.renewLease(session.id, lease.owner, 30_000)) return;
+    store.markCronJob(
+      job.id,
+      succeeded === true && turnState(runEvents) === 'completed' && !failedHook
+        ? 'completed'
+        : 'needs_review',
+    );
+  } finally {
+    lease?.release();
+  }
+}
+
+let scheduled: Promise<void> | undefined;
+let shuttingDown = false;
 async function scheduleTick() {
-  if (active || scheduling) return;
-  scheduling = true;
   try {
     recoverCronJobs(store);
     const job = store.takeDueCronJobs(Date.now())[0];
     if (job) {
-      const session = store.getSession(job.sessionId);
-      if (!session) {
-        store.markCronJob(job.id, 'session_missing');
-        return;
-      }
-      try {
-        await startRun(session, job.prompt, [], undefined, {
-          maxModelCalls: 24,
-          allowWorkspaceEdits: false,
-          unattended: process.env.BRUIN_SERVICE === '1',
-        });
-        await activeRun;
-        const last = store.events(session.id).at(-1);
-        store.markCronJob(job.id, last?.type === 'turn_completed' ? 'completed' : 'needs_review');
-      } catch (error) {
-        store.markCronJob(job.id, needsReview(session.id) ? 'needs_review' : 'skipped_busy');
-        event('notice', {
-          sessionId: session.id,
-          message: `定时任务未启动: ${error instanceof Error ? error.message : String(error)}`,
-        });
-      }
+      await runScheduledCron(job);
       return;
     }
     for (const session of store.listSessions()) {
@@ -973,13 +1049,24 @@ async function scheduleTick() {
             unattended: process.env.BRUIN_SERVICE === '1',
           },
         );
-        await activeRun;
-        services.finishClaimIfOpen(task.id);
       } catch (error) {
         services.releaseClaim(task.id);
         event('notice', {
           sessionId: session.id,
           message: `任务认领未启动: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        return;
+      }
+      try {
+        try {
+          await activeRun;
+        } finally {
+          services.finishClaimIfOpen(task.id);
+        }
+      } catch (error) {
+        event('notice', {
+          sessionId: session.id,
+          message: `任务 ${task.id} 的运行结果需要检查: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
       return;
@@ -988,12 +1075,13 @@ async function scheduleTick() {
     event('notice', {
       message: `调度检查失败: ${error instanceof Error ? error.message : String(error)}`,
     });
-  } finally {
-    scheduling = false;
   }
 }
 const scheduler = setInterval(() => {
-  void scheduleTick();
+  if (active || scheduled || shuttingDown) return;
+  scheduled = scheduleTick().finally(() => {
+    scheduled = undefined;
+  });
 }, 15_000);
 scheduler.unref();
 
@@ -1018,11 +1106,11 @@ async function shutdown() {
   for (const pending of approvals.values()) pending.resolve(false);
   approvals.clear();
   await activeRun;
+  await scheduled;
   await services.close();
   await executor.close();
   store.close();
 }
-let shuttingDown = false;
 async function safeShutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;

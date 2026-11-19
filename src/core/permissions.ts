@@ -45,6 +45,8 @@ export function decisionFor(
   if (
     [
       'subagent_status',
+      'subagent_review',
+      'cancel_subagent',
       'list_worktrees',
       'background_status',
       'cancel_background',

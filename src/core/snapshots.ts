@@ -3,8 +3,8 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { dataDir } from '../config.js';
 
-const limit = 10_000_000;
-const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+export const snapshotMaxBytes = 10_000_000;
+export const fileContentHash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 function bounded(fd: number, max: number) {
   const buffer = Buffer.alloc(Math.min(max + 1, fs.fstatSync(fd).size + 1));
   let count = 0;
@@ -19,7 +19,7 @@ function bounded(fd: number, max: number) {
 }
 function location(workspace: string) {
   const root = fs.realpathSync(workspace);
-  return { root, directory: path.join(dataDir(), 'snapshots', hash(Buffer.from(root))) };
+  return { root, directory: path.join(dataDir(), 'snapshots', fileContentHash(Buffer.from(root))) };
 }
 function checked(root: string, relative: string): string {
   const file = path.resolve(root, relative);
@@ -48,8 +48,9 @@ function bytesAt(file: string): { bytes: Buffer; stat: fs.Stats } | null {
   }
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > limit) throw new Error('快照仅支持不超过 10 MB 的普通文件');
-    const bytes = bounded(fd, limit);
+    if (!stat.isFile() || stat.size > snapshotMaxBytes)
+      throw new Error('快照仅支持不超过 10 MB 的普通文件');
+    const bytes = bounded(fd, snapshotMaxBytes);
     const after = fs.fstatSync(fd);
     if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs)
       throw new Error('快照读取期间文件发生变化');
@@ -68,12 +69,21 @@ type Snapshot = {
   mode: number;
   afterHash: string;
 };
-export function recordSnapshot(workspace: string, file: string, after: Buffer): string | undefined {
+export function recordSnapshot(
+  workspace: string,
+  file: string,
+  after: Buffer,
+  expectedFileVersion?: string,
+): string | undefined {
   const { root, directory } = location(workspace);
   const relative = path.relative(root, file);
   const target = checked(root, relative);
   const before = bytesAt(target);
-  if (before && hash(before.bytes) === hash(after)) return;
+  const beforeHash = before ? fileContentHash(before.bytes) : null;
+  const afterHash = fileContentHash(after);
+  if (expectedFileVersion !== undefined && beforeHash !== expectedFileVersion)
+    throw new Error('文件自上次读取后已更改，请重新读取后再写入');
+  if (beforeHash === afterHash) return;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const stored = fs.readdirSync(directory).filter((name) => name.endsWith('.json'));
   if (
@@ -89,9 +99,9 @@ export function recordSnapshot(workspace: string, file: string, after: Buffer): 
     path: relative,
     at: new Date().toISOString(),
     before: before?.bytes.toString('base64') ?? null,
-    beforeHash: before ? hash(before.bytes) : null,
+    beforeHash,
     mode: before ? before.stat.mode & 0o777 : 0o600,
-    afterHash: hash(after),
+    afterHash,
   };
   const temp = path.join(directory, `${id}.tmp`);
   try {
@@ -142,7 +152,7 @@ function readSnapshot(workspace: string, id: string): Snapshot {
       (value.before === null
         ? value.beforeHash !== null
         : Buffer.from(value.before, 'base64').toString('base64') !== value.before ||
-          hash(Buffer.from(value.before, 'base64')) !== value.beforeHash) ||
+          fileContentHash(Buffer.from(value.before, 'base64')) !== value.beforeHash) ||
       !Number.isInteger(value.mode) ||
       value.mode < 0 ||
       value.mode > 0o777 ||
@@ -187,15 +197,16 @@ export function restoreSnapshot(
   const { root } = location(workspace);
   const file = checked(root, snapshot.path);
   const current = bytesAt(file);
-  if (!current || hash(current.bytes) !== snapshot.afterHash)
+  if (!current || fileContentHash(current.bytes) !== snapshot.afterHash)
     throw new Error('文件已有后续修改或已删除，拒绝覆盖；请先检查差异');
   if (snapshot.before === null) {
     const again = bytesAt(checked(root, snapshot.path));
-    if (!again || hash(again.bytes) !== snapshot.afterHash) throw new Error('回滚期间文件发生变化');
+    if (!again || fileContentHash(again.bytes) !== snapshot.afterHash)
+      throw new Error('回滚期间文件发生变化');
     fs.unlinkSync(file);
   } else {
     const before = Buffer.from(snapshot.before, 'base64');
-    if (before.length > limit) throw new Error('快照内容过大');
+    if (before.length > snapshotMaxBytes) throw new Error('快照内容过大');
     replace(file, before, snapshot.mode, current.stat);
   }
   return { path: snapshot.path, action: snapshot.before === null ? 'deleted' : 'restored' };
