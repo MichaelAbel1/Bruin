@@ -381,6 +381,9 @@ function createWindow() {
     return { action: 'deny' };
   });
   window.webContents.on('will-navigate', (event) => event.preventDefault());
+  window.on('closed', () => {
+    window = undefined;
+  });
   if (development) void window.loadURL(process.env.BRUIN_RENDERER_URL);
   else void window.loadFile(path.join(__dirname, 'build', 'renderer', 'index.html'));
 }
@@ -493,7 +496,7 @@ if (!gotSingleInstanceLock) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   });
-  app.on('before-quit', () => {
+  app.on('will-quit', () => {
     stopLongRunPowerBlocker();
     if (host && !host.killed) {
       host.stdin.end();

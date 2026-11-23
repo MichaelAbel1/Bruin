@@ -32,11 +32,17 @@ export interface CronJob {
   prompt: string;
   nextRunAt: number;
   lastStatus?: string;
+  planSeq?: number;
 }
 export interface MemoryPage {
   key: string;
   content: string;
   updatedAt: string;
+}
+export class MemoryPageChangedError extends Error {
+  constructor() {
+    super('这条记忆已被其他操作修改，请重新生成候选');
+  }
 }
 export interface UserPreference {
   id: string;
@@ -74,13 +80,13 @@ export interface EventStore {
   releaseTask(id: string, owner: string): void;
   retryTask(sessionId: string, id: string): void;
   deleteTask(sessionId: string, id: string): void;
-  createCronJob(sessionId: string, expression: string, prompt: string): CronJob;
+  createCronJob(sessionId: string, expression: string, prompt: string, planSeq?: number): CronJob;
   listCronJobs(sessionId: string): CronJob[];
   deleteCronJob(sessionId: string, id: string): void;
   takeDueCronJobs(now: number): CronJob[];
-  markCronJob(id: string, status: string): void;
+  markCronJob(id: string, status: string, detail?: string): void;
   listMemory(workspace: string): MemoryPage[];
-  saveMemory(workspace: string, key: string, content: string): void;
+  saveMemory(workspace: string, key: string, content: string, expected?: MemoryPage | null): void;
   listPreferences(): UserPreference[];
   savePreference(sessionId: string, content: string): UserPreference;
   deletePreference(id: string): void;
@@ -667,6 +673,13 @@ export class SqliteEventStore implements EventStore {
     this.repairTaskFiles(workspace);
   }
   private rowToCronJob(row: any): CronJob {
+    const binding = this.db
+      .prepare(
+        `SELECT json_extract(payload_json, '$.planSeq') AS planSeq FROM events
+        WHERE session_id = ? AND type = 'cron_configured' AND json_extract(payload_json, '$.jobId') = ?
+        ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(row.session_id, row.id) as { planSeq: number } | undefined;
     return {
       id: row.id,
       sessionId: row.session_id,
@@ -674,9 +687,10 @@ export class SqliteEventStore implements EventStore {
       prompt: row.prompt,
       nextRunAt: row.next_run_at,
       ...(row.last_status ? { lastStatus: row.last_status } : {}),
+      ...(binding ? { planSeq: binding.planSeq } : {}),
     };
   }
-  createCronJob(sessionId: string, expression: string, prompt: string): CronJob {
+  createCronJob(sessionId: string, expression: string, prompt: string, planSeq?: number): CronJob {
     if (!this.getSession(sessionId)) throw new Error('会话不存在');
     if (
       !prompt.trim() ||
@@ -689,17 +703,21 @@ export class SqliteEventStore implements EventStore {
       .next()
       .getTime();
     const id = randomUUID();
-    this.db.transaction(() => {
-      const count = (
+    this.db
+      .transaction(() => {
+        const count = (
+          this.db
+            .prepare('SELECT COUNT(*) AS n FROM cron_jobs WHERE session_id = ?')
+            .get(sessionId) as { n: number }
+        ).n;
+        if (count >= 50) throw new Error('会话定时任务已达到 50 项上限');
         this.db
-          .prepare('SELECT COUNT(*) AS n FROM cron_jobs WHERE session_id = ?')
-          .get(sessionId) as { n: number }
-      ).n;
-      if (count >= 50) throw new Error('会话定时任务已达到 50 项上限');
-      this.db
-        .prepare('INSERT INTO cron_jobs VALUES (?, ?, ?, ?, ?, NULL)')
-        .run(id, sessionId, expression, prompt.trim(), nextRunAt);
-    })();
+          .prepare('INSERT INTO cron_jobs VALUES (?, ?, ?, ?, ?, NULL)')
+          .run(id, sessionId, expression, prompt.trim(), nextRunAt);
+        if (planSeq !== undefined)
+          this.append(sessionId, 'cron_configured', { jobId: id, planSeq });
+      })
+      .immediate();
     return this.rowToCronJob(this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id));
   }
   listCronJobs(sessionId: string): CronJob[] {
@@ -750,6 +768,7 @@ export class SqliteEventStore implements EventStore {
           runId: randomUUID(),
           scheduledFor: job.nextRunAt,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          ...(job.planSeq === undefined ? {} : { planSeq: job.planSeq }),
         });
         this.db
           .prepare(`UPDATE cron_jobs SET next_run_at = ?, last_status = 'dispatched' WHERE id = ?`)
@@ -759,7 +778,7 @@ export class SqliteEventStore implements EventStore {
     });
     return claim.immediate();
   }
-  markCronJob(id: string, status: string): void {
+  markCronJob(id: string, status: string, detail?: string): void {
     this.db.transaction(() => {
       const row = this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id) as any;
       if (!row) return;
@@ -777,6 +796,7 @@ export class SqliteEventStore implements EventStore {
           jobId: id,
           runId: run.payload.runId,
           status,
+          ...(detail ? { detail } : {}),
         });
       this.db.prepare('UPDATE cron_jobs SET last_status = ? WHERE id = ?').run(status, id);
     })();
@@ -790,27 +810,35 @@ export class SqliteEventStore implements EventStore {
         .all(workspace) as Array<{ key: string; content: string; updated_at: string }>
     ).map((row) => ({ key: row.key, content: row.content, updatedAt: row.updated_at }));
   }
-  saveMemory(workspace: string, key: string, content: string): void {
+  saveMemory(workspace: string, key: string, content: string, expected?: MemoryPage | null): void {
     if (!/^[a-zA-Z0-9._-]{1,80}$/.test(key) || !content.trim() || content.length > 8000)
       throw new Error('记忆名称或内容无效');
-    const count = (
-      this.db
-        .prepare('SELECT COUNT(*) AS n FROM memory_pages WHERE workspace = ?')
-        .get(workspace) as { n: number }
-    ).n;
-    if (
-      count >= 50 &&
-      !this.db
-        .prepare('SELECT 1 FROM memory_pages WHERE workspace = ? AND key = ?')
-        .get(workspace, key)
-    )
-      throw new Error('工作区记忆已达到 50 项上限');
     this.db
-      .prepare(
-        `INSERT INTO memory_pages VALUES (?, ?, ?, ?)
-      ON CONFLICT(workspace, key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
-      )
-      .run(workspace, key, content.trim(), new Date().toISOString());
+      .transaction(() => {
+        const current = this.db
+          .prepare(
+            'SELECT content, updated_at AS updatedAt FROM memory_pages WHERE workspace = ? AND key = ?',
+          )
+          .get(workspace, key) as Omit<MemoryPage, 'key'> | undefined;
+        if (
+          expected !== undefined &&
+          (current?.content !== expected?.content || current?.updatedAt !== expected?.updatedAt)
+        )
+          throw new MemoryPageChangedError();
+        if (!current) {
+          const { n } = this.db
+            .prepare('SELECT COUNT(*) AS n FROM memory_pages WHERE workspace = ?')
+            .get(workspace) as { n: number };
+          if (n >= 50) throw new Error('工作区记忆已达到 50 项上限');
+        }
+        this.db
+          .prepare(
+            `INSERT INTO memory_pages VALUES (?, ?, ?, ?)
+        ON CONFLICT(workspace, key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
+          )
+          .run(workspace, key, content.trim(), new Date().toISOString());
+      })
+      .immediate();
   }
   listPreferences(): UserPreference[] {
     return (

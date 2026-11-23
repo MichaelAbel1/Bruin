@@ -4,10 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { pendingInputs } from '../core/input-queue.js';
+import { pendingQuestion, recordQuestionAnswer } from '../core/question.js';
 import { canResumeTurn, turnState } from '../core/turn-state.js';
+import { SqliteEventStore } from '../storage/event-store.js';
 
 // Stub the model transport and hold one hook open. Host RPC, SDK stream parsing,
 // attachment loading and the durable queue run normally.
@@ -38,6 +41,23 @@ globalThis.fetch = async (url, init) => {
     id: 'reply-' + calls, object: 'chat.completion.chunk', created: 1, model: 'mock',
     choices: [{ index: 0, delta, finish_reason }],
   }) + '\\n\\n';
+  const user = JSON.stringify(body.messages.filter(message => message.role === 'user').at(-1));
+  const tool = (index, id, name, input) => ({ index, id, type: 'function', function: { name, arguments: JSON.stringify(input) } });
+  const response = (data) => new Response(data + 'data: [DONE]\\n\\n', { headers: { 'content-type': 'text/event-stream' } });
+  if (user.includes('REQUEST_COMPATIBILITY')) {
+    if (!body.tools?.some(tool => tool.function.name === 'ask_user')) throw new Error('question tool missing');
+    return response(chunk({ role: 'assistant', tool_calls: [
+      tool(0, 'question', 'ask_user', { question: 'Which legacy version must be supported?' }),
+      tool(1, 'write-before-answer', 'write_file', { path: 'premature.txt', content: 'premature' }),
+    ] }, null) + chunk({}, 'tool_calls'));
+  }
+  if (user.includes('ANSWER_')) {
+    if (!user.includes('Which legacy version must be supported?')) throw new Error('question missing from answer context');
+    if (!body.messages.some(message => message.tool_call_id === 'write-after-answer'))
+      return response(chunk({ role: 'assistant', tool_calls: [
+        tool(0, 'write-after-answer', 'write_file', { path: 'after.txt', content: 'requires approval' }),
+      ] }, null) + chunk({}, 'tool_calls'));
+  }
   return new Response(chunk({ role: 'assistant', content: 'Image received ' + calls }, null) +
     chunk({}, 'stop') + 'data: [DONE]\\n\\n', { headers: { 'content-type': 'text/event-stream' } });
 };
@@ -231,6 +251,144 @@ test(
       assert.equal(pendingInputs(latestEvents).length, 0);
       assert.equal(canResumeTurn(latestEvents), false);
       assert.equal(latestEvents.filter((event) => event.type === 'hook_finished').length, 2);
+
+      const cli = (sessionId: string, ...args: string[]) => {
+        const child = promisify(execFile)(
+          process.execPath,
+          [
+            '--import',
+            preloader,
+            fileURLToPath(new URL('../cli.js', import.meta.url)),
+            'chat',
+            '--resume',
+            sessionId,
+            ...args,
+          ],
+          {
+            cwd: dir,
+            env: {
+              ...process.env,
+              BRUIN_HOME: path.join(dir, 'home'),
+              BRUIN_TEST_TRACE: trace,
+              BRUIN_TEST_READY: ready,
+              BRUIN_TEST_RELEASE: release,
+            },
+            timeout: 5_000,
+          },
+        );
+        child.child.stdin?.end();
+        return child;
+      };
+
+      await request('send', { sessionId: session.id, prompt: 'REQUEST_COMPATIBILITY' });
+      await waitUntil(() => completions === 4, 'The question did not pause the task');
+      const question = pendingQuestion(latestEvents)!;
+      assert.equal(question.text, 'Which legacy version must be supported?');
+      assert.equal(canResumeTurn(latestEvents), false);
+      assert.ok(
+        latestEvents.some(
+          (event) => event.type === 'tool_denied' && event.payload.callId === 'write-before-answer',
+        ),
+      );
+      await assert.rejects(request('resume', { sessionId: session.id }), /待答问题/);
+      await assert.rejects(
+        cli(session.id),
+        (error: Error & { code?: number; stdout?: string }) =>
+          error.code === 2 && Boolean(error.stdout?.includes(question.id)),
+      );
+      await assert.rejects(
+        request('answerQuestion', {
+          sessionId: other.session.id,
+          questionId: question.id,
+          text: 'a different session',
+        }),
+        /不属于当前会话/,
+      );
+
+      const db = new SqliteEventStore(path.join(dir, 'home', 'sessions.sqlite'));
+      try {
+        const priorCompletions = db
+          .events(session.id)
+          .filter((event) => event.type === 'turn_completed').length;
+        const competing = await Promise.allSettled([
+          cli(session.id, '--answer', question.id, 'ANSWER_CLI'),
+          request('answerQuestion', {
+            sessionId: session.id,
+            questionId: question.id,
+            text: 'ANSWER_DESKTOP',
+            unattended: true,
+            maxModelCalls: 96,
+          }),
+        ]);
+        assert.equal(competing.filter((result) => result.status === 'fulfilled').length, 1);
+        await waitUntil(
+          () =>
+            db.events(session.id).filter((event) => event.type === 'turn_completed').length ===
+              priorCompletions + 1 && !db.isLeased(session.id),
+          'The accepted answer did not reach the model',
+        );
+        const afterAnswer = db.events(session.id);
+        assert.equal(
+          afterAnswer.filter(
+            (event) => event.type === 'user' && event.payload.answerTo === question.id,
+          ).length,
+          1,
+        );
+        assert.ok(
+          afterAnswer.some(
+            (event) =>
+              event.type === 'tool_denied' && event.payload.callId === 'write-after-answer',
+          ),
+        );
+        assert.equal(fs.existsSync(path.join(dir, 'premature.txt')), false);
+        assert.equal(fs.existsSync(path.join(dir, 'after.txt')), false);
+
+        await request('send', { sessionId: other.session.id, prompt: 'REQUEST_COMPATIBILITY' });
+        await waitUntil(
+          () =>
+            Boolean(pendingQuestion(db.events(other.session.id))) && !db.isLeased(other.session.id),
+          'The second question did not persist',
+        );
+        const second = pendingQuestion(db.events(other.session.id))!;
+        const unknown = db.append(other.session.id, 'tool_unknown', {
+          callId: 'interrupted-mutation',
+          name: 'write_file',
+          output: 'fixture for an interrupted write',
+        });
+        await assert.rejects(
+          request('answerQuestion', {
+            sessionId: other.session.id,
+            questionId: second.id,
+            text: 'ANSWER_BLOCKED_BY_REVIEW',
+          }),
+          /执行结果未知/,
+        );
+        await assert.rejects(
+          cli(other.session.id, '--answer', second.id, 'ANSWER_BLOCKED_BY_REVIEW'),
+          {
+            code: 3,
+          },
+        );
+        assert.equal(pendingQuestion(db.events(other.session.id))?.id, second.id);
+        await request('reviewUnknown', { sessionId: other.session.id, throughSeq: unknown.seq });
+        db.acquireLease(other.session.id, 'interrupted-client', 30_000);
+        try {
+          recordQuestionAnswer(db, other.session.id, second.id, 'ANSWER_BEFORE_INTERRUPT');
+        } finally {
+          db.releaseLease(other.session.id, 'interrupted-client');
+        }
+        await cli(other.session.id);
+        assert.equal(
+          db
+            .events(other.session.id)
+            .filter((event) => event.type === 'user' && event.payload.answerTo === second.id)
+            .length,
+          1,
+        );
+        assert.equal(turnState(db.events(other.session.id)), 'completed');
+      } finally {
+        db.close();
+      }
     } finally {
       clearTimeout(deadlineTimer);
       fs.writeFileSync(release, 'go');

@@ -27,7 +27,13 @@ test('registry preserves existing tool exposure and provider compatibility expor
     'shell',
     'write_file',
   ]);
-  assert.deepEqual(Object.keys(toolsForMode('full')), Object.keys(toolDefinitions));
+  assert.deepEqual(
+    Object.keys(toolsForMode('full')),
+    Object.keys(toolDefinitions).filter((name) => name !== 'ask_user'),
+  );
+  assert.deepEqual(Object.keys(toolsForMode('full', true)), Object.keys(toolDefinitions));
+  assert.equal(Object.hasOwn(toolsForMode('read-only', true), 'ask_user'), false);
+  assert.equal(Object.hasOwn(toolsForMode('worktree', true), 'ask_user'), false);
   assert.deepEqual(Object.keys(toolSchemas), Object.keys(toolDefinitions));
   for (const definition of Object.values(toolDefinitions)) {
     if (definition.parallel) {

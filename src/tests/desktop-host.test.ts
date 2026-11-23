@@ -59,6 +59,8 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
   let finishRun: (events: any[]) => void = () => {};
   let failRun: (error: Error) => void = () => {};
   let approvalSeen = 0;
+  let approvalSource: { sessionId: string; workspace: string } | undefined;
+  let createWhileBusy: Promise<string> | undefined;
   const runDone = new Promise<any[]>((resolve, reject) => {
     finishRun = resolve;
     failRun = reject;
@@ -68,6 +70,11 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     if (!message.id) {
       if (message.type === 'approval') {
         approvalSeen++;
+        approvalSource = { sessionId: message.sessionId, workspace: message.workspace };
+        createWhileBusy = request('createSession', { workspace: dir }).then(
+          () => 'created a session',
+          (error: Error) => error.message,
+        );
         void request('answerApproval', { approvalId: message.approvalId, approved: true });
       }
       if (message.type === 'runFinished') finishRun(message.events);
@@ -249,6 +256,11 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
     await request('send', { sessionId: created.session.id, prompt: '创建文件' });
     const events = await runDone;
     assert.equal(approvalSeen, 1);
+    assert.deepEqual(approvalSource, {
+      sessionId: created.session.id,
+      workspace: created.session.workspace,
+    });
+    assert.match((await createWhileBusy) ?? '', /当前任务完成后再新建会话/);
     assert.equal(modelCalls, 2);
     assert.deepEqual(authHeaders, [`Bearer ${key}`, `Bearer ${key}`]);
     assert.doesNotMatch(

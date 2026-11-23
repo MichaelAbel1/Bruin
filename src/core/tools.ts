@@ -2,6 +2,17 @@ import { z } from 'zod';
 
 // Internal registry only. Registration never grants execution permission.
 export const toolDefinitions = {
+  ask_user: {
+    target: 'runtime' as const,
+    readOnly: false,
+    basic: false,
+    planning: true,
+    parallel: false,
+    replay: 'safe' as const,
+    description:
+      'Pause the task to ask one business question whose answer is needed to continue. Call this tool on its own. Use regular tool approvals for actions that require permission.',
+    inputSchema: z.object({ question: z.string().trim().min(1).max(2000) }),
+  },
   search_repository: {
     target: 'executor' as const,
     readOnly: true,
@@ -393,9 +404,10 @@ export const toolSchemas = Object.fromEntries(
   >;
 };
 
-export function toolsForMode(mode: ToolMode) {
+export function toolsForMode(mode: ToolMode, allowQuestions = false) {
   return Object.fromEntries(
     Object.entries(toolSchemas).filter(([name]) => {
+      if (name === 'ask_user') return mode === 'full' && allowQuestions;
       const definition = toolDefinitions[name as keyof typeof toolDefinitions];
       return (
         mode === 'full' ||

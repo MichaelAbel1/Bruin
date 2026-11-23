@@ -3,8 +3,12 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { EventStore } from '../storage/event-store.js';
-import type { TaskNode } from '../storage/event-store.js';
+import {
+  MemoryPageChangedError,
+  type EventStore,
+  type MemoryPage,
+  type TaskNode,
+} from '../storage/event-store.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { Session, SessionEvent, ToolCall, ToolResult } from '../core/types.js';
 import { dataDir, loadConfig, type HookConfig, type McpServerConfig } from '../config.js';
@@ -31,6 +35,7 @@ type Subagent = {
 };
 type DelegationSettings = {
   toolStartedSeq?: number;
+  expectedMemoryPage?: MemoryPage | null;
   allowWorkspaceEdits?: boolean;
   maxModelCalls?: number;
   maxDurationMs?: number;
@@ -373,11 +378,11 @@ export class RuntimeServices {
           return { output: '记忆名称或内容无效', isError: true };
         }
         try {
-          this.store.saveMemory(session.workspace, key, content);
+          this.store.saveMemory(session.workspace, key, content, delegation.expectedMemoryPage);
           return { output: '工作区记忆已保存', isError: false };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          if (message === '工作区记忆已达到 50 项上限') {
+          if (error instanceof MemoryPageChangedError || message === '工作区记忆已达到 50 项上限') {
             return { output: message, isError: true };
           }
           throw error;

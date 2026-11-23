@@ -1883,6 +1883,42 @@ pre {
   letter-spacing: -0.035em;
   font-weight: 600;
 }
+.unsaved-files-dialog {
+  color: var(--review-text);
+  overflow-wrap: anywhere;
+}
+.unsaved-files-dialog::backdrop {
+  background: #000a;
+  backdrop-filter: blur(5px);
+}
+.memory-candidate {
+  border: 1px solid var(--review-border);
+  border-radius: 8px;
+  margin-top: 12px;
+  padding: 12px;
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.memory-candidate-text {
+  white-space: pre-wrap;
+}
+.memory-candidate details {
+  min-width: 0;
+  max-width: 100%;
+}
+.memory-candidate summary {
+  cursor: pointer;
+}
+.memory-candidate ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.memory-candidate li + li {
+  margin-top: 6px;
+}
 .icon-button {
   width: 29px;
   height: 29px;

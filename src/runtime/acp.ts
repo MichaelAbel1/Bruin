@@ -13,6 +13,7 @@ import { createSubagentRunner } from './subagent.js';
 import type { ToolMode } from '../core/tools.js';
 import { needsUnknownReview } from '../core/unknown-review.js';
 import { turnState } from '../core/turn-state.js';
+import { pendingQuestion } from '../core/question.js';
 
 const sessionParams = z.object({ sessionId: z.string().min(1) });
 const newParams = z.object({
@@ -70,7 +71,7 @@ export class AcpServer {
   private update(sessionId: string, update: Record<string, unknown>) {
     this.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
   }
-  private toolEvent(event: SessionEvent) {
+  private toolEvent(event: SessionEvent, replayId?: string) {
     const statuses: Record<string, string> = {
       tool_requested: 'pending',
       tool_started: 'in_progress',
@@ -81,15 +82,57 @@ export class AcpServer {
     if (!statuses[event.type]) return;
     this.update(event.sessionId, {
       sessionUpdate: event.type === 'tool_requested' ? 'tool_call' : 'tool_call_update',
-      toolCallId: event.payload.callId,
+      toolCallId: replayId ?? event.payload.callId,
       status: statuses[event.type],
       ...(event.type === 'tool_requested'
-        ? { title: event.payload.name, kind: 'other', rawInput: event.payload.input }
+        ? {
+            title: event.payload.name,
+            kind: 'other',
+            ...(replayId === undefined ? { rawInput: event.payload.input } : {}),
+          }
         : {}),
       ...(typeof event.payload.output === 'string'
         ? { content: [{ type: 'content', content: { type: 'text', text: event.payload.output } }] }
         : {}),
     });
+  }
+  private replay(session: Session) {
+    const tools = new Map<unknown, SessionEvent>();
+    for (const event of this.store.events(session.id)) {
+      if (event.type === 'user' || event.type === 'assistant') {
+        const text = event.payload.text;
+        if (typeof text === 'string') {
+          // Bound each frame even for large messages and preserve surrogate pairs.
+          for (const chunk of text.match(/[\s\S]{1,16000}/gu) ?? [])
+            this.update(session.id, {
+              sessionUpdate: event.type === 'user' ? 'user_message_chunk' : 'agent_message_chunk',
+              messageId: `message-${event.seq}`,
+              content: { type: 'text', text: chunk },
+            });
+        }
+      }
+      const callId = event.payload.callId;
+      if (event.type === 'tool_requested' && typeof callId === 'string') tools.set(callId, event);
+      const request = tools.get(callId);
+      if (request) this.toolEvent(event, `history-tool-${request.seq}`);
+      if (['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type))
+        tools.delete(callId);
+    }
+    for (const request of tools.values())
+      this.update(session.id, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: `history-tool-${request.seq}`,
+        status: 'failed',
+        content: [
+          {
+            type: 'content',
+            content: {
+              type: 'text',
+              text: 'No recorded result. Check the session before continuing.',
+            },
+          },
+        ],
+      });
   }
   private approve(sessionId: string, call: ToolCall, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || this.closing) return Promise.resolve(false);
@@ -185,84 +228,109 @@ export class AcpServer {
       this.initialized = true;
       return {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: false, promptCapabilities: {}, mcpCapabilities: {} },
+        agentCapabilities: { loadSession: true, promptCapabilities: {}, mcpCapabilities: {} },
         agentInfo: { name: 'bruin', version: '1.0.0' },
         authMethods: [],
       };
     }
     if (!this.initialized) throw new RpcError(-32600, 'Initialize first');
-    if (method === 'session/new') {
-      const p = newParams.parse(params);
-      if (this.entries.size >= 20) throw new RpcError(-32603, 'Session limit reached');
+    if (method === 'session/new' || method === 'session/load') {
+      const p = newParams
+        .extend({ sessionId: sessionParams.shape.sessionId.optional() })
+        .parse(params);
       const root = fs.realpathSync(p.cwd);
       if (!fs.statSync(root).isDirectory()) throw new RpcError(-32602, 'cwd must be a directory');
-      const servers = p.mcpServers.map((server) =>
-        mcpServerSchema.parse({
-          ...server,
-          transport: 'stdio',
-          envNames: server.env.map((item) => item.name),
-        }),
-      );
-      if (new Set(servers.map((server) => server.name)).size !== servers.length)
-        throw new RpcError(-32602, 'Duplicate MCP server name');
-      const env: Record<string, Record<string, string>> = Object.create(null);
-      for (const server of p.mcpServers)
-        env[server.name] = Object.fromEntries(server.env.map((item) => [item.name, item.value]));
+      if (method === 'session/load') {
+        if (!p.sessionId) throw new RpcError(-32602, 'sessionId is required');
+        const session = this.store.getSession(p.sessionId);
+        if (!session || session.workspace !== root)
+          throw new RpcError(-32602, 'No saved session in the requested workspace');
+        const existing = this.entries.get(session.id);
+        if (existing?.run || this.store.isLeased(session.id))
+          throw new RpcError(-32600, 'Session is busy');
+        if (existing && existing.session.workspace !== session.workspace)
+          throw new RpcError(-32602, 'Session workspace changed; open a new connection');
+        if (!existing) this.attach(session, this.sessionMcp(p.mcpServers));
+        this.replay(session);
+        return {};
+      }
+      if (this.entries.size >= 20) throw new RpcError(-32603, 'Session limit reached');
+      const mcp = this.sessionMcp(p.mcpServers);
       const session = this.store.createSession(root, findProfile(this.modelAlias));
-      const view = new Proxy(this.store, {
-        get: (target, property) => {
-          if (property === 'append')
-            return (id: string, type: SessionEvent['type'], payload: Record<string, unknown>) => {
-              const event = target.append(id, type, payload);
-              if (id === session.id) this.toolEvent(event);
-              return event;
-            };
-          const value = Reflect.get(target, property);
-          return typeof value === 'function' ? value.bind(target) : value;
-        },
-      });
-      const services = new RuntimeServices(
-        view,
-        this.executor,
-        createSubagentRunner(view, this.executor, (mode) =>
-          this.gateway(mode === 'read-only', mode),
-        ),
-        {
-          servers: [
-            ...loadConfig().mcpServers.filter(
-              (server) => !servers.some((item) => item.name === server.name),
-            ),
-            ...servers,
-          ],
-          env,
-        },
-      );
-      const runner = new AgentRunner(
-        view,
-        this.gateway(false),
-        this.executor,
-        {
-          text: (text) =>
-            this.update(session.id, {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text },
-            }),
-          notice: (text) => {
-            if (!text.includes(': 完成\n') && !text.includes(': 失败\n'))
-              this.update(session.id, {
-                sessionUpdate: 'agent_message_chunk',
-                content: { type: 'text', text: `\n${text}\n` },
-              });
-          },
-          approve: (call, _reason, signal) => this.approve(session.id, call, signal),
-        },
-        services,
-      );
-      this.entries.set(session.id, { session, services, runner });
+      this.attach(session, mcp);
       return { sessionId: session.id };
     }
     if (method !== 'session/prompt' && method !== 'session/cancel')
       throw new RpcError(-32601, 'Method not found');
+    return this.promptOrCancel(method, params);
+  }
+  private sessionMcp(mcpServers: z.infer<typeof newParams>['mcpServers']) {
+    const servers = mcpServers.map((server) =>
+      mcpServerSchema.parse({
+        ...server,
+        transport: 'stdio',
+        envNames: server.env.map((item) => item.name),
+      }),
+    );
+    if (new Set(servers.map((server) => server.name)).size !== servers.length)
+      throw new RpcError(-32602, 'Duplicate MCP server name');
+    const env: Record<string, Record<string, string>> = Object.create(null);
+    for (const server of mcpServers)
+      env[server.name] = Object.fromEntries(server.env.map((item) => [item.name, item.value]));
+    return {
+      servers: [
+        ...loadConfig().mcpServers.filter(
+          (server) => !servers.some((item) => item.name === server.name),
+        ),
+        ...servers,
+      ],
+      env,
+    };
+  }
+  private attach(session: Session, mcp: ReturnType<AcpServer['sessionMcp']>) {
+    if (this.entries.size >= 20) throw new RpcError(-32603, 'Session limit reached');
+    const view = new Proxy(this.store, {
+      get: (target, property) => {
+        if (property === 'append')
+          return (id: string, type: SessionEvent['type'], payload: Record<string, unknown>) => {
+            const event = target.append(id, type, payload);
+            if (id === session.id) this.toolEvent(event);
+            return event;
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const services = new RuntimeServices(
+      view,
+      this.executor,
+      createSubagentRunner(view, this.executor, (mode) => this.gateway(mode === 'read-only', mode)),
+      mcp,
+    );
+    const runner = new AgentRunner(
+      view,
+      this.gateway(false),
+      this.executor,
+      {
+        text: (text) =>
+          this.update(session.id, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text },
+          }),
+        notice: (text) => {
+          if (!text.includes(': 完成\n') && !text.includes(': 失败\n'))
+            this.update(session.id, {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `\n${text}\n` },
+            });
+        },
+        approve: (call, _reason, signal) => this.approve(session.id, call, signal),
+      },
+      services,
+    );
+    this.entries.set(session.id, { session, services, runner });
+  }
+  private async promptOrCancel(method: 'session/prompt' | 'session/cancel', params: unknown) {
     const p = sessionParams.parse(params);
     const entry = this.entries.get(p.sessionId);
     if (!entry) throw new RpcError(-32602, 'Unknown session');
@@ -285,11 +353,21 @@ export class AcpServer {
     const lease = entry.services.sessionLeases.retain(entry.session.id, controller);
     entry.controller = controller;
     try {
+      const session = this.store.getSession(entry.session.id);
+      if (!session || session.workspace !== entry.session.workspace)
+        throw new RpcError(-32602, 'Session workspace changed; reopen the session');
+      entry.session = session;
       entry.runner.recover(entry.session);
-      if (needsUnknownReview(this.store.events(entry.session.id)))
+      const events = this.store.events(entry.session.id);
+      if (needsUnknownReview(events))
         throw new RpcError(
           -32603,
           'Session has uncertain tool results; inspect the local session and workspace before continuing',
+        );
+      if (pendingQuestion(events))
+        throw new RpcError(
+          -32603,
+          'Answer the pending question in Bruin desktop or CLI before continuing',
         );
       entry.run = entry.runner.run(entry.session, prompt, controller.signal);
       await entry.run;

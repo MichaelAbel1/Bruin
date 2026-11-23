@@ -34,6 +34,7 @@ import { pendingSubagents, recoverSession } from './recovery.js';
 import { subagentPreviews } from './subagent-results.js';
 import { turnState } from './turn-state.js';
 import { withoutPauseReports } from './pause-report.js';
+import { pendingQuestion } from './question.js';
 
 const worktreeTools = toolsForMode('worktree');
 
@@ -61,6 +62,7 @@ type RunOptions = {
   maxDurationMs?: number;
   checkpointEvery?: number;
   unattended?: boolean;
+  allowQuestions?: boolean;
   allowWorkspaceEdits?: boolean;
 };
 
@@ -462,6 +464,8 @@ export class AgentRunner {
         ...(keepUserSeq === undefined ? {} : { keepUserSeq }),
       });
     };
+    if (pendingQuestion(this.store.events(session.id)))
+      throw new Error('请先答复当前待答问题，再继续任务');
     const newTurn = Boolean(input || attachments.length || quote);
     // Calibrate only within this run/model. Never reuse counts across model changes.
     let tokenScale = 1;
@@ -885,6 +889,7 @@ export class AgentRunner {
       }
       // Freeze tool hooks for the batch, including recovery policy. Config changes apply next batch.
       const toolHooks = this.services ? loadConfig().hooks : [];
+      let askedQuestion = false;
       const hasToolHooks = toolHooks.some(
         (hook) => hook.enabled && ['before_tool', 'after_tool'].includes(hook.event),
       );
@@ -914,6 +919,27 @@ export class AgentRunner {
           return;
         }
         call.input = parsed.data as Record<string, unknown>;
+        if (call.name === 'ask_user') {
+          if (!options.allowQuestions || this.readOnly || this.worktreeAgent) {
+            this.store.append(session.id, 'tool_denied', {
+              callId: call.id,
+              name: call.name,
+              output: '此入口不支持持久化提问',
+            });
+          } else {
+            const question = String(call.input.question);
+            this.store.append(session.id, 'tool_finished', {
+              callId: call.id,
+              name: call.name,
+              isError: false,
+              question,
+              questionId: randomUUID(),
+              output: `Waiting for the user's answer. Question: ${question}`,
+            });
+            askedQuestion = true;
+          }
+          return;
+        }
         const policy =
           this.worktreeAgent &&
           (!Object.hasOwn(worktreeTools, call.name) ||
@@ -1162,8 +1188,17 @@ export class AgentRunner {
           throw failed ? failure : new Error('已取消');
         }
       } else {
-        for (const [index, call] of reply!.calls.entries()) await executeCall(call, index);
+        for (const [index, call] of reply!.calls.entries()) {
+          if (askedQuestion)
+            this.store.append(session.id, 'tool_denied', {
+              callId: call.id,
+              name: call.name,
+              output: '任务已暂停等待用户答复，此工具尚未开始执行',
+            });
+          else await executeCall(call, index);
+        }
       }
+      if (askedQuestion) return;
       // Keep the original signal on started tools and hooks so a deadline cannot
       // release the turn while their side effects are still being recorded.
       checkBudget();

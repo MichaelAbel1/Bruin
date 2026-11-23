@@ -22,30 +22,39 @@ function fixture(gateway: ModelGateway) {
   const store = new SqliteEventStore(path.join(dir, 'db.sqlite'));
   const messages: any[] = [];
   let effects = 0;
-  const server = new AcpServer(
-    store,
-    {
-      async execute() {
-        effects++;
-        return { output: 'written', isError: false };
+  const connect = () =>
+    new AcpServer(
+      store,
+      {
+        async execute() {
+          effects++;
+          return { output: 'written', isError: false };
+        },
+        async close() {},
       },
-      async close() {},
-    },
-    (message) => messages.push(message),
-    undefined,
-    () => gateway,
-  );
+      (message) => messages.push(message),
+      undefined,
+      () => gateway,
+    );
+  let server = connect();
   let id = 0;
   return {
     dir,
     store,
-    server,
+    get server() {
+      return server;
+    },
     messages,
     effects: () => effects,
     async request(method: string, params: unknown) {
       const requestId = ++id;
       await server.handle({ jsonrpc: '2.0', id: requestId, method, params });
       return messages.find((message) => message.id === requestId);
+    },
+    async reconnect() {
+      await server.close();
+      messages.length = 0;
+      server = connect();
     },
     async close() {
       await server.close();
@@ -105,6 +114,86 @@ test('ACP checks uncertain effects before another prompt and honors an explicit 
     assert.equal(calls, 1);
     assert.equal(f.effects(), 0);
     assert.equal(f.store.isLeased(sessionId), false);
+  } finally {
+    await f.close();
+  }
+});
+
+test('ACP reloads a saved session after reconnect and preserves tool results and review gates', async () => {
+  let calls = 0;
+  const f = fixture({
+    async complete(_profile, messages) {
+      if (++calls === 1)
+        return {
+          text: '',
+          calls: [{ id: 'first-read', name: 'read_file', input: { path: 'file.txt' } }],
+        };
+      if (calls === 2) return { text: 'Initial answer.', calls: [] };
+      assert.match(JSON.stringify(messages), /Original task.*written.*Initial answer/s);
+      return { text: 'Continuing the original task.', calls: [] };
+    },
+  });
+  try {
+    fs.writeFileSync(path.join(f.dir, 'file.txt'), 'fixture');
+    await f.request('initialize', { protocolVersion: 1 });
+    const sessionId = (await f.request('session/new', { cwd: f.dir, mcpServers: [] })).result
+      .sessionId;
+    const send = (text: string) =>
+      f.request('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
+    assert.equal((await send('Original task')).result.stopReason, 'end_turn');
+    assert.equal(f.effects(), 1);
+    await f.reconnect();
+    assert.equal(
+      (await f.request('initialize', { protocolVersion: 1 })).result.agentCapabilities.loadSession,
+      true,
+    );
+
+    const other = path.join(f.dir, 'unrelated');
+    fs.mkdirSync(other);
+    assert.equal(
+      (await f.request('session/load', { sessionId, cwd: other, mcpServers: [] })).error.code,
+      -32602,
+    );
+    const load = () => f.request('session/load', { sessionId, cwd: f.dir, mcpServers: [] });
+    const snapshot = f.store.events(sessionId);
+    let previous: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const start = f.messages.length;
+      assert.deepEqual((await load()).result, {});
+      const replay = f.messages.slice(start, -1);
+      const text = JSON.stringify(replay);
+      assert.match(text, /Original task.*written.*Initial answer/s);
+      assert.doesNotMatch(text, /request_permission|rawInput/);
+      if (attempt) assert.deepEqual(replay, previous);
+      previous = replay;
+    }
+    assert.deepEqual(f.store.events(sessionId), snapshot);
+    assert.equal(calls, 2);
+    assert.equal(f.effects(), 1);
+
+    f.store.append(sessionId, 'assistant', {
+      calls: [{ id: 'interrupted', name: 'shell', input: { command: 'external side effect' } }],
+    });
+    f.store.append(sessionId, 'tool_started', {
+      callId: 'interrupted',
+      name: 'shell',
+      recovery: 'manual',
+    });
+    assert.match((await send('Resume')).error.message, /uncertain tool results/);
+    assert.equal(calls, 2);
+    const unknown = f.store.events(sessionId).at(-1)!;
+    assert.equal(unknown.type, 'tool_unknown');
+    f.store.append(sessionId, 'unknown_reviewed', { throughSeq: unknown.seq, source: 'desktop' });
+    assert.equal((await send('Resume')).result.stopReason, 'end_turn');
+    assert.equal(calls, 3);
+    assert.equal(f.effects(), 1);
+    assert.deepEqual(
+      f.store
+        .events(sessionId)
+        .filter((event) => event.type === 'user')
+        .map((event) => event.payload.text),
+      ['Original task', 'Resume'],
+    );
   } finally {
     await f.close();
   }
@@ -225,7 +314,7 @@ test('ACP negotiates v1, validates capabilities, preserves streams and records n
     assert.equal((await f.request('session/new', { cwd: '.', mcpServers: [] })).error.code, -32602);
     const created = await f.request('session/new', { cwd: f.dir, mcpServers: [] });
     const sessionId = created.result.sessionId;
-    assert.equal((await f.request('session/load', {})).error.code, -32601);
+    assert.equal((await f.request('session/load', {})).error.code, -32602);
     assert.equal(
       (await f.request('session/prompt', { sessionId, prompt: [{ type: 'image', data: 'x' }] }))
         .error.code,

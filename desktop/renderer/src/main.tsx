@@ -36,6 +36,12 @@ import { date } from './formatting.js';
 import { connectorTemplates } from './connectors.js';
 import type { AttachmentRef } from '../../../src/core/attachments.js';
 import type { PatchPreflight } from '../../../src/core/workspace-patch.js';
+import { pendingQuestion } from '../../../src/core/question.js';
+import {
+  memoryReviewTurns,
+  type MemoryReviewPreview,
+  type MemoryReviewTurn,
+} from '../../../src/core/memory-review.js';
 import './style.css';
 import { recordedUsage, recordedTokenLabel } from '../../../src/core/usage.js';
 import { pendingInputs } from '../../../src/core/input-queue.js';
@@ -80,12 +86,23 @@ type SessionView = {
   recoveredUnknown?: number;
   tasks?: TaskNode[];
 };
+type ComposerDraft = {
+  composer: string;
+  attachments: AttachmentRef[];
+  quote: { seq: number; text: string } | null;
+};
+const emptyDraft: ComposerDraft = { composer: '', attachments: [], quote: null };
+type FileDecision = {
+  paths: string[];
+  resolve: (choice: 'save' | 'discard' | 'cancel') => void;
+};
 type CronJob = {
   id: string;
   expression: string;
   prompt: string;
   nextRunAt: number;
   lastStatus?: string;
+  planSeq?: number;
 };
 type TaskNode = {
   id: string;
@@ -107,6 +124,7 @@ type Market = { name: string; source: string };
 type MarketEntry = { name: string; description: string; path: string };
 type Approval = {
   sessionId: string;
+  workspace?: string;
   approvalId: string;
   call: { name: string; input: Record<string, unknown> };
   reason: string;
@@ -139,6 +157,7 @@ type Config = {
 type HostEvent = {
   type: string;
   sessionId?: string;
+  workspace?: string;
   delta?: string;
   message?: string;
   events?: SessionEvent[];
@@ -184,17 +203,23 @@ function App() {
   const [sending, setSending] = useState(false);
   const [delivery, setDelivery] = useState<'steer' | 'follow-up'>('steer');
   const [stream, setStream] = useState('');
-  const [composer, setComposer] = useState('');
+  const [drafts, setDrafts] = useState(new Map<string, Map<string, ComposerDraft>>());
   const [maxModelCalls, setMaxModelCalls] = useState<24 | 96 | 240 | 480>(24);
   const [allowWorkspaceEdits, setAllowWorkspaceEdits] = useState(false);
   const [unattended, setUnattended] = useState(false);
-  const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
-  const [quote, setQuote] = useState<{ seq: number; text: string } | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [approvalScope, setApprovalScope] = useState<ApprovalScope>('once');
   const [sessionApprovedCommands, setSessionApprovedCommands] = useState<[string, string][]>([]);
   const [dialog, setDialog] = useState<
-    'model' | 'new' | 'skills' | 'appearance' | 'runtime' | 'preferences' | 'approvals' | null
+    | 'model'
+    | 'new'
+    | 'skills'
+    | 'appearance'
+    | 'runtime'
+    | 'preferences'
+    | 'approvals'
+    | 'memory'
+    | null
   >(null);
   const [iconBackground, setIconBackground] = useState('white');
   const [uiTheme, setUiTheme] = useState<'light' | 'dark'>('light');
@@ -205,6 +230,11 @@ function App() {
   const [filesOpen, setFilesOpen] = useState(false);
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
   const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [savingFile, setSavingFile] = useState(false);
+  const fileOperation = useRef(false);
+  const [fileTransitioning, setFileTransitioning] = useState(false);
+  const [fileDecision, setFileDecision] = useState<FileDecision | null>(null);
+  const allowWindowClose = useRef(false);
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [modelLoading, setModelLoading] = useState(false);
@@ -217,6 +247,24 @@ function App() {
   const autoScrollRef = useRef(true);
   const isCurrentView = (revision: number, sessionId: string) =>
     viewRevision.current === revision && selected.current === sessionId;
+  const draft = (view && drafts.get(view.session.id)?.get(view.session.workspace)) ?? emptyDraft;
+  const { composer, attachments, quote } = draft;
+
+  function updateDraft(session: Session, update: (previous: ComposerDraft) => ComposerDraft) {
+    setDrafts((previous) => {
+      const workspaces = new Map(previous.get(session.id));
+      const before = workspaces.get(session.workspace) ?? emptyDraft;
+      const next = update(before);
+      if (before === next) return previous;
+      if (next.composer || next.attachments.length || next.quote)
+        workspaces.set(session.workspace, next);
+      else workspaces.delete(session.workspace);
+      const result = new Map(previous);
+      if (workspaces.size) result.set(session.id, workspaces);
+      else result.delete(session.id);
+      return result;
+    });
+  }
 
   const fail = (err: unknown) => {
     setError(err instanceof Error ? err.message : String(err));
@@ -226,16 +274,30 @@ function App() {
     setSessions(await api<Session[]>('listSessions'));
   }
   async function deleteSession(id: string) {
-    try {
+    async function remove() {
       const remaining = await api<Session[]>('deleteSession', { sessionId: id });
       setSessions(remaining);
       setDeletingSession(null);
-      if (selected.current === id) {
-        viewRevision.current++;
-        selected.current = null;
-        setView(null);
-        if (remaining[0]) await openSession(remaining[0].id);
-      }
+      setDrafts((previous) => {
+        const result = new Map(previous);
+        result.delete(id);
+        return result;
+      });
+      if (selected.current !== id) return;
+      viewRevision.current++;
+      selected.current = null;
+      setView(null);
+      setOpenFiles([]);
+      setActiveFile(null);
+      if (remaining[0])
+        showSession(await api<SessionView>('openSession', { sessionId: remaining[0].id }));
+    }
+    if (selected.current === id) {
+      await protectFileEdits(remove);
+      return;
+    }
+    try {
+      await remove();
     } catch (err) {
       fail(err);
     }
@@ -246,8 +308,6 @@ function App() {
     setView(result);
     setOpenFiles([]);
     setActiveFile(null);
-    setAttachments([]);
-    setQuote(null);
     setMaxModelCalls(24);
     setAllowWorkspaceEdits(false);
     setUnattended(false);
@@ -256,32 +316,28 @@ function App() {
     if (result.recoveredUnknown)
       setNotice(`已发现 ${result.recoveredUnknown} 个结果未知的工具调用，请检查工作区。`);
   }
-  async function createNewSession(customWorkspace?: string) {
+  async function createNewSession(workspace = '', profileAlias?: string) {
+    if (busy) return;
     if (!config.profiles.length) {
       setDialog('model');
       return;
     }
-    try {
-      setBusy(false);
-      const alias = config.defaultProfile ?? config.profiles[0]?.alias ?? '';
-      const workspace = customWorkspace ?? '';
+    await protectFileEdits(async () => {
+      const alias = profileAlias ?? config.defaultProfile ?? config.profiles[0]?.alias ?? '';
       const result = await api<SessionView>('createSession', { workspace, profileAlias: alias });
       setSessions((previous) => [result.session, ...previous]);
       viewRevision.current++;
       showSession(result);
-    } catch (err) {
-      fail(err);
-    }
+      setDialog(null);
+    });
   }
   async function openSession(id: string) {
-    const revision = ++viewRevision.current;
-    try {
+    if (id === selected.current) return;
+    await protectFileEdits(async () => {
+      viewRevision.current++;
       const result = await api<SessionView>('openSession', { sessionId: id });
-      if (viewRevision.current !== revision) return;
       showSession(result);
-    } catch (err) {
-      if (viewRevision.current === revision) fail(err);
-    }
+    });
   }
   async function refreshView(method: string, params: Record<string, unknown> = {}) {
     if (!view) return false;
@@ -296,9 +352,8 @@ function App() {
       throw error;
     }
   }
-  const [savingFile, setSavingFile] = useState(false);
   async function openFile(path: string, review = false) {
-    if (!view) return;
+    if (!view || fileOperation.current) return;
     const revision = viewRevision.current;
     try {
       const file = await api<{
@@ -311,7 +366,7 @@ function App() {
         sessionId: view.session.id,
         path,
       });
-      if (!isCurrentView(revision, view.session.id)) return;
+      if (!isCurrentView(revision, view.session.id) || fileOperation.current) return;
       setOpenFiles((current) => {
         const existing = current.find((item) => item.path === path);
         // Keep the original save precondition while the editor has unsaved changes.
@@ -336,36 +391,74 @@ function App() {
     }
   }
 
-  async function saveFile(file: OpenFile) {
-    if (!view || savingFile) return;
-    if (file.readOnlyReason) return;
+  async function persistFile(file: OpenFile) {
+    if (!view) throw new Error('未打开会话');
+    if (file.readOnlyReason) throw new Error(file.readOnlyReason);
+    if (file.truncated) throw new Error('截断预览不能覆盖保存，请使用外部编辑器修改完整文件。');
     const revision = viewRevision.current;
-    if (file.truncated) {
-      setNotice('截断预览不能覆盖保存，请使用外部编辑器修改完整文件。');
-      return;
-    }
+    await api('writeWorkspaceFile', {
+      sessionId: view.session.id,
+      path: file.path,
+      content: file.content,
+      expectedContent: file.originalContent,
+    });
+    if (!isCurrentView(revision, view.session.id)) return;
+    setOpenFiles((current) =>
+      current.map((item) =>
+        item.path === file.path && item.originalContent === file.originalContent
+          ? { ...item, originalContent: file.content }
+          : item,
+      ),
+    );
+    setNotice(`已保存 ${short(file.path)}`);
+  }
+
+  async function saveFile(file: OpenFile) {
+    if (fileOperation.current) return;
+    fileOperation.current = true;
+    setSavingFile(true);
     try {
-      setSavingFile(true);
-      await api('writeWorkspaceFile', {
-        sessionId: view.session.id,
-        path: file.path,
-        content: file.content,
-        expectedContent: file.originalContent,
-      });
-      if (!isCurrentView(revision, view.session.id)) return;
-      setOpenFiles((current) =>
-        current.map((item) =>
-          item.path === file.path && item.originalContent === file.originalContent
-            ? { ...item, originalContent: file.content }
-            : item,
-        ),
-      );
-      setNotice(`已保存 ${short(file.path)}`);
+      await persistFile(file);
     } catch (err) {
-      if (isCurrentView(revision, view.session.id)) fail(err);
+      fail(err);
     } finally {
+      fileOperation.current = false;
       setSavingFile(false);
     }
+  }
+
+  async function protectFileEdits(action: () => void | Promise<void>, path?: string) {
+    if (fileOperation.current || sending) return;
+    fileOperation.current = true;
+    setFileTransitioning(true);
+    try {
+      const dirty = openFiles.filter(
+        (file) =>
+          (path === undefined || file.path === path) && file.content !== file.originalContent,
+      );
+      if (dirty.length) {
+        const choice = await new Promise<'save' | 'discard' | 'cancel'>((resolve) =>
+          setFileDecision({ paths: dirty.map((file) => file.path), resolve }),
+        );
+        if (choice === 'cancel') return;
+        if (choice === 'save') {
+          for (const file of dirty) await persistFile(file);
+        }
+      }
+      await action();
+    } catch (err) {
+      fail(err);
+    } finally {
+      fileOperation.current = false;
+      setFileTransitioning(false);
+    }
+  }
+
+  function closeFile(path: string) {
+    void protectFileEdits(() => {
+      setOpenFiles((current) => current.filter((file) => file.path !== path));
+      setActiveFile((current) => (current === path ? null : current));
+    }, path);
   }
 
   function revertFile(file: OpenFile) {
@@ -388,28 +481,55 @@ function App() {
     );
   }
   async function changeWorkspace() {
-    if (!view || busy) return;
-    let revision = viewRevision.current;
+    if (!view || busy || fileOperation.current || sending) return;
+    const revision = viewRevision.current;
     try {
       const workspace = await api<string | null>('chooseWorkspace');
-      if (!workspace || !isCurrentView(revision, view.session.id)) return;
-      revision = ++viewRevision.current;
-      const next = await api<SessionView>('setWorkspace', {
-        sessionId: view.session.id,
-        workspace,
+      if (
+        !workspace ||
+        (workspace === view.session.workspace && !view.session.managedWorkspace) ||
+        !isCurrentView(revision, view.session.id)
+      )
+        return;
+      await protectFileEdits(async () => {
+        viewRevision.current++;
+        const next = await api<SessionView>('setWorkspace', {
+          sessionId: view.session.id,
+          workspace,
+        });
+        setView(next);
+        if (next.session.workspace !== view.session.workspace) {
+          viewRevision.current++;
+          setOpenFiles([]);
+          setActiveFile(null);
+        }
+        await refreshSessions();
       });
-      if (!isCurrentView(revision, view.session.id)) return;
-      viewRevision.current++;
-      setView(next);
-      setOpenFiles([]);
-      setActiveFile(null);
-      setAttachments([]);
-      setQuote(null);
-      await refreshSessions();
     } catch (err) {
       if (isCurrentView(revision, view.session.id)) fail(err);
     }
   }
+  useEffect(() => {
+    function beforeUnload(event: BeforeUnloadEvent) {
+      if (allowWindowClose.current) {
+        allowWindowClose.current = false;
+        return;
+      }
+      if (
+        !fileOperation.current &&
+        !openFiles.some((file) => file.content !== file.originalContent)
+      )
+        return;
+      event.preventDefault();
+      event.returnValue = '';
+      void protectFileEdits(() => {
+        allowWindowClose.current = true;
+        window.close();
+      });
+    }
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => window.removeEventListener('beforeunload', beforeUnload);
+  });
   useEffect(() => {
     let disposed = false;
     void api<{ iconBackground: string; uiTheme: 'light' | 'dark' }>('getAppearance')
@@ -445,6 +565,7 @@ function App() {
       if (message.type === 'hostExited') {
         fail(new Error('Agent 后台进程已退出，请重新启动 Bruin'));
         setBusy(false);
+        setApproval(null);
         return;
       }
       if (message.type === 'approval' && message.approvalId && message.call && message.sessionId) {
@@ -453,11 +574,13 @@ function App() {
           approvalId: message.approvalId,
           call: message.call,
           sessionId: message.sessionId,
+          workspace: message.workspace,
           reason: message.reason ?? '',
         });
         return;
       }
       if (message.type === 'runFinished' || message.type === 'runFailed') {
+        setApproval((current) => (current?.sessionId === message.sessionId ? null : current));
         setMaxModelCalls(24);
         setAllowWorkspaceEdits(false);
         setUnattended(false);
@@ -480,7 +603,6 @@ function App() {
       if (message.type === 'runFinished' || message.type === 'runFailed') {
         setBusy(false);
         setStream('');
-        setApproval(null);
         if (message.events)
           setView((previous) =>
             acceptsEventSnapshot(previous, message.sessionId!, message.events!)
@@ -557,80 +679,69 @@ function App() {
   }, [view?.events.length, stream, notice, approval]);
 
   async function send() {
-    if (!view || (!composer.trim() && !attachments.length && !quote) || sending || view.needsReview)
+    if (
+      !view ||
+      pendingQuestion(view.events) ||
+      (!composer.trim() && !attachments.length && !quote) ||
+      sending ||
+      fileOperation.current ||
+      view.needsReview
+    )
       return;
-    if (busy) {
-      const text = composer.trim();
-      const sessionId = view.session.id;
-      const revision = viewRevision.current;
-      setSending(true);
-      try {
-        const result = await api<{ queued?: boolean; events?: SessionEvent[] }>('send', {
-          sessionId,
-          prompt: text,
-          attachments: attachments.map((item) => item.id),
-          quoteSeq: quote?.seq,
-          delivery,
-        });
-        if (!isCurrentView(revision, sessionId)) return;
-        setComposer('');
-        setAttachments([]);
-        setQuote(null);
-        if (result.events)
-          setView((previous) =>
-            acceptsEventSnapshot(previous, sessionId, result.events!)
-              ? { ...previous!, events: result.events! }
-              : previous,
-          );
-        setNotice(result.queued ? '消息已排队，将在安全边界处理。' : '消息已开始处理。');
-      } catch (err) {
-        if (isCurrentView(revision, sessionId)) fail(err);
-      } finally {
-        setSending(false);
-      }
-      return;
-    }
-    autoScrollRef.current = true;
+    const { session } = view;
+    const revision = viewRevision.current;
     const text = composer.trim();
-    const submittedAttachments = attachments;
-    const submittedQuote = quote;
-    setComposer('');
-    setAttachments([]);
-    setQuote(null);
-    setBusy(true);
-    setView((previous) =>
-      previous
-        ? {
-            ...previous,
-            events: [
-              ...previous.events,
-              {
-                seq: -Date.now(),
-                type: 'user',
-                at: new Date().toISOString(),
-                payload: { text, attachments: submittedAttachments, quote: submittedQuote },
-              },
-            ],
-          }
-        : previous,
-    );
+    const optimistic: SessionEvent = {
+      seq: -Date.now(),
+      type: 'user',
+      at: new Date().toISOString(),
+      payload: { text, attachments, quote },
+    };
+    setSending(true);
+    if (!busy) {
+      autoScrollRef.current = true;
+      setBusy(true);
+      setView((previous) =>
+        previous ? { ...previous, events: [...previous.events, optimistic] } : previous,
+      );
+    }
     try {
-      await api('send', {
-        sessionId: view.session.id,
+      const result = await api<{ queued?: boolean; events?: SessionEvent[] }>('send', {
+        sessionId: session.id,
         prompt: text,
-        attachments: submittedAttachments.map((item) => item.id),
-        quoteSeq: submittedQuote?.seq,
-        maxModelCalls,
-        allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
-        unattended: maxModelCalls > 24 && unattended,
+        attachments: attachments.map((item) => item.id),
+        quoteSeq: quote?.seq,
+        ...(busy
+          ? { delivery }
+          : {
+              maxModelCalls,
+              allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+              unattended: maxModelCalls > 24 && unattended,
+            }),
       });
+      updateDraft(session, (current) => (current === draft ? emptyDraft : current));
+      if (!busy || !isCurrentView(revision, session.id)) return;
+      if (result.events)
+        setView((previous) =>
+          acceptsEventSnapshot(previous, session.id, result.events!)
+            ? { ...previous!, events: result.events! }
+            : previous,
+        );
+      setNotice(result.queued ? '消息已排队，将在安全边界处理。' : '消息已开始处理。');
     } catch (err) {
-      setBusy(false);
-      await openSession(view.session.id);
-      setComposer(text);
-      setAttachments(submittedAttachments);
-      setQuote(submittedQuote);
+      if (!isCurrentView(revision, session.id)) return;
+      if (!busy) {
+        setBusy(false);
+        setView((previous) =>
+          previous
+            ? { ...previous, events: previous.events.filter((event) => event !== optimistic) }
+            : previous,
+        );
+        await refreshView('openSession').catch(fail);
+      }
       fail(err);
+    } finally {
+      setSending(false);
     }
   }
   async function chooseAttachments(kind: 'file' | 'folder') {
@@ -641,16 +752,20 @@ function App() {
         sessionId: view.session.id,
         kind,
       });
-      if (isCurrentView(revision, view.session.id))
-        setAttachments((current) => [...current, ...imported].slice(0, 30));
+      if (imported.length && isCurrentView(revision, view.session.id))
+        updateDraft(view.session, (current) => ({
+          ...current,
+          attachments: [...current.attachments, ...imported].slice(0, 30),
+        }));
     } catch (err) {
       if (isCurrentView(revision, view.session.id)) fail(err);
     }
   }
   async function cancel() {
-    if (view)
+    const sessionId = approval?.sessionId ?? view?.session.id;
+    if (sessionId)
       try {
-        await api('cancel', { sessionId: view.session.id });
+        await api('cancel', { sessionId });
       } catch (err) {
         fail(err);
       }
@@ -663,7 +778,7 @@ function App() {
         approved,
         scope: approvalScope,
       });
-      setApproval(null);
+      setApproval((current) => (current?.approvalId === approval.approvalId ? null : current));
       if (approved && approvalScope !== 'once') {
         const settings = await api<{ config: Config; sessionCommands: [string, string][] }>(
           'getApprovalSettings',
@@ -749,7 +864,9 @@ function App() {
     }
   }
   const usage = useMemo(() => recordedUsage(view?.events ?? []), [view?.events]);
+  const reviewTurns = useMemo(() => memoryReviewTurns(view?.events ?? []), [view?.events]);
   const currentTurn = turnState(view?.events ?? []);
+  const question = pendingQuestion(view?.events ?? []);
   const canResume = Boolean(view && !busy && canResumeTurn(view.events));
   const resumeLabel =
     currentTurn === 'paused'
@@ -760,7 +877,7 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} inert={fileTransitioning}>
         <div className="brand">
           <div className="brand-mark">
             <Code2 size={21} strokeWidth={2.4} />
@@ -770,10 +887,9 @@ function App() {
         </div>
         <button
           className="new-task"
-          onClick={() => {
-            void createNewSession();
-            setSidebarOpen(false);
-          }}
+          disabled={busy}
+          title={busy ? '当前任务完成后可新建会话' : undefined}
+          onClick={() => void createNewSession()}
         >
           <Plus size={18} /> 新建会话
         </button>
@@ -858,7 +974,7 @@ function App() {
           </button>
         </div>
       </aside>
-      <main className="main-area">
+      <main className="main-area" inert={fileTransitioning}>
         <header className="topbar">
           <button
             className="mobile-menu icon-button"
@@ -885,6 +1001,17 @@ function App() {
             <strong>{view ? short(view.session.workspace) : '欢迎使用 Bruin'}</strong>
           </div>
           <div className="header-actions">
+            {view && (
+              <button
+                className="icon-button"
+                title="整理会话记忆"
+                aria-label="整理会话记忆"
+                disabled={busy || !reviewTurns.length}
+                onClick={() => setDialog('memory')}
+              >
+                <Sparkles size={17} />
+              </button>
+            )}
             {view && (
               <button
                 className="workspace-path workspace-switch"
@@ -937,10 +1064,8 @@ function App() {
                   </button>
                   <button
                     aria-label={`关闭 ${file.path}`}
-                    onClick={() => {
-                      setOpenFiles((current) => current.filter((item) => item.path !== file.path));
-                      if (activeFile === file.path) setActiveFile(null);
-                    }}
+                    disabled={savingFile}
+                    onClick={() => closeFile(file.path)}
                   >
                     <X size={13} />
                   </button>
@@ -969,7 +1094,7 @@ function App() {
               连接你熟悉的模型，新建会话后即可开始协作。Bruin
               会记录会话、展示工具操作，并在修改文件前征求许可。
             </p>
-            <button className="primary" onClick={() => void createNewSession()}>
+            <button className="primary" disabled={busy} onClick={() => void createNewSession()}>
               <Plus size={17} />
               {config.profiles.length ? '新建会话' : '先配置一个模型'}
             </button>
@@ -1125,12 +1250,16 @@ function App() {
                     <EventCard
                       key={item.event.seq}
                       event={item.event}
-                      onQuote={(selected) =>
-                        setQuote({
-                          seq: selected.seq,
-                          text: String(selected.payload.text ?? '').slice(0, 4000),
-                        })
-                      }
+                      onQuote={(selected) => {
+                        if (!sending)
+                          updateDraft(view.session, (current) => ({
+                            ...current,
+                            quote: {
+                              seq: selected.seq,
+                              text: String(selected.payload.text ?? '').slice(0, 4000),
+                            },
+                          }));
+                      }}
                     />
                   ),
                 )}
@@ -1182,13 +1311,37 @@ function App() {
               />
             </div>
             <div className="composer-wrap">
+              {question && (
+                <QuestionReply
+                  key={question.id}
+                  question={question.text}
+                  disabled={busy || view.needsReview}
+                  answer={(text) =>
+                    api('answerQuestion', {
+                      sessionId: view.session.id,
+                      questionId: question.id,
+                      text,
+                      maxModelCalls,
+                      allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+                      unattended: maxModelCalls > 24 && unattended,
+                    })
+                  }
+                  finish={() => void finishPausedTurn()}
+                  fail={fail}
+                />
+              )}
               <div className="composer">
                 {(quote || attachments.length > 0) && (
-                  <div className="composer-context">
+                  <div className="composer-context" inert={sending}>
                     {quote && (
                       <span className="composer-chip">
                         <MessageSquare size={13} /> 引用：{quote.text.slice(0, 60) || '消息'}
-                        <button aria-label="移除引用" onClick={() => setQuote(null)}>
+                        <button
+                          aria-label="移除引用"
+                          onClick={() =>
+                            updateDraft(view.session, (current) => ({ ...current, quote: null }))
+                          }
+                        >
                           <X size={13} />
                         </button>
                       </span>
@@ -1201,9 +1354,12 @@ function App() {
                         <button
                           aria-label={`移除 ${item.name}`}
                           onClick={() =>
-                            setAttachments((current) =>
-                              current.filter((file) => file.id !== item.id),
-                            )
+                            updateDraft(view.session, (current) => ({
+                              ...current,
+                              attachments: current.attachments.filter(
+                                (file) => file.id !== item.id,
+                              ),
+                            }))
                           }
                         >
                           <X size={13} />
@@ -1214,7 +1370,10 @@ function App() {
                 )}
                 <textarea
                   value={composer}
-                  onChange={(e) => setComposer(e.target.value)}
+                  onChange={(e) => {
+                    const composer = e.target.value;
+                    updateDraft(view.session, (current) => ({ ...current, composer }));
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                       e.preventDefault();
@@ -1228,7 +1387,7 @@ function App() {
                         ? '补充指令或排队下一项任务…'
                         : '给 Bruin 一个任务…'
                   }
-                  disabled={view.needsReview || sending}
+                  disabled={Boolean(question) || view.needsReview || sending}
                 />
                 {pendingInputs(view.events).length > 0 && (
                   <div className="composer-queue" role="status">
@@ -1300,7 +1459,7 @@ function App() {
                       className="composer-action-btn"
                       title="添加图片、文档或文件"
                       aria-label="添加文件"
-                      disabled={busy}
+                      disabled={busy || sending}
                       onClick={() => void chooseAttachments('file')}
                     >
                       <Paperclip size={16} />
@@ -1310,7 +1469,7 @@ function App() {
                       className="composer-action-btn"
                       title="添加文件夹"
                       aria-label="添加文件夹"
-                      disabled={busy}
+                      disabled={busy || sending}
                       onClick={() => void chooseAttachments('folder')}
                     >
                       <FolderOpen size={16} />
@@ -1465,6 +1624,7 @@ function App() {
                       className="send-button"
                       title={busy ? '发送到队列 (⌘/Ctrl + Enter)' : '发送 (⌘/Ctrl + Enter)'}
                       disabled={
+                        Boolean(question) ||
                         sending ||
                         (!composer.trim() && !attachments.length && !quote) ||
                         view.needsReview
@@ -1501,6 +1661,9 @@ function App() {
                   <h2>允许 Bruin 执行此操作？</h2>
                 </div>
               </div>
+              <p title={approval.workspace}>
+                {approval.workspace ?? '工作区路径未提供'} · 会话 {approval.sessionId.slice(0, 8)}
+              </p>
               <p>{approval.reason}</p>
               <div className="approval-name">
                 <Terminal size={15} />
@@ -1632,12 +1795,7 @@ function App() {
           profiles={config.profiles}
           defaultProfile={config.defaultProfile}
           close={() => setDialog(null)}
-          created={(result) => {
-            setDialog(null);
-            setSessions((previous) => [result.session, ...previous]);
-            viewRevision.current++;
-            showSession(result);
-          }}
+          create={createNewSession}
           fail={fail}
           openModels={() => setDialog('model')}
         />
@@ -1685,12 +1843,38 @@ function App() {
           key={view ? `${view.session.id}:${view.session.workspace}` : undefined}
           config={config}
           session={view?.session}
+          approvedPlanSeq={
+            view?.plan.enabled && view.plan.approved
+              ? [...view.events].reverse().find((event) => event.type === 'plan_updated')?.seq
+              : undefined
+          }
           close={() => setDialog(null)}
           changed={setConfig}
           fail={fail}
         />
       )}
       {dialog === 'preferences' && <PreferencesDialog close={() => setDialog(null)} fail={fail} />}
+      {dialog === 'memory' && view && (
+        <MemoryReviewDialog
+          key={`${view.session.id}:${view.session.workspace}`}
+          session={view.session}
+          turns={reviewTurns}
+          close={() => setDialog(null)}
+          saved={() => {
+            setNotice('工作区记忆已保存');
+            void refreshView('openSession').catch(fail);
+          }}
+        />
+      )}
+      {fileDecision && (
+        <UnsavedFilesDialog
+          paths={fileDecision.paths}
+          choose={(choice) => {
+            setFileDecision(null);
+            fileDecision.resolve(choice);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1896,6 +2080,145 @@ function PreferencesDialog({ close, fail }: { close: () => void; fail: (error: u
   );
 }
 
+function MemoryReviewDialog({
+  session,
+  turns,
+  close,
+  saved,
+}: {
+  session: Session;
+  turns: MemoryReviewTurn[];
+  close: () => void;
+  saved: () => void;
+}) {
+  const [endSeq, setEndSeq] = useState(turns.at(-1)?.endSeq);
+  const [preview, setPreview] = useState<MemoryReviewPreview>();
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const [status, setStatus] = useState('');
+
+  async function generate() {
+    setPreview(undefined);
+    setError('');
+    setStatus('');
+    setPending(true);
+    try {
+      setPreview(
+        await api<MemoryReviewPreview>('previewMemoryReview', { sessionId: session.id, endSeq }),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function confirm(key: string) {
+    if (!preview) return;
+    setError('');
+    setPending(true);
+    try {
+      const result = await api<{ output: string; isError: boolean }>('confirmMemoryCandidate', {
+        sessionId: session.id,
+        reviewId: preview.id,
+        key,
+      });
+      if (result.isError) throw new Error(result.output);
+      setPreview({ ...preview, candidates: preview.candidates.filter((item) => item.key !== key) });
+      setStatus(`已保存 ${key}`);
+      saved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function discard() {
+    if (pending) return;
+    setPending(true);
+    try {
+      if (preview)
+        await api('discardMemoryReview', { sessionId: session.id, reviewId: preview.id });
+      close();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setPending(false);
+    }
+  }
+
+  return (
+    <Modal title="整理会话记忆" eyebrow="工作区记忆" close={() => void discard()}>
+      <div className="form-stack">
+        <label htmlFor="memory-review-turn">选择已结束的回合</label>
+        <select
+          id="memory-review-turn"
+          value={endSeq}
+          disabled={pending || Boolean(preview?.candidates.length)}
+          onChange={(event) => setEndSeq(Number(event.target.value))}
+        >
+          {[...turns].reverse().map((turn) => (
+            <option key={turn.endSeq} value={turn.endSeq}>
+              {date(turn.at)} · {turn.label || `回合 #${turn.endSeq}`}
+            </option>
+          ))}
+        </select>
+        <p className="form-help">
+          使用当前模型整理本轮的消息和命令结果。保存的记忆供此工作区的后续会话查阅。
+        </p>
+      </div>
+      {error && <p role="alert">{error}</p>}
+      {status && <p role="status">{status}</p>}
+      {preview && !preview.candidates.length && !status && <p>本轮没有可保存的记忆候选。</p>}
+      {preview?.candidates.map((item) => (
+        <section className="memory-candidate" key={item.key}>
+          <strong>{item.key}</strong>
+          {item.previousContent !== undefined && (
+            <details open>
+              <summary>现有记忆</summary>
+              <div className="memory-candidate-text">{item.previousContent}</div>
+            </details>
+          )}
+          {item.previousContent !== undefined && <small>拟保存内容</small>}
+          <div className="memory-candidate-text">{item.content}</div>
+          <details open>
+            <summary>原始证据</summary>
+            <small>会话 {session.id}</small>
+            <ul>
+              {item.evidence.map((evidence) => (
+                <li key={evidence.seq}>
+                  <div>
+                    #{evidence.seq} ·{' '}
+                    {evidence.kind === 'user'
+                      ? '用户消息'
+                      : `命令 #${evidence.commandSeq} · 退出码 ${evidence.exitCode}${evidence.isError ? ' · 执行失败' : ''}`}
+                  </div>
+                  <div className="memory-candidate-text">{evidence.text}</div>
+                </li>
+              ))}
+            </ul>
+          </details>
+          <button className="secondary" disabled={pending} onClick={() => void confirm(item.key)}>
+            {item.previousContent === undefined ? '确认保存' : '确认更新'}
+          </button>
+        </section>
+      ))}
+      <div className="modal-actions">
+        <button className="secondary" disabled={pending} onClick={() => void discard()}>
+          {preview?.candidates.length ? '放弃未保存候选' : '关闭'}
+        </button>
+        <button
+          className="primary"
+          disabled={pending || endSeq === undefined}
+          onClick={() => void generate()}
+        >
+          {pending ? '处理中…' : preview ? '重新生成' : '生成候选'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function Modal({
   title,
   eyebrow,
@@ -1929,17 +2252,111 @@ function Modal({
     </div>
   );
 }
+
+function UnsavedFilesDialog({
+  paths,
+  choose,
+}: {
+  paths: string[];
+  choose: FileDecision['resolve'];
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    dialog.current?.showModal();
+  }, []);
+  return (
+    <dialog
+      ref={dialog}
+      className="modal unsaved-files-dialog"
+      aria-labelledby="unsaved-files-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        choose('cancel');
+      }}
+    >
+      <h2 id="unsaved-files-title">文件有未保存的修改</h2>
+      <ul>
+        {paths.map((path) => (
+          <li key={path}>{path}</li>
+        ))}
+      </ul>
+      <div className="modal-actions">
+        <button autoFocus className="secondary" onClick={() => choose('cancel')}>
+          取消
+        </button>
+        <button className="secondary" onClick={() => choose('discard')}>
+          放弃修改
+        </button>
+        <button className="primary" onClick={() => choose('save')}>
+          保存并继续
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
 type PatchCandidate = { id: string; prompt: string; baseCommit: string; running: boolean };
+
+function QuestionReply({
+  question,
+  disabled,
+  answer,
+  finish,
+  fail,
+}: {
+  question: string;
+  disabled: boolean;
+  answer: (text: string) => Promise<unknown>;
+  finish: () => void;
+  fail: (error: unknown) => void;
+}) {
+  const [text, setText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  return (
+    <form
+      className="composer"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (disabled || submitting || !text.trim()) return;
+        setSubmitting(true);
+        void answer(text)
+          .catch(fail)
+          .finally(() => setSubmitting(false));
+      }}
+    >
+      <label>
+        {question}
+        <textarea
+          aria-label="答复待答问题"
+          value={text}
+          maxLength={10_000}
+          onChange={(event) => setText(event.target.value)}
+          disabled={disabled || submitting}
+        />
+      </label>
+      <div className="runtime-row">
+        <button type="submit" disabled={disabled || submitting || !text.trim()}>
+          答复并继续
+        </button>
+        <button type="button" disabled={disabled || submitting} onClick={finish}>
+          结束任务
+        </button>
+      </div>
+    </form>
+  );
+}
 
 function RuntimeDialog({
   config,
   session,
+  approvedPlanSeq,
   close,
   changed,
   fail,
 }: {
   config: Config;
   session?: Session;
+  approvedPlanSeq?: number;
   close: () => void;
   changed: (next: Config) => void;
   fail: (error: unknown) => void;
@@ -1975,6 +2392,7 @@ function RuntimeDialog({
   const [taskId, setTaskId] = useState('');
   const [cronExpression, setCronExpression] = useState('0 9 * * *');
   const [cronPrompt, setCronPrompt] = useState('');
+  const [cronPlanSeq, setCronPlanSeq] = useState<number>();
   const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
   const [taskTitle, setTaskTitle] = useState('');
   const [taskDescription, setTaskDescription] = useState('');
@@ -2127,9 +2545,11 @@ function RuntimeDialog({
         sessionId: session.id,
         expression: cronExpression,
         prompt: cronPrompt,
+        planSeq: cronPlanSeq,
       });
       setCronJobs(await api<CronJob[]>('listCronJobs', { sessionId: session.id }));
       setCronPrompt('');
+      setCronPlanSeq(undefined);
     } catch (error) {
       fail(error);
     } finally {
@@ -2476,6 +2896,7 @@ function RuntimeDialog({
             <span>
               <strong>{job.expression}</strong> · {job.prompt} · 下次{' '}
               {new Date(job.nextRunAt).toLocaleString('zh-CN')} · {job.lastStatus ?? '待执行'}
+              {job.planSeq !== undefined && ` · 计划版本 #${job.planSeq}`}
             </span>
             <button disabled={working} onClick={() => void removeCron(job.id)}>
               删除
@@ -2490,9 +2911,26 @@ function RuntimeDialog({
           到点发送给 Agent 的消息
           <input value={cronPrompt} onChange={(e) => setCronPrompt(e.target.value)} />
         </label>
+        {(approvedPlanSeq !== undefined || cronPlanSeq !== undefined) && (
+          <label className="checkbox-line">
+            <input
+              type="checkbox"
+              checked={cronPlanSeq !== undefined}
+              onChange={(e) => setCronPlanSeq(e.target.checked ? approvedPlanSeq : undefined)}
+            />
+            {cronPlanSeq !== undefined && cronPlanSeq !== approvedPlanSeq
+              ? `计划版本 #${cronPlanSeq} 已变更，请取消勾选后重新选择`
+              : `关联已批准计划版本 #${approvedPlanSeq}`}
+          </label>
+        )}
         <button
           className="secondary"
-          disabled={working || !session || !cronPrompt.trim()}
+          disabled={
+            working ||
+            !session ||
+            !cronPrompt.trim() ||
+            (cronPlanSeq !== undefined && cronPlanSeq !== approvedPlanSeq)
+          }
           onClick={() => void createCron()}
         >
           添加定时任务
@@ -2840,14 +3278,14 @@ function NewSessionDialog({
   profiles,
   defaultProfile,
   close,
-  created,
+  create,
   fail,
   openModels,
 }: {
   profiles: Profile[];
   defaultProfile?: string;
   close: () => void;
-  created: (result: SessionView) => void;
+  create: (workspace: string, alias: string) => Promise<void>;
   fail: (e: unknown) => void;
   openModels: () => void;
 }) {
@@ -2862,10 +3300,10 @@ function NewSessionDialog({
       fail(err);
     }
   }
-  async function create() {
+  async function submit() {
     try {
       setSaving(true);
-      created(await api<SessionView>('createSession', { workspace, profileAlias: alias }));
+      await create(workspace, alias);
     } catch (err) {
       fail(err);
     } finally {
@@ -2907,7 +3345,7 @@ function NewSessionDialog({
           <button className="secondary" onClick={close}>
             取消
           </button>
-          <button className="primary" disabled={!alias || saving} onClick={() => void create()}>
+          <button className="primary" disabled={!alias || saving} onClick={() => void submit()}>
             {saving ? '创建中…' : '创建会话'}
           </button>
         </div>

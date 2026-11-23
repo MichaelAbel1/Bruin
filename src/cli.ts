@@ -37,6 +37,7 @@ import type { ModelProfile, ProviderKind, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
 import { createSubagentRunner } from './runtime/subagent.js';
 import { canResumeTurn, turnState } from './core/turn-state.js';
+import { pendingQuestion, recordQuestionAnswer } from './core/question.js';
 import { runService } from './runtime/service.js';
 import { toolsForMode, toolDefinitions } from './core/tools.js';
 import { recoverSession } from './core/recovery.js';
@@ -46,7 +47,7 @@ const help = `Bruin — local coding agent
 
 bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV] [--context-tokens N]
 bruin model list | default ALIAS
-bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [PROMPT]
+bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--answer QUESTION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [PROMPT]
 bruin sessions list | show SESSION_ID
 bruin service run [--timezone IANA_ZONE]
 bruin acp [--model ALIAS]
@@ -94,6 +95,7 @@ async function chatOptions(args: string[]) {
   const modelAlias = takeFlag(args, '--model');
   const workspaceArg = takeFlag(args, '--workspace');
   const resume = takeFlag(args, '--resume');
+  const answerTo = takeFlag(args, '--answer');
   const maxCallsArg = takeFlag(args, '--max-model-calls');
   const maxModelCalls = maxCallsArg === undefined ? 24 : Number(maxCallsArg);
   const allowWorkspaceEdits = args.includes('--allow-workspace-edits');
@@ -107,12 +109,15 @@ async function chatOptions(args: string[]) {
   if (maxModelCalls === 480 && !unattended) throw new Error('480 次模型调用需要 --unattended');
   const effectiveUnattended = unattended || !stdin.isTTY;
   const prompt = await readChatPrompt(args.join(' '));
+  if (answerTo !== undefined && (!resume || !prompt.trim()))
+    throw new Error('--answer 需要 --resume 和答复内容');
   if (effectiveUnattended && !resume && !prompt)
     throw new Error('非交互式 chat 需要提示词或 --resume');
   return {
     modelAlias,
     workspaceArg,
     resume,
+    answerTo,
     maxModelCalls,
     allowWorkspaceEdits,
     effectiveUnattended,
@@ -154,10 +159,10 @@ async function main(): Promise<void> {
       JSON.stringify(
         {
           modes: {
-            cli: Object.keys(toolsForMode('full')),
-            desktop: Object.keys(toolsForMode('full')),
+            cli: Object.keys(toolsForMode('full', true)),
+            desktop: Object.keys(toolsForMode('full', true)),
             acp: Object.keys(toolsForMode('full')),
-            service: Object.keys(toolsForMode('full')),
+            service: Object.keys(toolsForMode('full', true)),
             subagent: Object.keys(toolsForMode('read-only')),
             worktreeSubagent: Object.keys(toolsForMode('worktree')),
           },
@@ -372,6 +377,7 @@ async function main(): Promise<void> {
       modelAlias,
       workspaceArg,
       resume,
+      answerTo,
       maxModelCalls,
       allowWorkspaceEdits,
       effectiveUnattended,
@@ -437,17 +443,18 @@ async function main(): Promise<void> {
       },
     };
     const services = new RuntimeServices(store, executor, createSubagentRunner(store, executor));
-    const runner = new AgentRunner(store, new AiSdkGateway('full'), executor, io, services);
+    const runner = new AgentRunner(store, new AiSdkGateway('full', true), executor, io, services);
     const runOptions =
       maxModelCalls > 24
         ? {
             maxModelCalls,
             maxDurationMs: 8 * 60 * 60 * 1000,
             checkpointEvery: 24,
+            allowQuestions: true,
             unattended: effectiveUnattended,
             allowWorkspaceEdits,
           }
-        : { unattended: effectiveUnattended, allowWorkspaceEdits };
+        : { unattended: effectiveUnattended, allowWorkspaceEdits, allowQuestions: true };
     const controller = new AbortController();
     const leaseSessionId = session.id;
     let lease: ReturnType<RuntimeServices['sessionLeases']['retain']> | undefined;
@@ -479,13 +486,32 @@ async function main(): Promise<void> {
       console.log(
         `会话 ${session.id} | 工作区 ${session.workspace} | 模型 ${session.profile.alias}`,
       );
+      const reportQuestion = () => {
+        const question = pendingQuestion(store.events(leaseSessionId));
+        if (!question) return false;
+        console.log(`\n待答问题 ${question.id}\n${question.text}`);
+        console.log(
+          `使用 bruin chat --resume ${leaseSessionId} --answer ${question.id} "答复" 继续任务`,
+        );
+        process.exitCode = 2;
+        return true;
+      };
+      if (answerTo !== undefined) recordQuestionAnswer(store, session.id, answerTo, prompt);
+      else if (reportQuestion()) return;
       if (prompt) {
         store.append(session.id, 'run_configured', {
           maxModelCalls,
           allowWorkspaceEdits,
           unattended: effectiveUnattended,
         });
-        await runner.run(session, prompt, controller.signal, [], undefined, runOptions);
+        await runner.run(
+          session,
+          answerTo === undefined ? prompt : undefined,
+          controller.signal,
+          [],
+          undefined,
+          runOptions,
+        );
         stdout.write('\n');
       } else if (resume && canResumeTurn(store.events(session.id))) {
         store.append(session.id, 'run_configured', {
@@ -496,9 +522,10 @@ async function main(): Promise<void> {
         await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
       }
+      if (reportQuestion()) return;
       if (effectiveUnattended && turnState(store.events(session.id)) === 'paused')
         process.exitCode = 2;
-      while (!effectiveUnattended && !controller.signal.aborted) {
+      while (!effectiveUnattended && !controller.signal.aborted && !reportQuestion()) {
         const line = await rl.question('\n你> ', { signal: controller.signal });
         if (controller.signal.aborted) throw new Error('已取消');
         if (line.trim() === '/exit') break;

@@ -387,7 +387,9 @@ export function historyCompactionRange(
     (event) => event.seq > completedSeq && event.type === 'user',
   );
   // Steering augments the current request. A direct user input starts a new one.
-  const request = activeUsers.find((event) => !event.payload.queuedInputId) ?? activeUsers.at(-1);
+  const request =
+    activeUsers.find((event) => !event.payload.queuedInputId && !event.payload.answerTo) ??
+    activeUsers.at(-1);
   const keepUserSeq =
     request &&
     request.seq <= throughSeq &&

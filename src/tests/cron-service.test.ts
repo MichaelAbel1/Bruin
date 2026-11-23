@@ -17,8 +17,13 @@ for (const outcome of [
   'execution-error',
   'receipt-error',
   'lease-contention',
+  'bound-incomplete',
+  'bound-completed',
+  'unbound-incomplete',
+  'plan-replaced',
 ] as const) {
-  const failed = outcome !== 'success' && outcome !== 'lease-contention';
+  const failedHook = ['failed-result', 'execution-error', 'receipt-error'].includes(outcome);
+  const needsReview = failedHook || outcome === 'bound-incomplete' || outcome === 'plan-replaced';
   test(
     `scheduler classifies the current turn after a finishing hook (${outcome})`,
     { timeout: 10_000 },
@@ -43,7 +48,18 @@ for (const outcome of [
         isError: true,
         output: 'old failure',
       });
-      store.createCronJob(session.id, '* * * * *', 'scheduled task');
+      let planSeq: number | undefined;
+      if (outcome.includes('bound-') || outcome === 'plan-replaced') {
+        store.append(session.id, 'plan_mode', { enabled: true });
+        const plan = store.append(session.id, 'plan_updated', { steps: ['Verify the change'] });
+        store.append(session.id, 'plan_approved', {});
+        if (outcome !== 'unbound-incomplete') planSeq = plan.seq;
+      }
+      store.createCronJob(session.id, '* * * * *', 'scheduled task', planSeq);
+      if (outcome === 'plan-replaced') {
+        store.append(session.id, 'plan_updated', { steps: ['A different task'] });
+        store.append(session.id, 'plan_approved', {});
+      }
       const previous = process.env.BRUIN_HOME;
       process.env.BRUIN_HOME = home;
       try {
@@ -51,6 +67,7 @@ for (const outcome of [
           ...loadConfig(),
           profiles: [profile],
           defaultProfile: 'test',
+          ...(outcome === 'bound-completed' ? { approvalMode: 'auto' } : {}),
           hooks: [{ name: 'check', event: 'turn_finished', command: 'verify', enabled: true }],
         });
       } finally {
@@ -66,7 +83,14 @@ for (const outcome of [
       import { AiSdkGateway } from ${JSON.stringify(new URL('../providers/gateway.js', import.meta.url).href)};
       import { ProcessExecutor } from ${JSON.stringify(new URL('../executor/client.js', import.meta.url).href)};
       import { SqliteEventStore } from ${JSON.stringify(new URL('../storage/event-store.js', import.meta.url).href)};
-      AiSdkGateway.prototype.complete = async () => ({ text: 'scheduled answer', calls: [] });
+      let modelCalls = 0;
+      AiSdkGateway.prototype.complete = async () => {
+        if (${outcome === 'plan-replaced'}) throw new Error('a replaced plan must not start');
+        if (++modelCalls === 1 && ${outcome === 'bound-completed'}) {
+          return { text: '', calls: [{ id: 'mark-verified', name: 'update_plan_progress', input: { index: 0, status: 'completed' } }] };
+        }
+        return { text: 'scheduled answer', calls: [] };
+      };
       ProcessExecutor.prototype.execute = async (request) => {
         fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify(request) + '\\n');
         if (${outcome === 'execution-error'}) throw new Error('hook worker disconnected');
@@ -124,18 +148,36 @@ for (const outcome of [
         }
         assert.equal(
           store.listCronJobs(session.id)[0].lastStatus,
-          failed ? 'needs_review' : 'completed',
+          needsReview ? 'needs_review' : 'completed',
         );
         const events = store.events(session.id);
-        assert.equal(events.filter((event) => event.type === 'cron_started').length, 1);
-        assert.equal(events.filter((event) => event.type === 'cron_finished').length, 1);
+        const dispatched = events.filter((event) => event.type === 'cron_started');
+        const settled = events.filter((event) => event.type === 'cron_finished');
+        assert.equal(dispatched.length, 1);
+        assert.equal(dispatched[0].payload.planSeq, planSeq);
+        assert.equal(settled.length, 1);
+        if (outcome === 'plan-replaced') {
+          assert.match(String(settled[0].payload.detail), /已变更/);
+          assert.equal(events.filter((event) => event.type === 'user').length, 1);
+          assert.equal(fs.existsSync(trace), false);
+          return;
+        }
+        if (outcome === 'bound-incomplete')
+          assert.match(String(settled[0].payload.detail), /未完成步骤.*Verify the change/);
+        else assert.equal(settled[0].payload.detail, undefined);
+        if (outcome === 'bound-completed')
+          assert.ok(
+            events.some(
+              (event) => event.type === 'plan_progress' && event.payload.status === 'completed',
+            ),
+          );
         assert.equal(events.filter((event) => event.type === 'turn_completed').length, 2);
         const hook = events.find(
           (event) => event.type === 'hook_finished' && event.payload.name === 'check',
         );
         if (outcome === 'receipt-error') assert.equal(hook, undefined);
         else {
-          assert.equal(hook?.payload.isError, failed);
+          assert.equal(hook?.payload.isError, failedHook);
           assert.equal(hook?.payload.executionUnknown === true, outcome === 'execution-error');
         }
         const requests = fs
@@ -289,6 +331,55 @@ test('cron claims are durable, leased sessions are deferred, abandoned runs requ
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const race of ['new-dispatch', 'lease-contention'] as const) {
+  test(`cron recovery rechecks its candidate after a concurrent ${race}`, (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-cron-recovery-race-'));
+    const file = path.join(dir, 'sessions.sqlite');
+    const first = new SqliteEventStore(file);
+    const second = new SqliteEventStore(file);
+    try {
+      const profile = { alias: 'test', provider: 'openai' as const, model: 'mock' };
+      const session = first.createSession(dir, profile);
+      const other = first.createSession(dir, profile);
+      const job = first.createCronJob(session.id, '* * * * *', 'first task');
+      const abandoned = first.createCronJob(other.id, '* * * * *', 'other task');
+      const due = Math.max(job.nextRunAt, abandoned.nextRunAt);
+      assert.equal(first.takeDueCronJobs(due).length, 1);
+      assert.equal(first.takeDueCronJobs(due).length, 1);
+      const acquire = first.acquireLease.bind(first);
+      t.mock.method(first, 'acquireLease', (id: string, owner: string, ttlMs: number) => {
+        if (id === session.id) {
+          if (race === 'new-dispatch') {
+            second.markCronJob(job.id, 'completed');
+            assert.equal(second.takeDueCronJobs(due + 120_000)[0]?.id, job.id);
+          } else second.acquireLease(id, 'active-runner', 30_000);
+        }
+        return acquire(id, owner, ttlMs);
+      });
+
+      recoverCronJobs(first, Date.now() + 31_000);
+
+      assert.equal(first.listCronJobs(session.id)[0].lastStatus, 'dispatched');
+      assert.equal(first.listCronJobs(other.id)[0].lastStatus, 'needs_review');
+      const events = first.events(session.id);
+      assert.equal(
+        events.filter((event) => event.type === 'cron_started').length,
+        race === 'new-dispatch' ? 2 : 1,
+      );
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === 'cron_finished')
+          .map((event) => event.payload.status),
+        race === 'new-dispatch' ? ['completed'] : [],
+      );
+    } finally {
+      second.close();
+      first.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test('a dispatched job reserves its session before the runner obtains a lease', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-cron-concurrent-'));
