@@ -821,11 +821,13 @@ export class AgentRunner {
       };
       checkCancelledCalls(0);
       if (!reply!.calls.length) {
+        // The budget signal already enforces the deadline. A second timer can
+        // release the wait just before the deadline while the child is still running.
         await withinBudget(async () =>
           this.services?.waitForSubagents?.(
             session.id,
             budgetSignal,
-            step + 1 >= maxSteps ? 0 : deadline === undefined ? undefined : deadline - Date.now(),
+            step + 1 >= maxSteps ? 0 : undefined,
           ),
         );
         if (signal.aborted) throw new Error('已取消');
