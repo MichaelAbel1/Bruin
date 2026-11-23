@@ -1,0 +1,289 @@
+{
+  "model": {
+    "id": "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",
+    "revision": "3dd939c621c08e5753d5b89f35a2642cd83b98ca",
+    "runtime": "MLX",
+    "temperature": 0
+  },
+  "trials": [
+    {
+      "setting": "delegation-only",
+      "budgets": {
+        "maxModelCalls": 12,
+        "maxDurationMs": 180000
+      },
+      "results": [
+        {
+          "sample": "defective",
+          "variant": "baseline",
+          "workspace": "trial-XgIlj5",
+          "commit": "ae7a2651b7754e165d7c64b90d0453df5738987a",
+          "prompt": "Review the repository for defects. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 0,
+            "misses": 1
+          },
+          "untouched": true,
+          "elapsedMs": 2012,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "defective",
+          "variant": "structured",
+          "workspace": "trial-MnbuWq",
+          "commit": "ae7a2651b7754e165d7c64b90d0453df5738987a",
+          "prompt": "Review the batch function against its contract. Before writing the report, use read_file on README.md and src/batches.mjs. Inspect boundary cases at and around the end of the input. Cite the exact line and give a counterexample for each finding. List anything you did not check. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 0,
+            "misses": 1
+          },
+          "untouched": true,
+          "elapsedMs": 1976,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "clean",
+          "variant": "baseline",
+          "workspace": "trial-N6b6rG",
+          "commit": "a600fdbcfbe63a7b3324488dbc927d2d4517baf3",
+          "prompt": "Review the repository for defects. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 0,
+            "misses": 0
+          },
+          "untouched": true,
+          "elapsedMs": 1913,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "clean",
+          "variant": "structured",
+          "workspace": "trial-ihiYul",
+          "commit": "a600fdbcfbe63a7b3324488dbc927d2d4517baf3",
+          "prompt": "Review the batch function against its contract. Before writing the report, use read_file on README.md and src/batches.mjs. Inspect boundary cases at and around the end of the input. Cite the exact line and give a counterexample for each finding. List anything you did not check. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 0,
+            "misses": 0
+          },
+          "untouched": true,
+          "elapsedMs": 1965,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        }
+      ]
+    },
+    {
+      "setting": "parent-source-snapshots",
+      "budgets": {
+        "maxModelCalls": 12,
+        "maxDurationMs": 180000
+      },
+      "results": [
+        {
+          "sample": "defective",
+          "variant": "baseline",
+          "workspace": "trial-gWG8Vy",
+          "commit": "ae7a2651b7754e165d7c64b90d0453df5738987a",
+          "prompt": "Review the repository for defects. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable.\nREADME.md\n# Batch contract\n\nnextOffset is null when the batch reaches the end of the input.\n\n\nsrc/batches.mjs\nexport function batch(items, offset, limit) {\n  const end = offset + limit;\n  return { items: items.slice(offset, end), nextOffset: end <= items.length ? end : null };\n}\n",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 5,\n      \"source\": \"const end = offset + limit;\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 0,\n        \"limit\": 10\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 1
+          },
+          "untouched": true,
+          "elapsedMs": 3541,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "defective",
+          "variant": "structured",
+          "workspace": "trial-1Rrg6g",
+          "commit": "ae7a2651b7754e165d7c64b90d0453df5738987a",
+          "prompt": "Review the batch function against its contract. Before writing the report, use read_file on README.md and src/batches.mjs. Inspect boundary cases at and around the end of the input. Cite the exact line and give a counterexample for each finding. List anything you did not check. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable.\nREADME.md\n# Batch contract\n\nnextOffset is null when the batch reaches the end of the input.\n\n\nsrc/batches.mjs\nexport function batch(items, offset, limit) {\n  const end = offset + limit;\n  return { items: items.slice(offset, end), nextOffset: end <= items.length ? end : null };\n}\n",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 10,\n      \"source\": \"  return { items: items.slice(offset, end), nextOffset: end <= items.length ? end : null; }\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 0,\n        \"limit\": 1\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 1
+          },
+          "untouched": true,
+          "elapsedMs": 3731,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "clean",
+          "variant": "baseline",
+          "workspace": "trial-Tqtr1t",
+          "commit": "a600fdbcfbe63a7b3324488dbc927d2d4517baf3",
+          "prompt": "Review the repository for defects. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable.\nREADME.md\n# Batch contract\n\nnextOffset is null when the batch reaches the end of the input.\n\n\nsrc/batches.mjs\nexport function batch(items, offset, limit) {\n  const end = offset + limit;\n  return { items: items.slice(offset, end), nextOffset: end < items.length ? end : null };\n}\n",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 5,\n      \"source\": \"const end = offset + limit;\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 0,\n        \"limit\": 10\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 0
+          },
+          "untouched": true,
+          "elapsedMs": 3205,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "clean",
+          "variant": "structured",
+          "workspace": "trial-JzFXfb",
+          "commit": "a600fdbcfbe63a7b3324488dbc927d2d4517baf3",
+          "prompt": "Review the batch function against its contract. Before writing the report, use read_file on README.md and src/batches.mjs. Inspect boundary cases at and around the end of the input. Cite the exact line and give a counterexample for each finding. List anything you did not check. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable.\nREADME.md\n# Batch contract\n\nnextOffset is null when the batch reaches the end of the input.\n\n\nsrc/batches.mjs\nexport function batch(items, offset, limit) {\n  const end = offset + limit;\n  return { items: items.slice(offset, end), nextOffset: end < items.length ? end : null };\n}\n",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 10,\n      \"source\": \"  return { items: items.slice(offset, end), nextOffset: end < items.length ? end : null; }\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 0,\n        \"limit\": 1\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 0
+          },
+          "untouched": true,
+          "elapsedMs": 3580,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        }
+      ]
+    },
+    {
+      "setting": "parent-numbered-source-snapshots",
+      "budgets": {
+        "maxModelCalls": 12,
+        "maxDurationMs": 180000
+      },
+      "results": [
+        {
+          "sample": "defective",
+          "variant": "baseline",
+          "workspace": "trial-YEyBWX",
+          "commit": "ae7a2651b7754e165d7c64b90d0453df5738987a",
+          "prompt": "Review the repository for defects. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable. The number before each | is the source line; omit that prefix from the source field.\nREADME.md\n1 | # Batch contract\n2 | \n3 | nextOffset is null when the batch reaches the end of the input.\n\nsrc/batches.mjs\n1 | export function batch(items, offset, limit) {\n2 |   const end = offset + limit;\n3 |   return { items: items.slice(offset, end), nextOffset: end <= items.length ? end : null };\n4 | }",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 3,\n      \"source\": \"nextOffset is null when the batch reaches the end of the input.\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 0,\n        \"limit\": 10\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 1
+          },
+          "untouched": true,
+          "elapsedMs": 3449,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "defective",
+          "variant": "structured",
+          "workspace": "trial-k91R66",
+          "commit": "ae7a2651b7754e165d7c64b90d0453df5738987a",
+          "prompt": "Review the batch function against its contract. Before writing the report, use read_file on README.md and src/batches.mjs. Inspect boundary cases at and around the end of the input. Cite the exact line and give a counterexample for each finding. List anything you did not check. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable. The number before each | is the source line; omit that prefix from the source field.\nREADME.md\n1 | # Batch contract\n2 | \n3 | nextOffset is null when the batch reaches the end of the input.\n\nsrc/batches.mjs\n1 | export function batch(items, offset, limit) {\n2 |   const end = offset + limit;\n3 |   return { items: items.slice(offset, end), nextOffset: end <= items.length ? end : null };\n4 | }",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 3,\n      \"source\": \"nextOffset is null when the batch reaches the end of the input.\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 10,\n        \"limit\": 5\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 1
+          },
+          "untouched": true,
+          "elapsedMs": 3465,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "clean",
+          "variant": "baseline",
+          "workspace": "trial-ujnSvV",
+          "commit": "a600fdbcfbe63a7b3324488dbc927d2d4517baf3",
+          "prompt": "Review the repository for defects. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable. The number before each | is the source line; omit that prefix from the source field.\nREADME.md\n1 | # Batch contract\n2 | \n3 | nextOffset is null when the batch reaches the end of the input.\n\nsrc/batches.mjs\n1 | export function batch(items, offset, limit) {\n2 |   const end = offset + limit;\n3 |   return { items: items.slice(offset, end), nextOffset: end < items.length ? end : null };\n4 | }",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 3,\n      \"source\": \"3 |   const end = offset + limit;\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 0,\n        \"limit\": 10\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 0
+          },
+          "untouched": true,
+          "elapsedMs": 3321,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        },
+        {
+          "sample": "clean",
+          "variant": "structured",
+          "workspace": "trial-hBLO3q",
+          "commit": "a600fdbcfbe63a7b3324488dbc927d2d4517baf3",
+          "prompt": "Review the batch function against its contract. Before writing the report, use read_file on README.md and src/batches.mjs. Inspect boundary cases at and around the end of the input. Cite the exact line and give a counterexample for each finding. List anything you did not check. Return one JSON object with findings (an array) and unchecked (an array of strings).\nEach finding has path, line (1-based), source (the exact source line), and an example object with integer size, offset and limit. Use an empty findings array when no defect is found.\nThe parent read the following files. Review these snapshots if tools are unavailable. The number before each | is the source line; omit that prefix from the source field.\nREADME.md\n1 | # Batch contract\n2 | \n3 | nextOffset is null when the batch reaches the end of the input.\n\nsrc/batches.mjs\n1 | export function batch(items, offset, limit) {\n2 |   const end = offset + limit;\n3 |   return { items: items.slice(offset, end), nextOffset: end < items.length ? end : null };\n4 | }",
+          "status": "completed",
+          "answer": "```json\n{\n  \"findings\": [\n    {\n      \"path\": \"src/batches.mjs\",\n      \"line\": 3,\n      \"source\": \"nextOffset is null when the batch reaches the end of the input.\",\n      \"example\": {\n        \"size\": 1,\n        \"offset\": 10,\n        \"limit\": 5\n      }\n    }\n  ],\n  \"unchecked\": []\n}\n```",
+          "metrics": {
+            "valid": true,
+            "hits": 0,
+            "falsePositives": 1,
+            "misses": 0
+          },
+          "untouched": true,
+          "elapsedMs": 3487,
+          "modelCalls": 1,
+          "inspectedFiles": [],
+          "inspectedBoth": false,
+          "tools": []
+        }
+      ]
+    }
+  ]
+}

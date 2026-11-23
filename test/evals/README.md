@@ -18,3 +18,15 @@ node test/evals/run.mjs check batch-end /tmp/bruin-batch-trial
 1. 为每个参评客户端创建新目录，使用同一个任务提示，并设置相同的模型、工具权限、时间预算和人工介入条件。隔离工作区记忆及已有会话。评测脚本自身只准备和检查文件。
 2. 保留准备结果与检查结果。另记客户端版本、实际模型 ID、耗时、人工介入次数以及可取得的 token 用量，缺失字段标记未知。
 3. 用 `git diff <基线提交>` 保留已跟踪变更，并用 `git ls-files --others --exclude-standard` 记录未跟踪路径。不要把验收脚本放进受测工作区。模型或权限条件不同时分别记录结果。
+
+## 只读子 Agent 审查
+
+`subagent-review.mjs` 在同一模型和预算下运行自由委派与结构化委派。两组各看一个有缺陷版本和一个无缺陷版本，目录名使用随机标识。评测走实际只读子 Agent 和文件执行器。评分同时核对路径、源代码行和可复现的反例，并记录真实读取、模型调用数、原始答复与工作区状态。
+
+```sh
+npm run build
+node test/evals/subagent-review.mjs MODEL_ALIAS /tmp/bruin-review-trial
+node test/evals/subagent-review.mjs MODEL_ALIAS /tmp/bruin-review-with-evidence --parent-evidence
+```
+
+目录须尚未存在，结果保存为其中的 `results.json`。第二条评测命令给两组相同的带行号源码快照，用于区分取证和审查推理。`--fixture-provider` 使用固定响应校验评测流程。对无缺陷样本，空报告应结合实际读文件记录判断。[本机模型原始结果](results/2026-11-23-subagent-review.json)
