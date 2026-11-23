@@ -229,7 +229,7 @@ export class AcpServer {
       return {
         protocolVersion: 1,
         agentCapabilities: { loadSession: true, promptCapabilities: {}, mcpCapabilities: {} },
-        agentInfo: { name: 'bruin', version: '1.0.0' },
+        agentInfo: { name: 'bruin', version: '1.1.0' },
         authMethods: [],
       };
     }
