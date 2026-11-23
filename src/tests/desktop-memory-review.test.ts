@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import readline from 'node:readline';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SqliteEventStore } from '../storage/event-store.js';
 import type { MemoryReviewPreview } from '../core/memory-review.js';
 import type { ModelProfile, ToolResult } from '../core/types.js';
@@ -110,7 +110,11 @@ test(
 
     const child = spawn(
       process.execPath,
-      ['--import', preloader, fileURLToPath(new URL('../desktop-host.js', import.meta.url))],
+      [
+        '--import',
+        pathToFileURL(preloader).href,
+        fileURLToPath(new URL('../desktop-host.js', import.meta.url)),
+      ],
       {
         env: { ...process.env, BRUIN_HOME: home, BRUIN_REVIEW_TRACE: trace, BRUIN_SERVICE: '0' },
         stdio: ['pipe', 'pipe', 'pipe'],

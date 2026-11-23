@@ -509,7 +509,7 @@ test('cron review keeps the job blocked when confirmation discovers a previously
 });
 
 test(
-  'independent service runs without desktop and shuts down on SIGTERM',
+  'independent service runs without desktop and releases its database on termination',
   { timeout: 10_000 },
   async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-service-'));
@@ -532,7 +532,7 @@ test(
       error += data;
     });
     const exited = new Promise<number | null>((resolve, reject) => {
-      child.once('exit', resolve);
+      child.once('close', resolve);
       child.once('error', reject);
     });
     try {
@@ -543,11 +543,13 @@ test(
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       child.kill('SIGTERM');
-      assert.equal(await exited, 0, error);
+      const code = await exited;
+      if (process.platform === 'win32') assert.notEqual(code, 0, error);
+      else assert.equal(code, 0, error);
     } finally {
-      child.kill('SIGTERM');
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
       await exited;
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
     }
   },
 );

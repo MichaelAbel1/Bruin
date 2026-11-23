@@ -566,6 +566,7 @@ test('coding cancellation keeps the worktree and releases both session leases', 
     f.signal,
     { allowWorkspaceEdits: true },
   );
+  assert.equal(started.isError, false, started.output);
   const id = started.output.split(': ')[1];
   await entered;
   const observerStore = new SqliteEventStore(path.join(f.dir, 'home', 'sessions.sqlite'));

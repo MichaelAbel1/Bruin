@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SqliteEventStore } from '../storage/event-store.js';
 import { enqueueInput, pendingInputs } from '../core/input-queue.js';
 
@@ -139,7 +139,7 @@ test('CLI reads a single prompt source before creating a noninteractive session'
     const run = (args: string[], input: string | Buffer) =>
       spawnSync(
         process.execPath,
-        ['--import', preloader, cli, 'chat', '--model', 'test', ...args],
+        ['--import', pathToFileURL(preloader).href, cli, 'chat', '--model', 'test', ...args],
         {
           cwd: dir,
           env: { ...process.env, BRUIN_HOME: home },

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { execFile, spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { pendingInputs } from '../core/input-queue.js';
 import { pendingQuestion, recordQuestionAnswer } from '../core/question.js';
@@ -83,7 +83,11 @@ test(
     );
     const child = spawn(
       process.execPath,
-      ['--import', preloader, fileURLToPath(new URL('../desktop-host.js', import.meta.url))],
+      [
+        '--import',
+        pathToFileURL(preloader).href,
+        fileURLToPath(new URL('../desktop-host.js', import.meta.url)),
+      ],
       {
         env: {
           ...process.env,
@@ -257,7 +261,7 @@ test(
           process.execPath,
           [
             '--import',
-            preloader,
+            pathToFileURL(preloader).href,
             fileURLToPath(new URL('../cli.js', import.meta.url)),
             'chat',
             '--resume',

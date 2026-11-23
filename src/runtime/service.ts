@@ -13,7 +13,7 @@ export async function runService(timezone?: string): Promise<void> {
       stdio: ['pipe', 'inherit', 'inherit'],
     },
   );
-  const stop = () => child.kill('SIGTERM');
+  const stop = () => child.stdin.end();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   try {

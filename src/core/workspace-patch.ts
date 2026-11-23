@@ -23,7 +23,10 @@ async function workspaceRepository(workspace: string, signal: AbortSignal) {
   const [topLevel, sourceObjects, trailing] = stdout.split(/\r?\n/);
   if (!topLevel || !sourceObjects || trailing !== '' || !path.isAbsolute(sourceObjects))
     throw new Error('无法识别工作树的 Git 对象目录');
-  return { root: fs.realpathSync(topLevel), sourceObjects: fs.realpathSync(sourceObjects) };
+  return {
+    root: fs.realpathSync.native(topLevel),
+    sourceObjects: fs.realpathSync.native(sourceObjects),
+  };
 }
 
 type GitRun = (
@@ -187,6 +190,7 @@ export async function buildWorkspacePatch(
   baseCommit: string,
   signal: AbortSignal,
 ): Promise<Buffer> {
+  const workspaceRoot = fs.realpathSync.native(workspace);
   const changes = listWorkspaceChanges(workspace, events, baseCommit);
   if (!changes.length) throw new Error('此子任务没有可导出的工作树改动');
   const repository = await workspaceRepository(workspace, signal);
@@ -194,8 +198,8 @@ export async function buildWorkspacePatch(
   const removed: string[] = [];
   const staged: string[] = [];
   for (const change of changes) {
-    const target = path.resolve(workspace, change.path);
-    if (!target.startsWith(workspace + path.sep) || !target.startsWith(root + path.sep))
+    const target = path.resolve(workspaceRoot, change.path);
+    if (!target.startsWith(workspaceRoot + path.sep) || !target.startsWith(root + path.sep))
       throw new Error('变更路径超出子任务工作区');
     const relative = path.relative(root, target).split(path.sep).join('/');
     if (change.status === 'deleted') {
@@ -203,7 +207,8 @@ export async function buildWorkspacePatch(
       continue;
     }
     const parent = path.dirname(target);
-    if (fs.realpathSync(parent) !== parent) throw new Error(`变更路径经过符号链接：${change.path}`);
+    if (fs.realpathSync.native(parent) !== parent)
+      throw new Error(`变更路径经过符号链接：${change.path}`);
     const stat = fs.lstatSync(target);
     if (!stat.isFile() && !stat.isSymbolicLink())
       throw new Error(`无法将目录或子模块导出为文件补丁：${change.path}`);

@@ -15,6 +15,7 @@ import {
   snapshotMaxBytes,
 } from '../core/snapshots.js';
 import { searchRepository } from '../core/repository-index.js';
+import { workspaceMounts } from './bwrap.js';
 
 let macSandboxAvailable: boolean | undefined;
 function isMacSandboxAvailable(): boolean {
@@ -886,23 +887,13 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
       const bwrap = findBwrap();
       if (bwrap) {
         const root = fs.realpathSync(req.workspace);
-        const tmpReal = fs.realpathSync(os.tmpdir());
-        const sharedScratch = req.workspaceOnlyWrites ? [] : ['--bind', tmpReal, tmpReal];
         return command(
           bwrap,
           [
-            '--ro-bind',
-            '/',
-            '/',
-            '--bind',
-            root,
-            root,
-            ...sharedScratch,
-            '--dev',
-            '/dev',
-            '--proc',
-            '/proc',
-            ...(req.workspaceOnlyWrites ? [] : ['--tmpfs', '/tmp']),
+            ...workspaceMounts(root, {
+              privateTmp: !req.workspaceOnlyWrites,
+              sharedScratch: req.workspaceOnlyWrites ? undefined : fs.realpathSync(os.tmpdir()),
+            }),
             '--unshare-net',
             '--die-with-parent',
             '--chdir',

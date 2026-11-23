@@ -11,10 +11,7 @@ test('MCP workspace switches and disconnects wait for in-flight requests', async
   const second = path.join(dir, 'second');
   fs.mkdirSync(first);
   fs.mkdirSync(second);
-  const script = path.join(dir, 'server.cjs');
-  fs.writeFileSync(
-    script,
-    `
+  const script = `
     const readline = require('node:readline');
     const fs = require('node:fs');
     const path = require('node:path');
@@ -30,13 +27,14 @@ test('MCP workspace switches and disconnects wait for in-flight requests', async
       }
       setTimeout(() => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n'), message.method === 'initialize' ? 0 : 100);
     });
-  `,
-  );
+  `;
+  for (const workspace of [first, second])
+    fs.writeFileSync(path.join(workspace, 'server.cjs'), script);
   const server = {
     name: 'shared',
     transport: 'stdio' as const,
     command: process.execPath,
-    args: [script],
+    args: ['server.cjs'],
     envNames: [],
   };
   const manager = new McpManager();

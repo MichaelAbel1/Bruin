@@ -540,7 +540,7 @@ export class RuntimeServices {
         const base = delegation.worktreeBase;
         const root =
           base?.repository ??
-          fs.realpathSync(
+          fs.realpathSync.native(
             (
               await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
                 cwd: session.workspace,
@@ -560,7 +560,7 @@ export class RuntimeServices {
       case 'remove_worktree': {
         let destination: string;
         try {
-          destination = fs.realpathSync(String(input.path ?? ''));
+          destination = fs.realpathSync.native(String(input.path ?? ''));
         } catch {
           return { output: '工作树路径不存在', isError: true };
         }
@@ -568,7 +568,7 @@ export class RuntimeServices {
         if (!fs.existsSync(parent)) {
           return { output: '只能移除 Bruin 管理的工作树', isError: true };
         }
-        const parentReal = fs.realpathSync(parent);
+        const parentReal = fs.realpathSync.native(parent);
         if (
           !destination.startsWith(parentReal + path.sep) ||
           path.dirname(destination) !== parentReal
@@ -584,7 +584,7 @@ export class RuntimeServices {
           if (!line.startsWith('worktree ')) return false;
           const listedPath = line.slice('worktree '.length).trim();
           try {
-            const listedReal = fs.realpathSync(listedPath);
+            const listedReal = fs.realpathSync.native(listedPath);
             const pathMatches =
               process.platform === 'win32'
                 ? listedReal.toLowerCase() === destination.toLowerCase()
@@ -603,14 +603,18 @@ export class RuntimeServices {
         });
         if (!belongsToRepository) return { output: '该路径不属于当前仓库的工作树', isError: true };
         if (
-          this.store
-            .listSessions()
-            .some(
-              (item) =>
-                (item.workspace === destination ||
-                  item.workspace.startsWith(destination + path.sep)) &&
-                this.store.isLeased(item.id),
-            )
+          this.store.listSessions().some((item) => {
+            if (!this.store.isLeased(item.id)) return false;
+            const workspace = fs.existsSync(item.workspace)
+              ? fs.realpathSync.native(item.workspace)
+              : item.workspace;
+            const relative = path.relative(destination, workspace);
+            return (
+              !path.isAbsolute(relative) &&
+              relative !== '..' &&
+              !relative.startsWith('..' + path.sep)
+            );
+          })
         )
           return { output: '工作树仍有运行中的会话，不能移除', isError: true };
         await execFileAsync('git', ['worktree', 'remove', destination], {
@@ -703,9 +707,11 @@ export class RuntimeServices {
               const revision = stdout.trimEnd();
               const separator = revision.lastIndexOf('\n');
               if (separator < 0) throw new Error('无法识别子 Agent 的启动提交');
-              const repository = fs.realpathSync(revision.slice(0, separator).replace(/\r$/, ''));
+              const repository = fs.realpathSync.native(
+                revision.slice(0, separator).replace(/\r$/, ''),
+              );
               baseCommit = revision.slice(separator + 1);
-              const scope = path.relative(repository, fs.realpathSync(session.workspace));
+              const scope = path.relative(repository, fs.realpathSync.native(session.workspace));
               if (path.isAbsolute(scope) || scope === '..' || scope.startsWith('..' + path.sep))
                 return { output: '子任务的工作区不在当前仓库内', isError: true };
               if (scope) {
@@ -739,8 +745,8 @@ export class RuntimeServices {
               );
               if (created.isError) throw new Error(created.output);
               worktreeRoot = created.output;
-              const expected = path.join(fs.realpathSync(worktreeRoot), scope);
-              workspace = fs.realpathSync(expected);
+              const expected = path.join(fs.realpathSync.native(worktreeRoot), scope);
+              workspace = fs.realpathSync.native(expected);
               if (path.relative(expected, workspace) || !fs.statSync(workspace).isDirectory())
                 throw new Error('子任务的工作区与启动提交中的目录不一致');
             }

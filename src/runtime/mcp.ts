@@ -4,6 +4,7 @@ import type { McpServerConfig } from '../config.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { workspaceMounts } from '../executor/bwrap.js';
 import { McpOAuthSession, type OAuthSnapshot } from './mcp-oauth.js';
 
 let macSandboxAvailable: boolean | undefined;
@@ -167,18 +168,7 @@ export class McpManager {
       } else if (bwrap) {
         command = bwrap;
         args = [
-          '--ro-bind',
-          '/',
-          '/',
-          '--bind',
-          root!,
-          root!,
-          '--dev',
-          '/dev',
-          '--proc',
-          '/proc',
-          '--tmpfs',
-          '/tmp',
+          ...workspaceMounts(root!, { privateTmp: true }),
           '--die-with-parent',
           '--chdir',
           root!,
