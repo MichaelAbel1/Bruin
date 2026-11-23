@@ -50,10 +50,14 @@ test(
   'desktop memory review confirms evidence-backed revisions and isolates recall by workspace',
   { timeout: 15000 },
   async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-memory-review-'));
+    const dir = fs.realpathSync.native(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-memory-review-')),
+    );
     const home = path.join(dir, 'home');
-    const workspace = fs.realpathSync(fs.mkdirSync(path.join(dir, 'a'), { recursive: true })!);
-    const otherWorkspace = fs.realpathSync(fs.mkdirSync(path.join(dir, 'b'), { recursive: true })!);
+    const workspace = path.join(dir, 'a');
+    const otherWorkspace = path.join(dir, 'b');
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(otherWorkspace);
     const trace = path.join(dir, 'trace.jsonl');
     const preloader = path.join(dir, 'provider.mjs');
     fs.writeFileSync(preloader, mockProvider);

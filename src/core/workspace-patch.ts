@@ -152,10 +152,10 @@ export async function preflightWorkspacePatches(
             if (path) conflictPaths.add(path);
           }
         }
-        // File/directory collisions fail the worktree write before Git can stage conflicts.
+        // File/directory collisions can fail before Git stages the conflicting paths.
         for (const diagnosticLine of diagnostic.split(/\r?\n/)) {
           const blocked =
-            /^error: unable to write file '(.+)' mode [0-7]+: (?:Not a directory|Is a directory|Directory not empty)$/.exec(
+            /^error: unable to (?:write file|stat newly created file) '(.+)'(?: mode [0-7]+)?: (?:Not a directory|Is a directory|Directory not empty)$/.exec(
               diagnosticLine,
             );
           if (blocked) conflictPaths.add(blocked[1]);
