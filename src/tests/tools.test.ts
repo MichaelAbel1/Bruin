@@ -68,4 +68,10 @@ test('bwrap mounts shared scratch under /tmp after private /tmp and omits redund
 
   const rootTmp = workspaceMounts('/work/repo', { privateTmp: true, sharedScratch: '/tmp' });
   assert.equal(rootTmp.filter((arg, i) => arg === '--bind' && rootTmp[i + 1] === '/tmp').length, 0);
+
+  for (const unsafe of ['/', '/tmp/', '/Users/alice', '/work']) {
+    const args = workspaceMounts('/work/repo', { privateTmp: true, sharedScratch: unsafe });
+    const binds = args.flatMap((arg, i) => (arg === '--bind' ? [args[i + 1]] : []));
+    assert.deepEqual(binds, ['/work/repo'], `must reject unsafe sharedScratch: ${unsafe}`);
+  }
 });

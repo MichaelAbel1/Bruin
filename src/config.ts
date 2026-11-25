@@ -17,6 +17,18 @@ export function validApiKeyEnv(name: string): boolean {
 export function looksLikeApiKey(value: string): boolean {
   return /^(sk-|AIza|gsk_|xai-)/i.test(value) && value.length >= 16;
 }
+export function isAllowedWebhookUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) return false;
+    return (
+      url.protocol === 'https:' ||
+      (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+    );
+  } catch {
+    return false;
+  }
+}
 export function setRuntimeApiKey(alias: string, key: string | undefined): void {
   if (key) runtimeKeys.set(alias, key);
   else runtimeKeys.delete(alias);
@@ -88,6 +100,14 @@ const configSchema = z.object({
       z.object({ workspace: z.string(), command: z.string(), sessionId: z.string().optional() }),
     )
     .default([]),
+  webhookUrl: z
+    .string()
+    .url()
+    .refine(
+      (value) => isAllowedWebhookUrl(value),
+      'Webhook 地址必须使用 HTTPS（或本地 localhost HTTP）且不能包含内嵌凭据',
+    )
+    .optional(),
 });
 export type AppConfig = z.infer<typeof configSchema>;
 export function parseConfig(value: unknown): AppConfig {

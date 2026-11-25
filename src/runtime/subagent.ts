@@ -12,6 +12,8 @@ export type SubagentOptions = {
   autoSafeShell: boolean;
   maxModelCalls: number;
   maxDurationMs: number;
+  scope?: string;
+  deliverable?: string;
 };
 
 /** Shared by CLI, desktop and ACP; child permissions never prompt or grow. */
@@ -51,6 +53,9 @@ export function createSubagentRunner(
       maxDurationMs: options.maxDurationMs,
       checkpointEvery: 24,
       unattended: true,
+      ...(options.scope || options.deliverable
+        ? { focus: { scope: options.scope, deliverable: options.deliverable } }
+        : {}),
     });
   };
 }

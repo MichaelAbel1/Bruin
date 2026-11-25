@@ -491,3 +491,50 @@ test('ACP stdio emits protocol-only output and handles malformed JSON and EOF', 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('ACP session/load surfaces pending ask_user question with context and options', async () => {
+  const f = fixture({
+    async complete() {
+      return { text: 'unused', calls: [] };
+    },
+  });
+  try {
+    const session = f.store.createSession(fs.realpathSync(f.dir), {
+      alias: 'test',
+      provider: 'openai',
+      model: 'mock',
+    });
+    f.store.append(session.id, 'user', { text: 'migrate' });
+    f.store.append(session.id, 'tool_finished', {
+      callId: 'ask-1',
+      name: 'ask_user',
+      questionId: 'q-acp-1',
+      question: 'Keep backward compatibility?',
+      context: 'Older clients exist.',
+      options: ['Keep', 'Break'],
+      output: 'Waiting for user',
+    });
+    f.store.append(session.id, 'turn_paused', { reason: 'awaiting_input' });
+    await f.request('initialize', { protocolVersion: 1 });
+    const loaded = await f.request('session/load', {
+      sessionId: session.id,
+      cwd: f.dir,
+      mcpServers: [],
+    });
+    assert.equal(loaded.error, undefined);
+    const questionChunk = f.messages.find(
+      (m) =>
+        m.method === 'session/update' &&
+        m.params?.update?.sessionUpdate === 'agent_message_chunk' &&
+        String(m.params?.update?.content?.text ?? '').includes('q-acp-1'),
+    );
+    assert.ok(questionChunk);
+    const text = String(questionChunk.params.update.content.text);
+    assert.match(text, /Keep backward compatibility\?/);
+    assert.match(text, /Older clients exist\./);
+    assert.match(text, /1\. Keep/);
+    assert.match(text, /2\. Break/);
+  } finally {
+    await f.close();
+  }
+});

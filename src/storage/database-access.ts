@@ -59,3 +59,13 @@ function claim(filename: string, maintenance: boolean): () => void {
 
 export const registerDatabaseUse = (filename: string) => claim(filename, false);
 export const acquireDatabaseMaintenance = (filename: string) => claim(filename, true);
+export function cleanupDatabaseRegistry(filename: string): void {
+  const directory = registry(filename);
+  if (!fs.existsSync(directory)) return;
+  try {
+    const remaining = fs.readdirSync(directory).filter((name) => name.endsWith('.json'));
+    if (remaining.length === 0) fs.rmSync(directory, { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup for ephemeral staging directories.
+  }
+}

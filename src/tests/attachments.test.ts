@@ -201,3 +201,33 @@ test('attachment metadata rejects oversized, invalid and mismatched records', ()
     f.close();
   }
 });
+
+test('xlsx extraction handles self-closing empty cells and rows without shifting shared strings', () => {
+  const f = fixture();
+  const originalExec = childProcess.execFileSync;
+  try {
+    childProcess.execFileSync = ((_command: string, args: string[]) => {
+      if (args[2] === 'xl/sharedStrings.xml')
+        return '<sst><si><t>Alice</t></si><si><t>Bob</t></si></sst>';
+      if (args[2] === 'xl/worksheets/sheet1.xml')
+        return (
+          '<worksheet><sheetData>' +
+          '<row r="1"><c r="A1" s="1"/><c r="B1" t="s"><v>0</v></c></row>' +
+          '<row r="2"/>' +
+          '<row r="3"><c r="A3" t="s"><v>1</v></c></row>' +
+          '</sheetData></worksheet>'
+        );
+      throw new Error('unexpected extraction command');
+    }) as typeof childProcess.execFileSync;
+    syncBuiltinESMExports();
+    const file = path.join(f.dir, 'cells.xlsx');
+    fs.writeFileSync(file, 'mock xlsx');
+    const [ref] = importAttachments(session, [file]);
+    const loaded = loadAttachment(session, ref.id);
+    assert.equal(loaded.text, '\tAlice\n\nBob');
+  } finally {
+    childProcess.execFileSync = originalExec;
+    syncBuiltinESMExports();
+    f.close();
+  }
+});

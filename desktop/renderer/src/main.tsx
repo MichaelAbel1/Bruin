@@ -85,6 +85,7 @@ type SessionView = {
   needsReview: boolean;
   recoveredUnknown?: number;
   tasks?: TaskNode[];
+  state?: { phase: string; canResume: boolean; needsReview: boolean };
 };
 type ComposerDraft = {
   composer: string;
@@ -153,6 +154,7 @@ type Config = {
   hooks: Hook[];
   approvalMode: 'ask' | 'autoSafe' | 'auto';
   approvedCommands: { workspace: string; command: string; sessionId?: string }[];
+  webhookUrl?: string;
 };
 type HostEvent = {
   type: string;
@@ -258,9 +260,15 @@ function App() {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [busySessionId, setBusySessionId] = useState<string | null>(null);
   const busy = busySessionId !== null;
+  const isCurrentBusy = Boolean(view && busySessionId === view.session.id);
+  const isOtherBusy = Boolean(busySessionId && busySessionId !== view?.session.id);
   const [sending, setSending] = useState(false);
+  const [approvalSaving, setApprovalSaving] = useState(false);
+  const [fileSavedVersion, setFileSavedVersion] = useState(0);
   const [delivery, setDelivery] = useState<'steer' | 'follow-up'>('steer');
   const [stream, setStream] = useState('');
+  const streamPendingRef = useRef('');
+  const streamRafRef = useRef<number | null>(null);
   const [drafts, setDrafts] = useState(new Map<string, Map<string, ComposerDraft>>());
   const [maxModelCalls, setMaxModelCalls] = useState<24 | 96 | 240 | 480>(24);
   const [allowWorkspaceEdits, setAllowWorkspaceEdits] = useState(false);
@@ -467,6 +475,7 @@ function App() {
           path: file.path,
           content: normalizedContent,
           originalContent: normalizedContent,
+          originalDiskContent: file.content,
           baselineContent: normalizedBaseline,
           eol,
           truncated: file.truncated,
@@ -486,20 +495,23 @@ function App() {
     if (file.readOnlyReason) throw new Error(file.readOnlyReason);
     if (file.truncated) throw new Error('截断预览不能覆盖保存，请使用外部编辑器修改完整文件。');
     const revision = viewRevision.current;
+    const nextDiskContent = restoreLineEndings(file.content, file.eol);
     await api('writeWorkspaceFile', {
       sessionId: view.session.id,
       path: file.path,
-      content: restoreLineEndings(file.content, file.eol),
-      expectedContent: restoreLineEndings(file.originalContent, file.eol),
+      content: nextDiskContent,
+      expectedContent:
+        file.originalDiskContent ?? restoreLineEndings(file.originalContent, file.eol),
     });
     if (!isCurrentView(revision, view.session.id)) return;
     setOpenFiles((current) =>
       current.map((item) =>
         item.path === file.path && item.originalContent === file.originalContent
-          ? { ...item, originalContent: file.content }
+          ? { ...item, originalContent: file.content, originalDiskContent: nextDiskContent }
           : item,
       ),
     );
+    setFileSavedVersion((v) => v + 1);
     setNotice(`已保存 ${short(file.path)}`);
   }
 
@@ -677,12 +689,34 @@ function App() {
         );
         setApproval((current) => (current?.sessionId === message.sessionId ? null : current));
         void refreshSessions().catch(fail);
+        if (message.type === 'runFailed' && message.sessionId !== selected.current) {
+          fail(new Error(message.message ?? '后台会话执行失败'));
+        }
       }
       if (message.sessionId !== selected.current) return;
+      const clearStreamBuffer = () => {
+        streamPendingRef.current = '';
+        if (streamRafRef.current !== null) {
+          cancelAnimationFrame(streamRafRef.current);
+          streamRafRef.current = null;
+        }
+        setStream('');
+      };
       if (message.type === 'runStarted') {
         setNotice('');
       }
-      if (message.type === 'text') setStream((previous) => previous + (message.delta ?? ''));
+      if (message.type === 'text') {
+        streamPendingRef.current += message.delta ?? '';
+        if (streamRafRef.current === null) {
+          streamRafRef.current = requestAnimationFrame(() => {
+            streamRafRef.current = null;
+            const buffered = streamPendingRef.current;
+            if (!buffered) return;
+            streamPendingRef.current = '';
+            setStream((previous) => previous + buffered);
+          });
+        }
+      }
       if (message.type === 'notice') setNotice(message.message ?? '');
       if ((message.type === 'runCheckpoint' || message.type === 'queueUpdated') && message.events) {
         setView((previous) =>
@@ -690,13 +724,13 @@ function App() {
             ? { ...previous!, events: message.events! }
             : previous,
         );
-        setStream('');
+        clearStreamBuffer();
       }
       if (message.type === 'runFinished' || message.type === 'runFailed') {
         setMaxModelCalls(24);
         setAllowWorkspaceEdits(false);
         setUnattended(false);
-        setStream('');
+        clearStreamBuffer();
         if (message.events)
           setView((previous) =>
             acceptsEventSnapshot(previous, message.sessionId!, message.events!)
@@ -723,6 +757,11 @@ function App() {
     });
     return () => {
       disposed = true;
+      if (streamRafRef.current !== null) {
+        cancelAnimationFrame(streamRafRef.current);
+        streamRafRef.current = null;
+      }
+      streamPendingRef.current = '';
       unsubscribe();
     };
   }, []);
@@ -778,6 +817,7 @@ function App() {
   async function send() {
     if (
       !view ||
+      isOtherBusy ||
       pendingQuestion(view.events) ||
       (!composer.trim() && !attachments.length && !quote) ||
       sending ||
@@ -786,9 +826,8 @@ function App() {
     )
       return;
     const { session } = view;
-    const revision = viewRevision.current;
     const text = composer.trim();
-    const wasBusy = busy;
+    const wasBusy = isCurrentBusy;
     const optimistic: SessionEvent = {
       seq: -Date.now(),
       type: 'user',
@@ -797,12 +836,14 @@ function App() {
     };
     setSending(true);
     if (!wasBusy) {
+      viewRevision.current++;
       autoScrollRef.current = true;
       setBusySessionId(session.id);
       setView((previous) =>
         previous ? { ...previous, events: [...previous.events, optimistic] } : previous,
       );
     }
+    const revision = viewRevision.current;
     try {
       const result = await api<{ queued?: boolean; events?: SessionEvent[] }>('send', {
         sessionId: session.id,
@@ -1030,7 +1071,7 @@ function App() {
               <button
                 className={`session-item ${view?.session.id === session.id ? 'active' : ''}`}
                 onClick={() => void openSession(session.id)}
-                disabled={busy && view?.session.id !== session.id}
+                disabled={isCurrentBusy && view?.session.id !== session.id}
               >
                 <MessageSquare size={16} />
                 <span className="session-copy">
@@ -1049,7 +1090,7 @@ function App() {
                 className="session-delete"
                 aria-label={deletingSession === session.id ? '确认删除会话' : '删除会话'}
                 title={deletingSession === session.id ? '再次点击，删除本地会话记录' : '删除会话'}
-                disabled={busy && view?.session.id === session.id}
+                disabled={busySessionId === session.id}
                 onClick={() =>
                   deletingSession === session.id
                     ? void deleteSession(session.id)
@@ -1371,7 +1412,7 @@ function App() {
                     </div>
                   </div>
                 )}
-                {busy && !stream && (
+                {isCurrentBusy && !stream && (
                   <div className="working">
                     <LoaderCircle className="spin" size={16} /> Bruin 正在处理…
                   </div>
@@ -1401,7 +1442,7 @@ function App() {
               </div>
               <WorkspaceReviewDock
                 sessionId={view.session.id}
-                refreshKey={`${view.events.length}:${notice}:${busy}`}
+                refreshKey={`${view.events.length}:${fileSavedVersion}:${busy}`}
                 openFile={(path) => openFile(path, true)}
               />
             </div>
@@ -1410,17 +1451,33 @@ function App() {
                 <QuestionReply
                   key={question.id}
                   question={question.text}
+                  context={question.context}
+                  options={question.options}
+                  kind={question.kind}
                   disabled={busy || view.needsReview}
-                  answer={(text) =>
-                    api('answerQuestion', {
-                      sessionId: view.session.id,
-                      questionId: question.id,
-                      text,
-                      maxModelCalls,
-                      allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
-                      unattended: maxModelCalls > 24 && unattended,
-                    })
-                  }
+                  answer={async (text) => {
+                    const sessionId = view.session.id;
+                    const revision = viewRevision.current;
+                    const result = await api<{ started?: boolean; events?: SessionEvent[] }>(
+                      'answerQuestion',
+                      {
+                        sessionId,
+                        questionId: question.id,
+                        text,
+                        maxModelCalls,
+                        allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+                        unattended: maxModelCalls > 24 && unattended,
+                      },
+                    );
+                    setBusySessionId(sessionId);
+                    if (result.events && isCurrentView(revision, sessionId)) {
+                      setView((previous) =>
+                        acceptsEventSnapshot(previous, sessionId, result.events!)
+                          ? { ...previous!, events: result.events! }
+                          : previous,
+                      );
+                    }
+                  }}
                   finish={() => void finishPausedTurn()}
                   fail={fail}
                 />
@@ -1445,7 +1502,13 @@ function App() {
                       <span className="composer-chip" key={item.id} title={item.note}>
                         <Paperclip size={13} />
                         {item.name}
-                        {item.note ? ' · 无法提取内容' : ''}
+                        {item.note
+                          ? item.note.startsWith('无法提取')
+                            ? ' · 无法提取内容'
+                            : item.note.includes('截断')
+                              ? ' · 已截断'
+                              : ' · 部分提取'
+                          : ''}
                         <button
                           aria-label={`移除 ${item.name}`}
                           onClick={() =>
@@ -1571,7 +1634,8 @@ function App() {
                     </button>
                     <button
                       type="button"
-                      className={`composer-action-btn composer-mode-toggle ${config.approvalMode === 'auto' ? 'active' : ''}`}
+                      className={`composer-action-btn composer-mode-toggle ${config.approvalMode !== 'ask' ? 'active' : ''}`}
+                      disabled={approvalSaving}
                       title={
                         config.approvalMode === 'auto'
                           ? '当前为【自动执行】模式（除恶意操作全自动，点击切换为每次询问）'
@@ -1581,15 +1645,22 @@ function App() {
                       }
                       aria-label="切换审批模式"
                       onClick={() => {
+                        if (approvalSaving) return;
+                        setApprovalSaving(true);
                         const nextMode = config.approvalMode === 'auto' ? 'ask' : 'auto';
                         void api<Config>('setApprovalMode', { mode: nextMode })
                           .then(setConfig)
-                          .catch(fail);
+                          .catch(fail)
+                          .finally(() => setApprovalSaving(false));
                       }}
                     >
                       <ShieldCheck size={15} />
                       <span className="composer-mode-badge">
-                        {config.approvalMode === 'auto' ? '自动审批' : '手动审核'}
+                        {config.approvalMode === 'auto'
+                          ? '自动审批'
+                          : config.approvalMode === 'autoSafe'
+                            ? '只读免审'
+                            : '手动审核'}
                       </span>
                     </button>
                   </div>
@@ -1618,7 +1689,9 @@ function App() {
                         }}
                         disabled={busy || modelLoading}
                       >
-                        {config.profiles.length > 1 ? (
+                        {config.profiles.length > 1 ||
+                        (config.profiles.length === 1 &&
+                          config.profiles[0].alias !== view.session.profile.alias) ? (
                           <>
                             {!config.profiles.some(
                               (p) => p.alias === view.session.profile.alias,
@@ -1732,7 +1805,7 @@ function App() {
                       ⌘ ↵
                     </span>
 
-                    {busy && (
+                    {isCurrentBusy && (
                       <select
                         aria-label="消息处理时机"
                         value={delivery}
@@ -1744,8 +1817,15 @@ function App() {
                     )}
                     <button
                       className="send-button"
-                      title={busy ? '发送到队列 (⌘/Ctrl + Enter)' : '发送 (⌘/Ctrl + Enter)'}
+                      title={
+                        isOtherBusy
+                          ? '其他会话正在运行任务'
+                          : isCurrentBusy
+                            ? '发送到队列 (⌘/Ctrl + Enter)'
+                            : '发送 (⌘/Ctrl + Enter)'
+                      }
                       disabled={
+                        isOtherBusy ||
                         Boolean(question) ||
                         sending ||
                         (!composer.trim() && !attachments.length && !quote) ||
@@ -1755,7 +1835,7 @@ function App() {
                     >
                       <Send size={15} />
                     </button>
-                    {busy && (
+                    {isCurrentBusy && (
                       <button
                         className="send-button stop"
                         title="停止运行"
@@ -2372,7 +2452,11 @@ function Modal({
   closeRef.current = close;
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (
+        event.key === 'Escape' &&
+        !event.defaultPrevented &&
+        !document.querySelector('dialog[open]')
+      ) {
         event.preventDefault();
         closeRef.current();
       }
@@ -2449,41 +2533,82 @@ type PatchCandidate = { id: string; prompt: string; baseCommit: string; running:
 
 function QuestionReply({
   question,
+  context,
+  options,
+  kind,
   disabled,
   answer,
   finish,
   fail,
 }: {
   question: string;
+  context?: string;
+  options?: string[];
+  kind?: string;
   disabled: boolean;
   answer: (text: string) => Promise<unknown>;
   finish: () => void;
   fail: (error: unknown) => void;
 }) {
+  const inputId = useId();
   const [text, setText] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const submitAnswer = (value: string) => {
+    if (disabled || submitting || !value.trim()) return;
+    setSubmitting(true);
+    void answer(value)
+      .catch(fail)
+      .finally(() => setSubmitting(false));
+  };
+  const kindLabels: Record<string, string> = {
+    clarification: '需要澄清',
+    decision: '需要决策',
+    confirmation: '需要确认',
+  };
   return (
     <form
       className="composer"
       onSubmit={(event) => {
         event.preventDefault();
-        if (disabled || submitting || !text.trim()) return;
-        setSubmitting(true);
-        void answer(text)
-          .catch(fail)
-          .finally(() => setSubmitting(false));
+        submitAnswer(text);
       }}
     >
-      <label>
-        {question}
+      <div>
+        <label htmlFor={inputId}>
+          {kind && kindLabels[kind] ? `[${kindLabels[kind]}] ` : ''}
+          {question}
+        </label>
+        {context && <small className="question-context">{context}</small>}
+        {options && options.length > 0 && (
+          <div className="runtime-row question-options" role="group" aria-label="快捷选项">
+            {options.map((option, index) => (
+              <button
+                key={`${index}-${option}`}
+                type="button"
+                disabled={disabled || submitting}
+                onClick={() => submitAnswer(option)}
+              >
+                {index + 1}. {option}
+              </button>
+            ))}
+          </div>
+        )}
         <textarea
+          id={inputId}
           aria-label="答复待答问题"
+          placeholder={options?.length ? '点击上方选项或输入自定义答复…' : undefined}
           value={text}
           maxLength={10_000}
           onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+              event.preventDefault();
+              submitAnswer(text);
+            }
+          }}
           disabled={disabled || submitting}
         />
-      </label>
+      </div>
       <div className="runtime-row">
         <button type="submit" disabled={disabled || submitting || !text.trim()}>
           答复并继续
@@ -2552,6 +2677,10 @@ function RuntimeDialog({
   const [retryConfirmId, setRetryConfirmId] = useState('');
   const [memoryKey, setMemoryKey] = useState('');
   const [memoryContent, setMemoryContent] = useState('');
+  const [webhookUrl, setWebhookUrl] = useState(config.webhookUrl ?? '');
+  useEffect(() => {
+    setWebhookUrl(config.webhookUrl ?? '');
+  }, [config.webhookUrl]);
   useEffect(() => {
     if (!session) return;
     let active = true;
@@ -2602,7 +2731,7 @@ function RuntimeDialog({
     }
     setWorking(true);
     try {
-      const result = await api<{ output: string }>('runtimeTool', {
+      const result = await api<{ output: string; isError?: boolean }>('runtimeTool', {
         sessionId: session.id,
         name,
         input,
@@ -2611,12 +2740,12 @@ function RuntimeDialog({
           : {}),
       });
       setOutput(result.output);
-      if (name === 'list_snapshots') {
+      if (!result.isError && name === 'list_snapshots') {
         const page = JSON.parse(result.output);
         setSnapshots((old) => (input.offset ? [...old, ...page.snapshots] : page.snapshots));
         setSnapshotOffset(page.nextOffset);
       }
-      if (name === 'restore_snapshot') {
+      if (!result.isError && name === 'restore_snapshot') {
         setSnapshots([]);
         setSnapshotConfirm('');
       }
@@ -2748,6 +2877,35 @@ function RuntimeDialog({
   return (
     <Modal title="MCP 与自动化" eyebrow="AGENT CAPABILITIES" close={close}>
       <div className="runtime-settings form-stack">
+        <h3>人工注意通知 Webhook（可选）</h3>
+        <div className="runtime-row">
+          <input
+            value={webhookUrl}
+            onChange={(e) => setWebhookUrl(e.target.value)}
+            placeholder="https://hooks.example.com/bruin（仅支持 HTTPS 或本机 localhost）"
+            maxLength={500}
+            aria-label="通知 Webhook 地址"
+          />
+          <button
+            type="button"
+            disabled={working}
+            onClick={() => void manage('setWebhookUrl', { url: webhookUrl })}
+          >
+            保存
+          </button>
+          {config.webhookUrl && (
+            <button
+              type="button"
+              disabled={working}
+              onClick={() => {
+                setWebhookUrl('');
+                void manage('setWebhookUrl', { url: '' });
+              }}
+            >
+              清除
+            </button>
+          )}
+        </div>
         <h3>仓库索引与文件快照</h3>
         <input
           value={indexQuery}

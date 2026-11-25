@@ -93,14 +93,18 @@ export function readWorkspaceFile(
       const normRelative = path.relative(root, target).split(path.sep).join('/');
       const gitShow = execFileSync('git', ['show', `HEAD:./${normRelative}`], {
         cwd: root,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
         stdio: ['ignore', 'pipe', 'ignore'],
-        encoding: 'utf8',
         maxBuffer: limit + 1024,
         timeout: 5000,
       });
-      baselineContent = gitShow;
+      if (!gitShow.includes(0)) {
+        baselineContent = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+          gitShow,
+        );
+      }
     } catch {
-      // Untracked or not a git repository
+      // Untracked, binary/non-UTF-8 baseline, or not a git repository
     }
     return { path: relative, content, truncated: size > limit, baselineContent };
   } finally {
@@ -187,7 +191,6 @@ export function writeWorkspaceFile(
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    recordSnapshot(root, target, buffer);
     checkedWorkspacePath(workspace, target, true);
     const currentParent = fs.lstatSync(parent);
     if (
@@ -214,6 +217,7 @@ export function writeWorkspaceFile(
           currentTarget.mtimeMs !== expected.mtimeMs))
     )
       throw new Error('写入期间目标文件发生变化');
+    recordSnapshot(root, target, buffer);
     fs.renameSync(temp, target);
   } finally {
     if (fd !== undefined) {

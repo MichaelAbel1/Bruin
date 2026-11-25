@@ -13,6 +13,7 @@ import {
   updateConfig,
   setRuntimeApiKey,
   validApiKeyEnv,
+  isAllowedWebhookUrl,
   mcpServerSchema,
   hookSchema,
 } from './config.js';
@@ -47,7 +48,9 @@ import type { ModelProfile, ProviderKind, Session, ToolCall } from './core/types
 import { RuntimeServices } from './runtime/services.js';
 import { createSubagentRunner } from './runtime/subagent.js';
 import { turnState } from './core/turn-state.js';
+import { reduceSessionState } from './core/session-state.js';
 import { pendingQuestion, recordQuestionAnswer } from './core/question.js';
+import { sendAttentionWebhook } from './runtime/notify.js';
 import { cronPlan, recoverCronJobs } from './runtime/cron.js';
 import { needsUnknownReview, recordUnknownReview } from './core/unknown-review.js';
 import {
@@ -209,13 +212,98 @@ function needsReview(id: string): boolean {
 }
 function viewSession(session: Session) {
   const events = store.events(session.id);
+  const state = reduceSessionState(events);
   return {
     session,
     events: redactEvents(events, session.profile.alias),
     plan: planState(events),
     tasks: store.listTasks(session.id),
-    needsReview: needsUnknownReview(events),
+    needsReview: state.needsReview,
+    state,
   };
+}
+const inFlightWebhooks = new Set<Promise<unknown>>();
+function trackWebhook(promise: Promise<unknown>): void {
+  inFlightWebhooks.add(promise);
+  void promise.finally(() => {
+    inFlightWebhooks.delete(promise);
+  });
+}
+function sessionSecrets(session: Session): string[] {
+  const secrets: string[] = [];
+  const runtime = getRuntimeApiKey(session.profile.alias);
+  if (runtime) secrets.push(runtime);
+  try {
+    const resolved = resolveApiKey(session.profile);
+    if (resolved) secrets.push(resolved);
+  } catch {
+    // Missing env key is valid for local / unconfigured profiles.
+  }
+  return secrets;
+}
+function notifyAttentionForSession(session: Session, failureMessage?: string): void {
+  const state = reduceSessionState(store.events(session.id));
+  const extraSecrets = sessionSecrets(session);
+  if (failureMessage) {
+    trackWebhook(
+      sendAttentionWebhook(
+        {
+          event: 'run_failed',
+          sessionId: session.id,
+          workspace: session.workspace,
+          phase: state.phase,
+          reason: failureMessage.slice(0, 500),
+        },
+        { extraSecrets },
+      ),
+    );
+    return;
+  }
+  if (state.phase === 'awaiting_input' && state.pendingQuestion) {
+    trackWebhook(
+      sendAttentionWebhook(
+        {
+          event: 'awaiting_input',
+          sessionId: session.id,
+          workspace: session.workspace,
+          phase: state.phase,
+          questionId: state.pendingQuestion.id,
+          question: state.pendingQuestion.text,
+          options: state.pendingQuestion.options,
+        },
+        { extraSecrets },
+      ),
+    );
+    return;
+  }
+  if (state.phase === 'awaiting_review') {
+    trackWebhook(
+      sendAttentionWebhook(
+        {
+          event: 'awaiting_review',
+          sessionId: session.id,
+          workspace: session.workspace,
+          phase: state.phase,
+          reason: `发现 ${state.unreviewedUnknownCount} 个结果未知的工具调用需要人工检查`,
+        },
+        { extraSecrets },
+      ),
+    );
+    return;
+  }
+  if (state.phase === 'paused') {
+    trackWebhook(
+      sendAttentionWebhook(
+        {
+          event: 'paused',
+          sessionId: session.id,
+          workspace: session.workspace,
+          phase: state.phase,
+        },
+        { extraSecrets },
+      ),
+    );
+  }
 }
 function redactApiKeys(text: string, key?: string) {
   return (key ? text.replaceAll(key, '[REDACTED]') : text).replace(
@@ -352,25 +440,28 @@ async function startRun(
     .run(session, prompt, controller.signal, attachments, quote, {
       allowWorkspaceEdits: runSettings.allowWorkspaceEdits,
       allowQuestions: true,
+      unattended: runSettings.unattended,
       ...(runSettings.maxModelCalls > 24
         ? {
             maxModelCalls: runSettings.maxModelCalls,
             maxDurationMs: 8 * 60 * 60 * 1000,
             checkpointEvery: 24,
-            unattended: runSettings.unattended,
           }
         : {}),
     })
     .then(() => {
       event('runFinished', { sessionId: session.id, events: viewSession(session).events });
+      notifyAttentionForSession(session);
       return true;
     })
     .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
       event('runFailed', {
         sessionId: session.id,
-        message: error instanceof Error ? error.message : String(error),
+        message,
         events: viewSession(session).events,
       });
+      notifyAttentionForSession(session, message);
       return false;
     })
     .finally(() => {
@@ -657,10 +748,12 @@ async function dispatch(method: string, p: Record<string, unknown>) {
     case 'answerQuestion': {
       if (typeof p.questionId !== 'string' || typeof p.text !== 'string')
         throw new Error('无效的问题答复');
-      return startRun(getSession(p.sessionId), undefined, [], undefined, requestedRunSettings(p), {
+      const session = getSession(p.sessionId);
+      const started = await startRun(session, undefined, [], undefined, requestedRunSettings(p), {
         id: p.questionId,
         text: p.text,
       });
+      return { ...started, events: viewSession(session).events };
     }
     case 'finishPausedTurn': {
       if (active) throw new Error('请等待当前任务结束');
@@ -749,6 +842,19 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       if (mode !== 'ask' && mode !== 'autoSafe' && mode !== 'auto')
         throw new Error('无效的审批模式');
       return updateConfig((config) => ({ ...config, approvalMode: mode }));
+    }
+    case 'setWebhookUrl': {
+      const raw = typeof p.url === 'string' ? p.url.trim() : '';
+      if (!raw) {
+        return updateConfig((config) => {
+          const next = { ...config };
+          delete next.webhookUrl;
+          return next;
+        });
+      }
+      if (!isAllowedWebhookUrl(raw))
+        throw new Error('Webhook 地址必须使用 HTTPS（或本机 localhost HTTP）且不能包含内嵌凭据');
+      return updateConfig((config) => ({ ...config, webhookUrl: raw }));
     }
     case 'removeApprovedCommand': {
       const workspace = String(p.workspace ?? '');
@@ -1315,6 +1421,7 @@ async function shutdown() {
   await activeRun;
   await scheduled;
   await memoryReviewRun?.result.catch(() => {});
+  await Promise.allSettled([...inFlightWebhooks]);
   await services.close();
   await executor.close();
   store.close();

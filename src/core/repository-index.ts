@@ -102,6 +102,7 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
   }
   const entries: Entry[] = [];
   const buffer = Buffer.allocUnsafe(1_000_001);
+  const verifiedDirs = new Set<string>([root]);
   let bytes = 0;
   for (const relative of [...new Set(paths)]) {
     if (Date.now() > deadline || bytes > 20_000_000) {
@@ -113,14 +114,17 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
     try {
       let current = root;
       let symlink = false;
-      for (const part of path.relative(root, file).split(path.sep)) {
-        current = path.join(current, part);
+      const parts = path.relative(root, file).split(path.sep);
+      for (let i = 0; i < parts.length - 1; i++) {
+        current = path.join(current, parts[i]);
+        if (verifiedDirs.has(current)) continue;
         if (fs.lstatSync(current).isSymbolicLink()) {
           symlink = true;
           break;
         }
+        verifiedDirs.add(current);
       }
-      if (symlink) continue;
+      if (symlink || fs.lstatSync(file).isSymbolicLink()) continue;
       const fd = fs.openSync(
         file,
         fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
@@ -132,14 +136,18 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
           entries.push({ path: relative, hash: '', size: stat.size, symbols: [] });
           continue;
         }
-        let count = 0;
+        // Probe the first 8 KB to skip binary files before reading up to 1 MB or burning budget.
+        const probeSize = Math.min(8192, buffer.length);
+        const probed = fs.readSync(fd, buffer, 0, probeSize, 0);
+        if (buffer.subarray(0, probed).includes(0)) continue;
+        let count = probed;
         while (count < buffer.length) {
           const read = fs.readSync(fd, buffer, count, buffer.length - count, count);
           if (!read) break;
           count += read;
         }
+        if (count > 1_000_000 || buffer.subarray(probed, count).includes(0)) continue;
         bytes += count;
-        if (count > 1_000_000 || buffer.subarray(0, count).includes(0)) continue;
         const hash = digest(buffer.subarray(0, count));
         const old = cached.get(relative);
         if (
@@ -171,17 +179,19 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
       /* Unreadable or changing files are omitted. */
     }
   }
-  const temp = `${cacheFile}.${randomUUID()}.tmp`;
-  try {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(temp, JSON.stringify(entries), { flag: 'wx', mode: 0o600 });
-    fs.renameSync(temp, cacheFile);
-  } catch {
-    /* Current results are usable even when the optional cache cannot be written. */
-  } finally {
+  if (!truncated || entries.length >= previous.length) {
+    const temp = `${cacheFile}.${randomUUID()}.tmp`;
     try {
-      fs.unlinkSync(temp);
-    } catch {}
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(temp, JSON.stringify(entries), { flag: 'wx', mode: 0o600 });
+      fs.renameSync(temp, cacheFile);
+    } catch {
+      /* Current results are usable even when the optional cache cannot be written. */
+    } finally {
+      try {
+        fs.unlinkSync(temp);
+      } catch {}
+    }
   }
   const terms = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
   const results = entries

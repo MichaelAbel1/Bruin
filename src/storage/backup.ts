@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
+import { Transform } from 'node:stream';
 import Database from 'better-sqlite3';
 import { z } from 'zod';
-import { acquireDatabaseMaintenance } from './database-access.js';
+import { acquireDatabaseMaintenance, cleanupDatabaseRegistry } from './database-access.js';
 import { SqliteEventStore } from './event-store.js';
 
 const roots = [
@@ -77,21 +78,40 @@ async function hashFile(file: string): Promise<string> {
     if (!streamOwned) fs.closeSync(fd);
   }
 }
-async function copyFile(source: string, target: string, mode: number): Promise<void> {
+async function copyFile(
+  source: string,
+  target: string,
+  mode: number,
+): Promise<{ sha256: string; size: number }> {
   checked(source);
   const fd = fs.openSync(
     source,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
   );
   let streamOwned = false;
+  let reader: fs.ReadStream | undefined;
   let before: fs.Stats;
+  const hash = createHash('sha256');
+  let size = 0;
   try {
     before = fs.fstatSync(fd);
     if (!before.isFile()) throw new Error('备份仅支持普通文件');
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-    const reader = fs.createReadStream(source, { fd });
+    const writer = fs.createWriteStream(target, { flags: 'wx', mode: 0o600 });
+    reader = fs.createReadStream(source, { fd });
     streamOwned = true;
-    await pipeline(reader, fs.createWriteStream(target, { flags: 'wx', mode: 0o600 }));
+    const hasher = new Transform({
+      transform(chunk, _encoding, callback) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        hash.update(buf);
+        size += buf.length;
+        callback(null, buf);
+      },
+    });
+    await pipeline(reader, hasher, writer);
+  } catch (error) {
+    reader?.destroy();
+    throw error;
   } finally {
     if (!streamOwned) fs.closeSync(fd);
   }
@@ -104,6 +124,7 @@ async function copyFile(source: string, target: string, mode: number): Promise<v
   )
     throw new Error('备份源文件在复制期间发生变化');
   fs.chmodSync(target, mode);
+  return { sha256: hash.digest('hex'), size };
 }
 function filesIn(directory: string, relative = ''): string[] {
   checked(directory);
@@ -204,13 +225,18 @@ export async function createBackup(home: string, destination: string) {
         const original = path.join(root, relative);
         const output = path.join(staging, 'data', relative);
         const mode = fs.statSync(original).mode & 0o777;
-        if (relative !== 'sessions.sqlite') await copyFile(original, output, mode);
-        fs.chmodSync(output, relative === 'sessions.sqlite' ? 0o600 : mode);
+        let copied: { sha256: string; size: number };
+        if (relative !== 'sessions.sqlite') {
+          copied = await copyFile(original, output, mode);
+        } else {
+          copied = { sha256: await hashFile(output), size: fs.statSync(output).size };
+          fs.chmodSync(output, 0o600);
+        }
         manifest.files.push({
           path: relative,
           mode: relative === 'sessions.sqlite' ? 0o600 : mode,
-          size: fs.statSync(output).size,
-          sha256: await hashFile(output),
+          size: copied.size,
+          sha256: copied.sha256,
         });
       }
     }
@@ -298,12 +324,13 @@ export async function restoreBackup(home: string, directory: string, confirmatio
     for (const file of backup.manifest.files) {
       const source = path.join(backup.root, 'data', file.path);
       const output = path.join(staging, file.path);
-      await copyFile(source, output, file.mode);
-      if ((await hashFile(output)) !== file.sha256)
+      const copied = await copyFile(source, output, file.mode);
+      if (copied.sha256 !== file.sha256 || copied.size !== file.size)
         throw new Error('备份在恢复期间发生变化，未替换数据目录');
     }
     // Keep stale in-flight work from becoming eligible for automatic replay.
-    const db = new Database(path.join(staging, 'sessions.sqlite'));
+    const stagedDbPath = path.join(staging, 'sessions.sqlite');
+    const db = new Database(stagedDbPath);
     try {
       db.transaction(() => {
         db.prepare('DELETE FROM session_leases').run();
@@ -314,15 +341,16 @@ export async function restoreBackup(home: string, directory: string, confirmatio
     } finally {
       db.close();
     }
-    const staged = new SqliteEventStore(path.join(staging, 'sessions.sqlite'));
+    const staged = new SqliteEventStore(stagedDbPath);
     try {
       for (const session of staged.listSessions())
         for (const job of staged.listCronJobs(session.id))
           if (job.lastStatus === 'dispatched') staged.markCronJob(job.id, 'needs_review');
     } finally {
       staged.close();
+      cleanupDatabaseRegistry(stagedDbPath);
     }
-    inspectDatabase(path.join(staging, 'sessions.sqlite'));
+    inspectDatabase(stagedDbPath);
     if (fs.existsSync(target)) {
       fs.renameSync(target, previous);
       moved = true;

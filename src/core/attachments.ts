@@ -102,15 +102,18 @@ function extractText(file: string, name: string): { text: string; note?: string 
       }
       const strings = [...shared.matchAll(/<si>([\s\S]*?)<\/si>/g)].map((item) => xmlText(item[1]));
       const sheet = zipEntry(file, 'xl/worksheets/sheet1.xml');
-      const rows = [...sheet.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)].map((row) =>
-        [...row[1].matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)]
-          .map((cell) => {
-            const value = cell[2].match(/<v>([\s\S]*?)<\/v>/)?.[1] ?? '';
-            if (/\bt="s"/.test(cell[1])) return strings[Number(value)] ?? '';
-            if (/\bt="inlineStr"/.test(cell[1])) return xmlText(cell[2]);
-            return xmlText(value);
-          })
-          .join('\t'),
+      const rows = [...sheet.matchAll(/<row\b[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g)].map((row) =>
+        row[1] === undefined
+          ? ''
+          : [...row[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)]
+              .map((cell) => {
+                if (cell[2] === undefined) return '';
+                const value = cell[2].match(/<v>([\s\S]*?)<\/v>/)?.[1] ?? '';
+                if (/\bt="s"/.test(cell[1])) return strings[Number(value)] ?? '';
+                if (/\bt="inlineStr"/.test(cell[1])) return xmlText(cell[2]);
+                return xmlText(value);
+              })
+              .join('\t'),
       );
       return extractedText(rows.join('\n'), '仅提取第一个工作表');
     }
@@ -153,12 +156,12 @@ function collect(files: string[], input: string): void {
   const stat = fs.lstatSync(input);
   if (stat.isSymbolicLink()) throw new Error('附件不允许符号链接');
   if (stat.isFile()) {
+    if (files.length >= maxFiles) throw new Error('一次最多上传 30 个文件');
     files.push(input);
     return;
   }
   if (!stat.isDirectory()) throw new Error('仅支持普通文件和文件夹');
   for (const entry of fs.readdirSync(input)) {
-    if (files.length >= maxFiles) throw new Error('一次最多上传 30 个文件');
     collect(files, path.join(input, entry));
   }
 }

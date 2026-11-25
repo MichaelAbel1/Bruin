@@ -912,3 +912,50 @@ test('a failure to record a created worktree reports its retained path and relea
     false,
   );
 });
+
+test('spawn_subagent forwards micro-agent scope, deliverable, and clamped maxSteps', async (t) => {
+  const f = fixture(t);
+  let childCalls = 0;
+  let observedSystem = '';
+  const services = f.runtime(() => ({
+    async complete(_profile, prompt) {
+      childCalls++;
+      observedSystem = String(prompt[0]?.content ?? '');
+      return {
+        text: '',
+        calls: [{ id: `read-${childCalls}`, name: 'read_file', input: { path: 'source.txt' } }],
+      };
+    },
+  }));
+  const started = await services.execute(
+    {
+      id: 'spawn',
+      name: 'spawn_subagent',
+      input: {
+        mode: 'read-only',
+        prompt: 'Audit source.txt',
+        scope: 'Only inspect source.txt',
+        deliverable: 'Bullet list of issues with line numbers',
+        maxSteps: 2,
+      },
+    },
+    f.session,
+    f.signal,
+    { maxModelCalls: 10 },
+  );
+  assert.equal(started.isError, false);
+  await services.waitForSubagents(f.session.id, f.signal);
+  assert.equal(childCalls, 2);
+  assert.match(observedSystem, /Focused micro-agent contract/);
+  assert.match(observedSystem, /Only inspect source\.txt/);
+  assert.match(observedSystem, /Bullet list of issues with line numbers/);
+  const startedEvent = f.store
+    .events(f.session.id)
+    .find((event) => event.type === 'subagent_started');
+  assert.equal(startedEvent?.payload.scope, 'Only inspect source.txt');
+  assert.equal(startedEvent?.payload.deliverable, 'Bullet list of issues with line numbers');
+  assert.equal(
+    (startedEvent?.payload.budget as { maxModelCalls?: number } | undefined)?.maxModelCalls,
+    2,
+  );
+});

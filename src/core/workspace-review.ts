@@ -11,7 +11,7 @@ export interface WorkspaceChange {
   source: 'agent' | 'workspace';
   status: 'added' | 'modified' | 'deleted';
 }
-function recordedWrites(events: Event[]) {
+function recordedWrites(events: Event[], root?: string) {
   const pending = new Map<string, Event[]>();
   const writes = new Map<string, { from: string; to: string }>();
   for (const event of events) {
@@ -30,8 +30,14 @@ function recordedWrites(events: Event[]) {
       if (!request || event.type !== 'tool_finished' || event.payload.isError) continue;
       if (!['write_file', 'edit_file'].includes(String(request.payload.name))) continue;
       const input = request.payload.input as Record<string, unknown> | undefined;
-      if (typeof input?.path === 'string' && !writes.has(input.path))
-        writes.set(input.path, { from: request.at, to: event.at });
+      if (typeof input?.path !== 'string') continue;
+      let key = input.path;
+      if (root) {
+        const resolved = path.resolve(root, input.path);
+        if (!resolved.startsWith(root + path.sep)) continue;
+        key = path.relative(root, resolved).split(path.sep).join('/');
+      }
+      if (!writes.has(key)) writes.set(key, { from: request.at, to: event.at });
     }
   }
   return writes;
@@ -119,7 +125,7 @@ export function listWorkspaceChanges(
   const root = fs.realpathSync(workspace);
   if (baseCommit !== undefined) return listChangesFromCommit(root, events, baseCommit);
   const changes = new Map<string, WorkspaceChange>();
-  const writes = recordedWrites(events);
+  const writes = recordedWrites(events, root);
   let snapshots: ReturnType<typeof listSnapshots> = [];
   if (writes.size) {
     try {
@@ -169,7 +175,17 @@ export function listWorkspaceChanges(
         const previous = entries[++i];
         if (state.includes('R') && previous?.startsWith(prefix)) {
           const oldPath = previous.slice(prefix.length);
-          changes.set(oldPath, { path: oldPath, source: 'workspace', status: 'deleted' });
+          if (
+            oldPath &&
+            !oldPath.split('/').includes('.bruin') &&
+            !oldPath.split('/').includes('node_modules')
+          ) {
+            changes.set(oldPath, {
+              path: oldPath,
+              source: changes.get(oldPath)?.source ?? 'workspace',
+              status: 'deleted',
+            });
+          }
         }
       }
       if (!name.startsWith(prefix)) continue;
@@ -244,8 +260,13 @@ export function readWorkspaceReview(
   if (change.status === 'deleted') {
     if (baseline === undefined) {
       try {
-        baseline = git(workspace, ['show', `HEAD:./${relative.split(path.sep).join('/')}`]);
-      } catch {
+        baseline = git(workspace, ['show', `HEAD:./${relative.split(path.sep).join('/')}`], {
+          strictText: true,
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
+          throw new Error('删除文件超过预览上限');
+        if (error instanceof TypeError) throw new Error('文件不是有效的 UTF-8 文本');
         baseline = '';
       }
     }

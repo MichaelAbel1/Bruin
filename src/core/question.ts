@@ -2,7 +2,17 @@ import type { EventStore } from '../storage/event-store.js';
 
 type Event = { seq: number; type: string; payload: Record<string, unknown> };
 
-export function pendingQuestion(events: readonly Event[]) {
+export type QuestionKind = 'clarification' | 'decision' | 'confirmation';
+export interface PendingQuestion {
+  id: string;
+  text: string;
+  seq: number;
+  options?: string[];
+  context?: string;
+  kind?: QuestionKind;
+}
+
+export function pendingQuestion(events: readonly Event[]): PendingQuestion | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
     const { type, seq, payload } = events[index];
     if (type === 'user' || type === 'turn_completed') break;
@@ -12,8 +22,29 @@ export function pendingQuestion(events: readonly Event[]) {
       !payload.isError &&
       typeof payload.questionId === 'string' &&
       typeof payload.question === 'string'
-    )
-      return { id: payload.questionId, text: payload.question, seq };
+    ) {
+      const options = Array.isArray(payload.options)
+        ? payload.options.filter(
+            (item): item is string => typeof item === 'string' && Boolean(item),
+          )
+        : undefined;
+      const context =
+        typeof payload.context === 'string' && payload.context.trim() ? payload.context : undefined;
+      const kind =
+        payload.kind === 'clarification' ||
+        payload.kind === 'decision' ||
+        payload.kind === 'confirmation'
+          ? payload.kind
+          : undefined;
+      return {
+        id: payload.questionId,
+        text: payload.question,
+        seq,
+        ...(options && options.length >= 2 ? { options } : {}),
+        ...(context ? { context } : {}),
+        ...(kind ? { kind } : {}),
+      };
+    }
   }
 }
 

@@ -10,8 +10,13 @@ export const toolDefinitions = {
     parallel: false,
     replay: 'safe' as const,
     description:
-      'Pause the task to ask one business question whose answer is needed to continue. Call this tool on its own. Use regular tool approvals for actions that require permission.',
-    inputSchema: z.object({ question: z.string().trim().min(1).max(2000) }),
+      'Pause the task to ask one structured business question whose answer is needed to continue. Call this tool on its own. Optionally supply 2–6 concise options, brief context, and kind (clarification/decision/confirmation). Use regular tool approvals for actions that require permission.',
+    inputSchema: z.object({
+      question: z.string().trim().min(1).max(2000),
+      options: z.array(z.string().trim().min(1).max(200)).min(2).max(6).optional(),
+      context: z.string().trim().min(1).max(2000).optional(),
+      kind: z.enum(['clarification', 'decision', 'confirmation']).optional(),
+    }),
   },
   search_repository: {
     target: 'executor' as const,
@@ -164,11 +169,14 @@ export const toolDefinitions = {
     parallel: false,
     replay: 'manual' as const,
     description:
-      'Start a bounded subagent. Default read-only researches the current workspace. Mode worktree creates a dedicated worktree at HEAD for edits using inherited permissions; changes are retained for review, never automatically merged.',
+      'Start a small, focused subagent. Default read-only researches the current workspace. Mode worktree creates a dedicated worktree at HEAD for edits using inherited permissions; changes are retained for review, never automatically merged. Prefer narrow scope, clear deliverable, and bounded maxSteps.',
     inputSchema: z.object({
       prompt: z.string(),
       worktree: z.string().optional(),
       mode: z.enum(['read-only', 'worktree']).optional(),
+      scope: z.string().trim().min(1).max(500).optional(),
+      deliverable: z.string().trim().min(1).max(1000).optional(),
+      maxSteps: z.number().int().min(1).max(48).optional(),
     }),
   },
   subagent_status: {

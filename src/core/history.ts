@@ -291,6 +291,11 @@ export function buildPrompt(
       // Standalone desktop actions or already-flushed calls have no pending model tool call.
       if (!pending && (desktopCalls.has(callId) || flushedCallIds.has(callId))) continue;
       const toolName = String(event.payload.name || pending?.name || 'tool');
+      const isFailure = event.type !== 'tool_finished' || Boolean(event.payload.isError);
+      const rawOutput = toolOutputForModel(event, toolName);
+      const formattedOutput = isFailure
+        ? compactToolError(rawOutput, 4_000)
+        : excerpt(rawOutput, 12_000);
       const result: ModelMessage = {
         role: 'tool',
         content: [
@@ -300,7 +305,7 @@ export function buildPrompt(
             toolName,
             output: {
               type: 'text',
-              value: `${event.type !== 'tool_finished' || Boolean(event.payload.isError) ? 'ERROR: ' : ''}${excerpt(toolOutputForModel(event, toolName), 12_000)}`,
+              value: `${isFailure ? 'ERROR: ' : ''}${formattedOutput}`,
             },
           },
         ],
@@ -413,6 +418,33 @@ export function historyCompactionRange(
     previous: String(checkpoint?.payload.text ?? ''),
     ...(keepUserSeq === undefined ? {} : { keepUserSeq }),
   };
+}
+
+/** Compact noisy error outputs for context efficiency while keeping root cause and tail intact. */
+export function compactToolError(value: string, limit = 4_000): string {
+  // Strip ANSI escape codes that burn tokens without adding diagnostic signal.
+  const stripped = value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\r\n/g, '\n');
+  const lines = stripped.split('\n');
+  const collapsed: string[] = [];
+  let prev: string | undefined;
+  let repeatCount = 0;
+  const flushRepeat = () => {
+    if (repeatCount > 0) {
+      collapsed.push(`[中间内容已压缩：重复行省略 ${repeatCount} 次]`);
+      repeatCount = 0;
+    }
+  };
+  for (const line of lines) {
+    if (line === prev && (line.trim() !== '' || collapsed.at(-1) === '')) {
+      repeatCount++;
+      continue;
+    }
+    flushRepeat();
+    collapsed.push(line);
+    prev = line;
+  }
+  flushRepeat();
+  return excerpt(collapsed.join('\n').trim(), limit);
 }
 
 function excerpt(value: string, limit: number): string {

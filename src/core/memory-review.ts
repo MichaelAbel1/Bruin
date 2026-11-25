@@ -54,7 +54,7 @@ export function memoryReviewEvidence(
 ): MemoryEvidence[] {
   const messages: MemoryEvidence[] = [];
   const results: MemoryEvidence[] = [];
-  const commands = new Map<string, { seq: number; text: string }>();
+  const commands = new Map<string, Array<{ seq: number; text: string } | null>>();
   for (const { seq, type, payload } of events) {
     if (seq < turn.startSeq || seq >= turn.endSeq) continue;
     if (type === 'user' && typeof payload.text === 'string' && payload.text.trim()) {
@@ -62,16 +62,20 @@ export function memoryReviewEvidence(
     }
     if (payload.name !== 'shell' || typeof payload.callId !== 'string') continue;
     if (type === 'tool_requested') {
-      commands.delete(payload.callId);
+      const queue = commands.get(payload.callId) ?? [];
       const command = (payload.input as { command?: unknown } | undefined)?.command;
       if (typeof command === 'string') {
         const text = redact(command);
-        if (text.length <= 400) commands.set(payload.callId, { seq, text });
+        queue.push(text.length <= 400 ? { seq, text } : null);
+      } else {
+        queue.push(null);
       }
+      commands.set(payload.callId, queue);
     }
     if (type === 'tool_finished' || type === 'tool_denied' || type === 'tool_unknown') {
-      const command = commands.get(payload.callId);
-      commands.delete(payload.callId);
+      const queue = commands.get(payload.callId);
+      const command = queue?.shift() ?? null;
+      if (queue && queue.length === 0) commands.delete(payload.callId);
       if (
         type === 'tool_finished' &&
         command &&

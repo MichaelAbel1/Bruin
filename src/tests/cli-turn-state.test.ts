@@ -250,3 +250,86 @@ test('CLI can continue a paused turn after background metadata arrived without r
   assert.equal(result.events.filter((event) => event.type === 'tool_started').length, 1);
   assert.equal(result.events.at(-1)?.type, 'turn_completed');
 });
+
+test('CLI sessions status and chat --json emit structured machine-readable output', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-cli-json-'));
+  try {
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home);
+    const model = { alias: 'test', provider: 'openai-compatible', model: 'mock' };
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ profiles: [model] }));
+    const preloader = path.join(dir, 'mock-model.mjs');
+    const gateway = new URL('../providers/gateway.js', import.meta.url).href;
+    fs.writeFileSync(
+      preloader,
+      `
+      import { AiSdkGateway } from ${JSON.stringify(gateway)};
+      AiSdkGateway.prototype.complete = async (_profile, prompt) => {
+        const last = String(prompt.filter((m) => m.role === 'user').at(-1)?.content ?? '');
+        if (last.includes('ask me')) {
+          return {
+            text: '',
+            calls: [{
+              id: 'q-call',
+              name: 'ask_user',
+              input: { question: 'Pick target?', options: ['A', 'B'], kind: 'decision' },
+            }],
+          };
+        }
+        return { text: 'structured reply', calls: [] };
+      };
+    `,
+    );
+    const cli = fileURLToPath(new URL('../cli.js', import.meta.url));
+    const run = (args: string[]) =>
+      spawnSync(process.execPath, ['--import', pathToFileURL(preloader).href, cli, ...args], {
+        cwd: dir,
+        env: { ...process.env, BRUIN_HOME: home },
+        input: '',
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+
+    const completed = run(['chat', '--model', 'test', '--json', 'say hello']);
+    assert.equal(completed.status, 0, completed.stderr);
+    const completedJson = JSON.parse(completed.stdout);
+    assert.equal(completedJson.phase, 'completed');
+    assert.equal(completedJson.exitCode, 0);
+    assert.equal(completedJson.answer, 'structured reply');
+    assert.equal(completedJson.pendingQuestion, null);
+
+    const status = run(['sessions', 'status', completedJson.sessionId]);
+    assert.equal(status.status, 0, status.stderr);
+    const statusJson = JSON.parse(status.stdout);
+    assert.equal(statusJson.session.id, completedJson.sessionId);
+    assert.equal(statusJson.leased, false);
+    assert.equal(statusJson.state.phase, 'completed');
+
+    const asked = run(['chat', '--model', 'test', '--json', 'ask me']);
+    assert.equal(asked.status, 2, asked.stderr);
+    const askedJson = JSON.parse(asked.stdout);
+    assert.equal(askedJson.ok, true);
+    assert.equal(askedJson.phase, 'awaiting_input');
+    assert.equal(askedJson.exitCode, 2);
+    assert.equal(askedJson.pendingQuestion?.text, 'Pick target?');
+    assert.deepEqual(askedJson.pendingQuestion?.options, ['A', 'B']);
+
+    const failed = run(['chat', '--model', 'missing-model', '--json', 'say hello']);
+    assert.equal(failed.status, 1);
+    const failedJson = JSON.parse(failed.stdout);
+    assert.equal(failedJson.ok, false);
+    assert.equal(failedJson.exitCode, 1);
+    assert.match(failedJson.error, /模型配置不存在/);
+
+    const setHook = run(['webhook', 'set', 'https://hooks.example.com/bruin']);
+    assert.equal(setHook.status, 0, setHook.stderr);
+    const showHook = run(['webhook', 'show']);
+    assert.equal(showHook.status, 0, showHook.stderr);
+    assert.equal(JSON.parse(showHook.stdout).configWebhookUrl, 'https://hooks.example.com/bruin');
+    const clearHook = run(['webhook', 'clear']);
+    assert.equal(clearHook.status, 0, clearHook.stderr);
+    assert.equal(JSON.parse(run(['webhook', 'show']).stdout).configWebhookUrl, null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

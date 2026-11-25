@@ -705,6 +705,17 @@ export class RuntimeServices {
             });
             if (!belongsToRepo) return { output: '该路径不属于当前仓库的工作树', isError: true };
           }
+          const parentBudget = delegation.maxModelCalls ?? 24;
+          const requestedSteps =
+            typeof input.maxSteps === 'number' && Number.isInteger(input.maxSteps)
+              ? Math.max(1, Math.min(input.maxSteps, parentBudget))
+              : parentBudget;
+          const focusScope =
+            typeof input.scope === 'string' && input.scope.trim() ? input.scope.trim() : undefined;
+          const focusDeliverable =
+            typeof input.deliverable === 'string' && input.deliverable.trim()
+              ? input.deliverable.trim()
+              : undefined;
           const childOptions: SubagentOptions = {
             mode,
             commands: config.approvedCommands
@@ -715,8 +726,10 @@ export class RuntimeServices {
               )
               .map((rule) => rule.command),
             autoSafeShell: config.approvalMode === 'autoSafe' || config.approvalMode === 'auto',
-            maxModelCalls: delegation.maxModelCalls ?? 24,
+            maxModelCalls: requestedSteps,
             maxDurationMs: delegation.maxDurationMs ?? 30 * 60_000,
+            ...(focusScope ? { scope: focusScope } : {}),
+            ...(focusDeliverable ? { deliverable: focusDeliverable } : {}),
           };
           const controller = new AbortController();
           const parentLease = this.sessionLeases.retain(session.id, controller);
@@ -812,6 +825,8 @@ export class RuntimeServices {
                 maxModelCalls: childOptions.maxModelCalls,
                 maxDurationMs: childOptions.maxDurationMs,
               },
+              ...(focusScope ? { scope: focusScope } : {}),
+              ...(focusDeliverable ? { deliverable: focusDeliverable } : {}),
             });
             setupComplete = true;
           } catch (error) {

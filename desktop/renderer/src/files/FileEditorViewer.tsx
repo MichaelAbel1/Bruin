@@ -6,6 +6,7 @@ export type OpenFile = {
   path: string;
   content: string;
   originalContent: string;
+  originalDiskContent?: string;
   baselineContent?: string;
   eol?: '\r\n' | '\n';
   truncated: boolean;

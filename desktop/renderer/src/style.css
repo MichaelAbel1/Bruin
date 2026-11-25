@@ -2677,6 +2677,15 @@ pre {
   align-items: center;
   margin: 7px 0;
 }
+.question-context {
+  display: block;
+  margin: 4px 0 6px;
+  opacity: 0.8;
+  white-space: pre-wrap;
+}
+.question-options {
+  flex-wrap: wrap;
+}
 .runtime-row span {
   flex: 1;
   overflow-wrap: anywhere;

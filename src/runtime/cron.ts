@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { SessionEvent } from '../core/types.js';
 import type { EventStore } from '../storage/event-store.js';
 import { planState } from './plan.js';
+import { sendAttentionWebhook } from './notify.js';
 
 export function cronPlan(events: SessionEvent[], planSeq: number) {
   const revision = [...events].reverse().find((event) => event.type === 'plan_updated')?.seq;
@@ -29,7 +30,9 @@ export function recoverCronJobs(store: EventStore, now = Date.now()): void {
     const observed = latestDispatches(store.events(session.id));
     const abandoned = dispatched.filter((job) => {
       const started = observed.get(job.id);
-      return !started || now - Date.parse(started.at) >= 30_000;
+      if (!started) return true;
+      const startedAt = Date.parse(started.at);
+      return !Number.isFinite(startedAt) || now - startedAt >= 30_000;
     });
     if (!abandoned.length) continue;
     const owner = randomUUID();
@@ -46,8 +49,16 @@ export function recoverCronJobs(store: EventStore, now = Date.now()): void {
         if (
           current.find((item) => item.id === job.id)?.lastStatus === 'dispatched' &&
           latest.get(job.id)?.seq === observed.get(job.id)?.seq
-        )
+        ) {
           store.markCronJob(job.id, 'needs_review');
+          void sendAttentionWebhook({
+            event: 'awaiting_review',
+            sessionId: session.id,
+            workspace: session.workspace,
+            phase: 'awaiting_review',
+            reason: `定时任务 ${job.id} 在派发后中断，已转入待复核状态`,
+          });
+        }
     } finally {
       store.releaseLease(session.id, owner);
     }

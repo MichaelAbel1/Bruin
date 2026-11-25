@@ -10,6 +10,7 @@ import type { ToolCall, ToolResult } from '../core/types.js';
 import { ProcessExecutor } from '../executor/client.js';
 import { importAttachments } from '../core/attachments.js';
 import { enqueueInput } from '../core/input-queue.js';
+import { pendingQuestion } from '../core/question.js';
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-control-'));
@@ -1196,6 +1197,208 @@ test('serial tool batch failure marks unstarted sibling calls as tool_denied', a
     const events = f.store.events(f.session.id);
     assert.ok(events.some((e) => e.type === 'tool_unknown' && e.payload.callId === 'first'));
     assert.ok(events.some((e) => e.type === 'tool_denied' && e.payload.callId === 'second'));
+  } finally {
+    f.close();
+  }
+});
+
+test('circuit breaker denies a 6th consecutive identical failing call before reaching executor or approval', async () => {
+  const f = fixture();
+  let modelStep = 0;
+  let executions = 0;
+  let approvals = 0;
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        modelStep++;
+        if (modelStep <= 6) {
+          return {
+            text: '',
+            calls: [{ id: `fail-${modelStep}`, name: 'shell', input: { command: 'false' } }],
+          };
+        }
+        return { text: 'Switched approach after circuit break.', calls: [] };
+      },
+    },
+    {
+      async execute() {
+        executions++;
+        return { output: 'exit 1', isError: true };
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        approvals++;
+        return true;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'run failing command');
+    assert.equal(executions, 5);
+    assert.equal(approvals, 5);
+    const denied = f.store
+      .events(f.session.id)
+      .find((event) => event.type === 'tool_denied' && event.payload.callId === 'fail-6');
+    assert.ok(denied);
+    assert.match(String(denied.payload.output), /已触发熔断/);
+  } finally {
+    f.close();
+  }
+});
+
+test('circuit breaker matches normalized inputs even when raw calls include extra stripped keys', async () => {
+  const f = fixture();
+  let modelStep = 0;
+  let executions = 0;
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        modelStep++;
+        if (modelStep <= 6) {
+          return {
+            text: '',
+            calls: [
+              {
+                id: `norm-${modelStep}`,
+                name: 'shell',
+                input: { command: 'false', extraNoise: `attempt-${modelStep}` },
+              },
+            ],
+          };
+        }
+        return { text: 'Stopped after normalized circuit break.', calls: [] };
+      },
+    },
+    {
+      async execute() {
+        executions++;
+        return { output: 'exit 1', isError: true };
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'run failing command with extra keys');
+    assert.equal(executions, 5);
+    const denied = f.store
+      .events(f.session.id)
+      .find((event) => event.type === 'tool_denied' && event.payload.callId === 'norm-6');
+    assert.ok(denied);
+    assert.match(String(denied.payload.output), /已触发熔断/);
+  } finally {
+    f.close();
+  }
+});
+
+test('identical read-only discovery loop injects no-progress steering after 4 repeated reads', async () => {
+  const f = fixture();
+  fs.writeFileSync(path.join(f.dir, 'same.txt'), 'unchanged content');
+  let modelStep = 0;
+  let sawSteeringPrompt = false;
+  const notices: string[] = [];
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete(_profile, prompt) {
+        modelStep++;
+        if (String(prompt[0]?.content).includes('Repeated unchanged read-only calls detected')) {
+          sawSteeringPrompt = true;
+          return { text: 'Breaking out of read loop.', calls: [] };
+        }
+        if (modelStep <= 5) {
+          return {
+            text: '',
+            calls: [{ id: `read-${modelStep}`, name: 'read_file', input: { path: 'same.txt' } }],
+          };
+        }
+        return { text: 'Done.', calls: [] };
+      },
+    },
+    {
+      async execute() {
+        return { output: 'unchanged content', isError: false };
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice(msg) {
+        notices.push(msg);
+      },
+      async approve() {
+        return true;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'inspect same file');
+    assert.equal(sawSteeringPrompt, true);
+    assert.ok(notices.some((msg) => msg.includes('重复执行相同的只读工具')));
+  } finally {
+    f.close();
+  }
+});
+
+test('structured ask_user persists options, context, and kind on tool_finished', async () => {
+  const f = fixture();
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        return {
+          text: '',
+          calls: [
+            {
+              id: 'ask-1',
+              name: 'ask_user',
+              input: {
+                question: 'Which migration strategy should we use?',
+                context: 'Both strategies pass current tests.',
+                kind: 'decision',
+                options: ['Dual-write', 'Cutover'],
+              },
+            },
+          ],
+        };
+      },
+    },
+    {
+      async execute() {
+        throw new Error('unused');
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'plan migration', undefined, [], undefined, {
+      allowQuestions: true,
+    });
+    const q = pendingQuestion(f.store.events(f.session.id));
+    assert.ok(q);
+    assert.equal(q.text, 'Which migration strategy should we use?');
+    assert.equal(q.context, 'Both strategies pass current tests.');
+    assert.equal(q.kind, 'decision');
+    assert.deepEqual(q.options, ['Dual-write', 'Cutover']);
   } finally {
     f.close();
   }

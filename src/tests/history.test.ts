@@ -4,6 +4,7 @@ import type { ModelMessage } from 'ai';
 import {
   budgetPrompt,
   buildPrompt,
+  compactToolError,
   promptTokens,
   historyCompactionRange,
   estimatedInputTokens,
@@ -439,4 +440,26 @@ test('workspace_changed between assistant tool-call and tool result preserves to
     ['system', 'user', 'assistant', 'tool', 'user', 'user'],
   );
   assert.match(String(messages[4].content), /workspace changed to \/repo-b/i);
+});
+
+test('compactToolError strips ANSI codes, collapses repeated lines, and caps error length', () => {
+  const noisy =
+    '\u001b[31mError: compilation failed\u001b[0m\n' +
+    'retrying connection...\n'.repeat(20) +
+    '\u001b[1mroot cause: missing symbol foo\u001b[0m';
+  const compacted = compactToolError(noisy, 4_000);
+  assert.doesNotMatch(compacted, /\u001b\[/);
+  assert.match(compacted, /Error: compilation failed/);
+  assert.match(compacted, /重复行省略 19 次/);
+  assert.match(compacted, /root cause: missing symbol foo/);
+
+  const hugeUnique = Array.from(
+    { length: 400 },
+    (_, i) => `unique error line ${i} ${'x'.repeat(20)}`,
+  ).join('\n');
+  const capped = compactToolError(hugeUnique, 4_000);
+  assert.ok(capped.length <= 4_000);
+  assert.match(capped, /unique error line 0/);
+  assert.match(capped, /unique error line 399/);
+  assert.match(capped, /中间内容已压缩/);
 });

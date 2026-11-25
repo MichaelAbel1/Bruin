@@ -14,9 +14,10 @@ import {
   updateConfig,
   setRuntimeApiKey,
   validApiKeyEnv,
+  isAllowedWebhookUrl,
 } from './config.js';
 import { SqliteEventStore } from './storage/event-store.js';
-import { AiSdkGateway } from './providers/gateway.js';
+import { AiSdkGateway, resolveApiKey } from './providers/gateway.js';
 import { ProcessExecutor } from './executor/client.js';
 import { AgentRunner } from './core/agent.js';
 import { isAutoSafeShell, isMaliciousShell } from './core/approval-policy.js';
@@ -37,8 +38,10 @@ import type { ModelProfile, ProviderKind, ToolCall } from './core/types.js';
 import { RuntimeServices } from './runtime/services.js';
 import { createSubagentRunner } from './runtime/subagent.js';
 import { canResumeTurn, turnState } from './core/turn-state.js';
-import { pendingQuestion, recordQuestionAnswer } from './core/question.js';
+import { reduceSessionState, type SessionState } from './core/session-state.js';
+import { pendingQuestion, recordQuestionAnswer, type PendingQuestion } from './core/question.js';
 import { runService } from './runtime/service.js';
+import { sendAttentionWebhook } from './runtime/notify.js';
 import { toolsForMode, toolDefinitions } from './core/tools.js';
 import { recoverSession } from './core/recovery.js';
 import { recordUnknownReview, unreviewedUnknownTools } from './core/unknown-review.js';
@@ -47,11 +50,12 @@ const help = `Bruin — local coding agent
 
 bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV] [--context-tokens N]
 bruin model list | default ALIAS
-bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--answer QUESTION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [PROMPT]
-bruin sessions list | show SESSION_ID
+bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--answer QUESTION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [--json] [PROMPT]
+bruin sessions list | show SESSION_ID | status SESSION_ID
 bruin service run [--timezone IANA_ZONE]
 bruin acp [--model ALIAS]
 bruin cron list | review JOB_ID --confirm
+bruin webhook show | set URL | clear
 bruin backup create DIRECTORY | inspect DIRECTORY | restore DIRECTORY --confirm TOKEN
 bruin doctor
 bruin capabilities
@@ -125,12 +129,14 @@ async function chatOptions(args: string[]) {
   if (allowWorkspaceEdits) args.splice(args.indexOf('--allow-workspace-edits'), 1);
   const unattended = args.includes('--unattended');
   if (unattended) args.splice(args.indexOf('--unattended'), 1);
+  const jsonOutput = args.includes('--json');
+  if (jsonOutput) args.splice(args.indexOf('--json'), 1);
   if (![24, 96, 240, 480].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
   if (allowWorkspaceEdits && maxModelCalls === 24)
     throw new Error('--allow-workspace-edits 需要长任务调用预算');
   if (unattended && maxModelCalls === 24) throw new Error('--unattended 需要长任务调用预算');
   if (maxModelCalls === 480 && !unattended) throw new Error('480 次模型调用需要 --unattended');
-  const effectiveUnattended = unattended || !stdin.isTTY;
+  const effectiveUnattended = unattended || jsonOutput || !stdin.isTTY;
   const prompt = await readChatPrompt(args.join(' '));
   if (answerTo !== undefined && (!resume || !prompt.trim()))
     throw new Error('--answer 需要 --resume 和答复内容');
@@ -144,6 +150,7 @@ async function chatOptions(args: string[]) {
     maxModelCalls,
     allowWorkspaceEdits,
     effectiveUnattended,
+    jsonOutput,
     prompt,
   };
 }
@@ -175,6 +182,43 @@ async function main(): Promise<void> {
     console.log(JSON.stringify(result, null, 2));
     if (!result.ok) process.exitCode = 1;
     return;
+  }
+  if (area === 'webhook') {
+    const action = args.shift();
+    if (action === 'show' && !args.length) {
+      const cfg = loadConfig();
+      const envUrl = process.env.BRUIN_WEBHOOK_URL?.trim();
+      console.log(
+        JSON.stringify(
+          {
+            configWebhookUrl: cfg.webhookUrl ?? null,
+            envConfigured: Boolean(envUrl),
+            envValid: envUrl ? isAllowedWebhookUrl(envUrl) : null,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    if (action === 'set' && args.length === 1) {
+      const url = args[0].trim();
+      if (!isAllowedWebhookUrl(url))
+        throw new Error('Webhook 地址必须使用 HTTPS（或本机 localhost HTTP）且不能包含内嵌凭据');
+      updateConfig((current) => ({ ...current, webhookUrl: url }));
+      console.log(`已保存 Webhook: ${url}`);
+      return;
+    }
+    if (action === 'clear' && !args.length) {
+      updateConfig((current) => {
+        const next = { ...current };
+        delete next.webhookUrl;
+        return next;
+      });
+      console.log('已清除 Webhook 配置');
+      return;
+    }
+    throw new Error('用法: bruin webhook show | set URL | clear');
   }
   if (area === 'capabilities') {
     if (args.length) throw new Error(help);
@@ -399,6 +443,23 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(store.events(sessionId), null, 2));
         return;
       }
+      if (action === 'status') {
+        const sessionId = requireArg(args[0]);
+        const session = store.getSession(sessionId);
+        if (!session) throw new Error('会话不存在');
+        console.log(
+          JSON.stringify(
+            {
+              session,
+              leased: store.isLeased(sessionId),
+              state: reduceSessionState(store.events(sessionId)),
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
       throw new Error(help);
     }
     if (!chat) throw new Error(help);
@@ -410,13 +471,15 @@ async function main(): Promise<void> {
       maxModelCalls,
       allowWorkspaceEdits,
       effectiveUnattended,
+      jsonOutput,
       prompt,
     } = chat;
     const workspace = fs.realpathSync(workspaceArg ?? process.cwd());
-    let session = resume
+    const loadedSession = resume
       ? store.getSession(resume)
       : store.createSession(workspace, findProfile(modelAlias));
-    if (!session) throw new Error('会话不存在');
+    if (!loadedSession) throw new Error('会话不存在');
+    let session = loadedSession;
     if (resume && session.profile.apiKeyEnv && !validApiKeyEnv(session.profile.apiKeyEnv)) {
       const config = loadConfig();
       if (!getRuntimeApiKey(session.profile.alias) && looksLikeApiKey(session.profile.apiKeyEnv))
@@ -432,9 +495,15 @@ async function main(): Promise<void> {
       throw new Error('恢复会话时工作区不匹配');
     const rl = createInterface({ input: stdin, output: stdout });
     const executor = new ProcessExecutor();
+    let assistantOutput = '';
     const io = {
-      text: (delta: string) => stdout.write(delta),
-      notice: (message: string) => console.log(`\n[工具] ${message}`),
+      text: (delta: string) => {
+        if (jsonOutput) assistantOutput += delta;
+        else stdout.write(delta);
+      },
+      notice: (message: string) => {
+        if (!jsonOutput) console.log(`\n[工具] ${message}`);
+      },
       approve: async (call: ToolCall, reason: string, signal: AbortSignal) => {
         if (allowWorkspaceEdits && ['write_file', 'edit_file'].includes(call.name)) return true;
         const config = loadConfig();
@@ -491,16 +560,125 @@ async function main(): Promise<void> {
     const onStopSignal = () => controller.abort();
     process.once('SIGINT', onStopSignal);
     process.once('SIGTERM', onStopSignal);
+    const cliSecrets = (): string[] => {
+      const secrets: string[] = [];
+      const runtime = getRuntimeApiKey(session.profile.alias);
+      if (runtime) secrets.push(runtime);
+      try {
+        const resolved = resolveApiKey(session.profile);
+        if (resolved) secrets.push(resolved);
+      } catch {}
+      return secrets;
+    };
+    const notifyAttention = async (state: SessionState, failureMessage?: string) => {
+      const extraSecrets = cliSecrets();
+      if (failureMessage) {
+        await sendAttentionWebhook(
+          {
+            event: 'run_failed',
+            sessionId: leaseSessionId,
+            workspace: session.workspace,
+            phase: state.phase,
+            reason: failureMessage.slice(0, 500),
+          },
+          { extraSecrets },
+        );
+        return;
+      }
+      if (state.phase === 'awaiting_input' && state.pendingQuestion) {
+        await sendAttentionWebhook(
+          {
+            event: 'awaiting_input',
+            sessionId: leaseSessionId,
+            workspace: session.workspace,
+            phase: state.phase,
+            questionId: state.pendingQuestion.id,
+            question: state.pendingQuestion.text,
+            options: state.pendingQuestion.options,
+          },
+          { extraSecrets },
+        );
+      } else if (state.phase === 'paused') {
+        await sendAttentionWebhook(
+          {
+            event: 'paused',
+            sessionId: leaseSessionId,
+            workspace: session.workspace,
+            phase: state.phase,
+          },
+          { extraSecrets },
+        );
+      } else if (state.phase === 'awaiting_review') {
+        await sendAttentionWebhook(
+          {
+            event: 'awaiting_review',
+            sessionId: leaseSessionId,
+            workspace: session.workspace,
+            phase: state.phase,
+            reason: `发现 ${state.unreviewedUnknownCount} 个结果未知的工具调用需要人工检查`,
+          },
+          { extraSecrets },
+        );
+      }
+    };
     try {
       lease = services.sessionLeases.retain(leaseSessionId, controller);
       if (resume) runner.recover(session);
+      const printQuestion = (question: PendingQuestion) => {
+        const kindLabel = question.kind ? ` [${question.kind}]` : '';
+        console.log(`\n待答问题 ${question.id}${kindLabel}\n${question.text}`);
+        if (question.context) console.log(`背景：${question.context}`);
+        if (question.options?.length) {
+          console.log('候选项：');
+          for (const [index, option] of question.options.entries())
+            console.log(`  ${index + 1}. ${option}`);
+        }
+      };
+      const emitJsonSummary = (exitCode: number) => {
+        const events = store.events(leaseSessionId);
+        const state = reduceSessionState(events);
+        const lastAssistant = [...events]
+          .reverse()
+          .find((event) => event.type === 'assistant' && typeof event.payload.text === 'string');
+        const answer =
+          assistantOutput ||
+          (typeof lastAssistant?.payload.text === 'string' ? lastAssistant.payload.text : '');
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              sessionId: leaseSessionId,
+              workspace: session.workspace,
+              model: session.profile.alias,
+              exitCode,
+              phase: state.phase,
+              turnState: state.turnState,
+              canResume: state.canResume,
+              needsReview: state.needsReview,
+              pendingQuestion: state.pendingQuestion,
+              usage: state.usage,
+              answer,
+            },
+            null,
+            2,
+          ),
+        );
+        process.exitCode = exitCode;
+      };
       while (true) {
         const unknown = unreviewedUnknownTools(store.events(session.id));
         const lastUnknown = unknown.at(-1);
         if (!lastUnknown) break;
         if (effectiveUnattended) {
-          console.error(`发现 ${unknown.length} 个结果未知的工具调用；请检查工作区后交互式继续。`);
-          process.exitCode = 3;
+          const state = reduceSessionState(store.events(session.id));
+          await notifyAttention(state);
+          if (jsonOutput) emitJsonSummary(3);
+          else {
+            console.error(
+              `发现 ${unknown.length} 个结果未知的工具调用；请检查工作区后交互式继续。`,
+            );
+            process.exitCode = 3;
+          }
           return;
         }
         const answer = await askLine(
@@ -516,21 +694,70 @@ async function main(): Promise<void> {
           reviewLease.release();
         }
       }
-      console.log(
-        `会话 ${session.id} | 工作区 ${session.workspace} | 模型 ${session.profile.alias}`,
-      );
-      const reportQuestion = () => {
-        const question = pendingQuestion(store.events(leaseSessionId));
-        if (!question) return false;
-        console.log(`\n待答问题 ${question.id}\n${question.text}`);
+      if (!jsonOutput) {
         console.log(
-          `使用 bruin chat --resume ${leaseSessionId} --answer ${question.id} "答复" 继续任务`,
+          `会话 ${session.id} | 工作区 ${session.workspace} | 模型 ${session.profile.alias}`,
         );
-        process.exitCode = 2;
+      }
+      const reportQuestionUnattended = async () => {
+        const state = reduceSessionState(store.events(leaseSessionId));
+        const question = state.pendingQuestion;
+        if (!question) return false;
+        await notifyAttention(state);
+        if (jsonOutput) {
+          emitJsonSummary(2);
+        } else {
+          printQuestion(question);
+          console.log(
+            `使用 bruin chat --resume ${leaseSessionId} --answer ${question.id} "答复" 继续任务`,
+          );
+          process.exitCode = 2;
+        }
         return true;
       };
+      const resolvePendingQuestionsInteractively = async (): Promise<boolean> => {
+        while (!controller.signal.aborted) {
+          const question = pendingQuestion(store.events(leaseSessionId));
+          if (!question) return true;
+          printQuestion(question);
+          const promptLabel = question.options?.length
+            ? '\n答复 (输入选项编号或自由文本，/exit 稍后继续)> '
+            : '\n答复 (/exit 稍后继续)> ';
+          const line = await askLine(rl, promptLabel, controller.signal);
+          if (controller.signal.aborted) throw new Error('已取消');
+          if (line === null || !line.trim() || line.trim() === '/exit') {
+            console.log(
+              `使用 bruin chat --resume ${leaseSessionId} --answer ${question.id} "答复" 继续任务`,
+            );
+            process.exitCode = 2;
+            return false;
+          }
+          const trimmed = line.trim();
+          const numeric = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+          const reply =
+            question.options &&
+            Number.isInteger(numeric) &&
+            numeric >= 1 &&
+            numeric <= question.options.length
+              ? question.options[numeric - 1]!
+              : trimmed;
+          recordQuestionAnswer(store, leaseSessionId, question.id, reply);
+          store.append(session.id, 'run_configured', {
+            maxModelCalls,
+            allowWorkspaceEdits,
+            unattended: effectiveUnattended,
+          });
+          await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
+          stdout.write('\n');
+        }
+        return false;
+      };
       if (answerTo !== undefined) recordQuestionAnswer(store, session.id, answerTo, prompt);
-      else if (reportQuestion()) return;
+      else if (effectiveUnattended) {
+        if (await reportQuestionUnattended()) return;
+      } else if (!(await resolvePendingQuestionsInteractively())) {
+        return;
+      }
       if (prompt) {
         store.append(session.id, 'run_configured', {
           maxModelCalls,
@@ -545,7 +772,7 @@ async function main(): Promise<void> {
           undefined,
           runOptions,
         );
-        stdout.write('\n');
+        if (!jsonOutput) stdout.write('\n');
       } else if (resume && canResumeTurn(store.events(session.id))) {
         store.append(session.id, 'run_configured', {
           maxModelCalls,
@@ -553,12 +780,28 @@ async function main(): Promise<void> {
           unattended: effectiveUnattended,
         });
         await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
-        stdout.write('\n');
+        if (!jsonOutput) stdout.write('\n');
       }
-      if (reportQuestion()) return;
-      if (effectiveUnattended && turnState(store.events(session.id)) === 'paused')
-        process.exitCode = 2;
-      while (!effectiveUnattended && !controller.signal.aborted && !reportQuestion()) {
+      if (effectiveUnattended) {
+        if (await reportQuestionUnattended()) return;
+        const state = reduceSessionState(store.events(session.id));
+        if (state.phase === 'awaiting_review') {
+          await notifyAttention(state);
+          if (jsonOutput) emitJsonSummary(3);
+          else process.exitCode = 3;
+          return;
+        }
+        if (state.phase === 'paused' || state.phase === 'awaiting_plan_approval') {
+          await notifyAttention(state);
+          if (jsonOutput) emitJsonSummary(2);
+          else process.exitCode = 2;
+          return;
+        }
+        if (jsonOutput) emitJsonSummary(0);
+        return;
+      }
+      while (!controller.signal.aborted) {
+        if (!(await resolvePendingQuestionsInteractively())) break;
         const line = await askLine(rl, '\n你> ', controller.signal);
         if (controller.signal.aborted) throw new Error('已取消');
         if (line === null || line.trim() === '/exit') break;
@@ -594,6 +837,30 @@ async function main(): Promise<void> {
         await runner.run(session, line, controller.signal, [], undefined, runOptions);
         stdout.write('\n');
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const state = reduceSessionState(store.events(leaseSessionId));
+      if (effectiveUnattended) await notifyAttention(state, message);
+      if (jsonOutput) {
+        console.log(
+          JSON.stringify(
+            {
+              ok: false,
+              sessionId: leaseSessionId,
+              workspace: session.workspace,
+              model: session.profile.alias,
+              exitCode: 1,
+              phase: state.phase,
+              error: message,
+            },
+            null,
+            2,
+          ),
+        );
+        process.exitCode = 1;
+        return;
+      }
+      throw error;
     } finally {
       process.removeListener('SIGINT', onStopSignal);
       process.removeListener('SIGTERM', onStopSignal);
@@ -616,6 +883,11 @@ async function main(): Promise<void> {
   }
 }
 main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
+  const message = err instanceof Error ? err.message : String(err);
+  if (process.argv[2] === 'chat' && process.argv.includes('--json')) {
+    console.log(JSON.stringify({ ok: false, exitCode: 1, error: message }, null, 2));
+  } else {
+    console.error(message);
+  }
   process.exitCode = 1;
 });

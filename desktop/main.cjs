@@ -382,6 +382,7 @@ function startHost() {
   });
   host.on('error', (error) => {
     stopLongRunPowerBlocker();
+    host = undefined;
     for (const entry of pending.values())
       entry.reject(new Error(`Agent 后台进程启动失败: ${error.message}`));
     pending.clear();
@@ -389,6 +390,7 @@ function startHost() {
   });
   host.on('exit', (code, signal) => {
     stopLongRunPowerBlocker();
+    host = undefined;
     for (const entry of pending.values()) entry.reject(new Error('Agent 后台进程已退出'));
     pending.clear();
     sendToWindow({ type: 'hostExited', code, signal });
@@ -569,7 +571,9 @@ if (!gotSingleInstanceLock) {
       if (method === 'loginMcpServer' && !secureStorageAvailable())
         throw new Error('系统安全存储不可用，无法持久保存 OAuth 凭证');
       const apiKey =
-        typeof params?.apiKey === 'string' && params.apiKey ? params.apiKey : undefined;
+        typeof params?.apiKey === 'string' && params.apiKey.trim()
+          ? params.apiKey.trim()
+          : undefined;
       if (method === 'saveProfile' && apiKey && !secureStorageAvailable())
         throw new Error('系统安全存储不可用，无法持久保存 API Key');
       const alias = String(params?.alias ?? '').trim();
@@ -605,7 +609,8 @@ if (!gotSingleInstanceLock) {
   });
   app.on('will-quit', (event) => {
     stopLongRunPowerBlocker();
-    const alive = host && host.exitCode === null && host.signalCode === null;
+    const alive =
+      host && host.pid !== undefined && host.exitCode === null && host.signalCode === null;
     if (!alive || quitting) return;
     quitting = true;
     event.preventDefault();

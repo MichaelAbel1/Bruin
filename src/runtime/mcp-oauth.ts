@@ -63,6 +63,9 @@ export class McpOAuthSession implements OAuthClientProvider {
     this.savedTokens = new Map(state.tokens);
     this.latest = state.latest;
   }
+  attachPersistence(changed: (state: OAuthSnapshot) => void) {
+    this.changed = changed;
+  }
   detachPersistence() {
     this.changed = undefined;
   }
@@ -106,13 +109,17 @@ export class McpOAuthSession implements OAuthClientProvider {
   discoveryState() {
     return this.discovery;
   }
-  async redirectToAuthorization(url: URL) {
-    if (!this.redirect) throw new Error('MCP 需要 OAuth 登录，请在 MCP 设置中点击登录');
+  private assertSafeEndpoint(url: URL, label = 'OAuth 端点') {
+    if (url.username || url.password) throw new Error(`${label}不允许包含内嵌凭据`);
     if (
       url.protocol !== 'https:' &&
       !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
     )
-      throw new Error('OAuth 授权地址必须使用 HTTPS');
+      throw new Error(`${label}必须使用 HTTPS`);
+  }
+  async redirectToAuthorization(url: URL) {
+    if (!this.redirect) throw new Error('MCP 需要 OAuth 登录，请在 MCP 设置中点击登录');
+    this.assertSafeEndpoint(url, 'OAuth 授权地址');
     await this.redirect(url);
   }
   invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery') {
@@ -180,9 +187,22 @@ export class McpOAuthSession implements OAuthClientProvider {
       resolve(url.searchParams);
     });
     await new Promise<void>((ok, fail) => {
-      server.once('error', fail);
-      server.listen(port, '127.0.0.1', ok);
+      const onError = (err: Error) => {
+        server.off('listening', onListening);
+        fail(err);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        ok();
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(port, '127.0.0.1');
     });
+    const onRuntimeError = (err: Error) => {
+      reject(err);
+    };
+    server.on('error', onRuntimeError);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       if (this.cancelled) throw new Error('OAuth 登录已取消');
@@ -200,8 +220,15 @@ export class McpOAuthSession implements OAuthClientProvider {
         reject(new Error('OAuth 登录超时'));
       }, timeoutMs);
       timer.unref();
-      const fetchFn: typeof fetch = (input, init) =>
-        fetch(input, { ...init, signal: controller.signal });
+      const fetchFn: typeof fetch = (input, init) => {
+        const rawUrl =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        this.assertSafeEndpoint(new URL(rawUrl), 'OAuth 端点');
+        const signal = init?.signal
+          ? AbortSignal.any([init.signal, controller.signal])
+          : controller.signal;
+        return fetch(input, { ...init, redirect: 'error', signal });
+      };
       this.redirect = async (url) => open(url.href);
       const response = await fetchFn(serverUrl, { method: 'GET' });
       const challenge = response.status === 401 ? extractWWWAuthenticateParams(response) : {};
@@ -229,6 +256,7 @@ export class McpOAuthSession implements OAuthClientProvider {
       throw error;
     } finally {
       clearTimeout(timer);
+      server.off('error', onRuntimeError);
       this.cancelPending = undefined;
       this.redirect = undefined;
       this.verifier = '';

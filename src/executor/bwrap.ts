@@ -1,11 +1,30 @@
+import path from 'node:path';
+
+function isAllowedScratchPath(candidate: string, privateTmp: boolean): boolean {
+  if (candidate === '/tmp') return !privateTmp;
+  return (
+    candidate.startsWith('/tmp/') ||
+    candidate.startsWith('/var/tmp/') ||
+    candidate.startsWith('/private/tmp/') ||
+    candidate.startsWith('/private/var/folders/')
+  );
+}
+
 export function workspaceMounts(
   workspace: string,
   options: { privateTmp: boolean; sharedScratch?: string },
 ): string[] {
-  const workspaceBind = ['--bind', workspace, workspace];
+  const normalizedWorkspace = path.posix.resolve(workspace);
+  const workspaceBind = ['--bind', normalizedWorkspace, normalizedWorkspace];
+  const candidateScratch = options.sharedScratch
+    ? path.posix.resolve(options.sharedScratch)
+    : undefined;
   const scratch =
-    options.sharedScratch && !(options.privateTmp && options.sharedScratch === '/tmp')
-      ? options.sharedScratch
+    candidateScratch &&
+    candidateScratch !== normalizedWorkspace &&
+    !normalizedWorkspace.startsWith(`${candidateScratch}/`) &&
+    isAllowedScratchPath(candidateScratch, options.privateTmp)
+      ? candidateScratch
       : undefined;
   const scratchInsidePrivateTmp = Boolean(
     options.privateTmp && scratch && scratch.startsWith('/tmp/'),
@@ -22,7 +41,8 @@ export function workspaceMounts(
   ];
   // Bind a workspace inside /tmp after its parent so the private mount doesn't hide it.
   const insidePrivateTmp =
-    options.privateTmp && (workspace === '/tmp' || workspace.startsWith('/tmp/'));
+    options.privateTmp &&
+    (normalizedWorkspace === '/tmp' || normalizedWorkspace.startsWith('/tmp/'));
   return [
     '--ro-bind',
     '/',

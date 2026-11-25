@@ -19,6 +19,9 @@ import {
 } from '../runtime/plan.js';
 import { loadConfig, mcpServerSchema, saveConfig } from '../config.js';
 import { McpManager } from '../runtime/mcp.js';
+import { isAllowedWebhookUrl, sendAttentionWebhook } from '../runtime/notify.js';
+import { doctor } from '../runtime/doctor.js';
+import { recoverCronJobs } from '../runtime/cron.js';
 import type { ModelGateway } from '../providers/gateway.js';
 import type { ToolExecutor } from '../executor/client.js';
 import type { ModelProfile, ToolCall, ToolResult } from '../core/types.js';
@@ -1641,5 +1644,142 @@ rl.on('line', (line) => {
   } finally {
     await manager.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('outbound attention webhook validates URLs, posts minimal payload, and swallows errors safely', async () => {
+  assert.equal(isAllowedWebhookUrl('https://hooks.example.com/bruin'), true);
+  assert.equal(isAllowedWebhookUrl('http://127.0.0.1:8787/hook'), true);
+  assert.equal(isAllowedWebhookUrl('http://localhost:3000/hook'), true);
+  assert.equal(isAllowedWebhookUrl('http://hooks.example.com/insecure'), false);
+  assert.equal(isAllowedWebhookUrl('https://user:pass@hooks.example.com/secret'), false);
+  assert.equal(isAllowedWebhookUrl('not-a-url'), false);
+
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const ok = await sendAttentionWebhook(
+    {
+      event: 'awaiting_input',
+      sessionId: 'sess-9',
+      workspace: '/tmp/repo',
+      phase: 'awaiting_input',
+      questionId: 'q-9',
+      question: 'Proceed with release?',
+      options: ['Yes', 'No'],
+    },
+    {
+      webhookUrl: 'https://hooks.example.com/notify',
+      fetchImpl: (async (input, init) => {
+        calls.push({ url: String(input), init: init ?? {} });
+        return new Response('ok', { status: 200 });
+      }) as typeof fetch,
+    },
+  );
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://hooks.example.com/notify');
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(calls[0].init.redirect, 'error');
+  const sent = JSON.parse(String(calls[0].init.body));
+  assert.equal(sent.event, 'awaiting_input');
+  assert.equal(sent.questionId, 'q-9');
+  assert.deepEqual(sent.options, ['Yes', 'No']);
+
+  const failed = await sendAttentionWebhook(
+    {
+      event: 'paused',
+      sessionId: 'sess-9',
+      workspace: '/tmp/repo',
+      phase: 'paused',
+    },
+    {
+      webhookUrl: 'https://hooks.example.com/notify',
+      fetchImpl: (async () => {
+        throw new Error('network down');
+      }) as typeof fetch,
+    },
+  );
+  assert.equal(failed, false);
+
+  const skipped = await sendAttentionWebhook(
+    {
+      event: 'paused',
+      sessionId: 'sess-9',
+      workspace: '/tmp/repo',
+      phase: 'paused',
+    },
+    {
+      webhookUrl: 'http://remote.example.com/insecure',
+      fetchImpl: (async () => {
+        throw new Error('must not be called');
+      }) as typeof fetch,
+    },
+  );
+  assert.equal(skipped, false);
+
+  let bodyCancelled = false;
+  let redactedBody = '';
+  const redactedOk = await sendAttentionWebhook(
+    {
+      event: 'run_failed',
+      sessionId: 'sess-9',
+      workspace: '/tmp/repo',
+      phase: 'unfinished',
+      reason: 'Bearer topsecret123 api_key=my_custom_secret_999 sk-1234567890abcdef1234',
+    },
+    {
+      webhookUrl: 'https://hooks.example.com/notify',
+      extraSecrets: ['my_custom_secret_999'],
+      fetchImpl: (async (_input, init) => {
+        redactedBody = String(init?.body ?? '');
+        return {
+          ok: true,
+          body: {
+            cancel: async () => {
+              bodyCancelled = true;
+            },
+          },
+        } as unknown as Response;
+      }) as typeof fetch,
+    },
+  );
+  assert.equal(redactedOk, true);
+  assert.equal(bodyCancelled, true);
+  assert.doesNotMatch(redactedBody, /topsecret123|my_custom_secret_999|sk-1234567890abcdef1234/);
+  assert.match(redactedBody, /\[REDACTED\]/);
+});
+
+test('doctor flags invalid BRUIN_WEBHOOK_URL and recoverCronJobs handles malformed timestamps', () => {
+  const f = fixture();
+  const prevWebhook = process.env.BRUIN_WEBHOOK_URL;
+  try {
+    process.env.BRUIN_WEBHOOK_URL = 'http://remote.example.com/insecure';
+    const report = doctor();
+    const webhookCheck = report.checks.find((c) => c.name === 'Webhook');
+    assert.ok(webhookCheck);
+    assert.equal(webhookCheck.ok, false);
+
+    const job = f.store.createCronJob(f.session.id, '0 9 * * *', 'daily check');
+    f.store.append(f.session.id, 'cron_started', { jobId: job.id, runId: 'r-bad' });
+    // Corrupt the started timestamp to simulate a malformed record and mark dispatched
+    (
+      f.store as unknown as {
+        db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+      }
+    ).db
+      .prepare(`UPDATE events SET at = 'not-a-date' WHERE type = 'cron_started'`)
+      .run();
+    (
+      f.store as unknown as {
+        db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+      }
+    ).db
+      .prepare(`UPDATE cron_jobs SET last_status = 'dispatched' WHERE id = ?`)
+      .run(job.id);
+    recoverCronJobs(f.store, Date.now());
+    assert.equal(f.store.listCronJobs(f.session.id)[0]?.lastStatus, 'needs_review');
+  } finally {
+    if (prevWebhook === undefined) delete process.env.BRUIN_WEBHOOK_URL;
+    else process.env.BRUIN_WEBHOOK_URL = prevWebhook;
+    f.close();
   }
 });

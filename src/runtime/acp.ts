@@ -97,8 +97,9 @@ export class AcpServer {
     });
   }
   private replay(session: Session) {
+    const events = this.store.events(session.id);
     const tools = new Map<unknown, SessionEvent>();
-    for (const event of this.store.events(session.id)) {
+    for (const event of events) {
       if (event.type === 'user' || event.type === 'assistant') {
         const text = event.payload.text;
         if (typeof text === 'string') {
@@ -133,6 +134,22 @@ export class AcpServer {
           },
         ],
       });
+    const question = pendingQuestion(events);
+    if (question) {
+      const lines = [
+        `Pending question (${question.id}): ${question.text}`,
+        ...(question.context ? [`Context: ${question.context}`] : []),
+        ...(question.options?.length
+          ? ['Options:', ...question.options.map((option, index) => `  ${index + 1}. ${option}`)]
+          : []),
+        `Answer via Bruin desktop or: bruin chat --resume ${session.id} --answer ${question.id} "<reply>"`,
+      ];
+      this.update(session.id, {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: `pending-question-${question.seq}`,
+        content: { type: 'text', text: lines.join('\n') },
+      });
+    }
   }
   private approve(sessionId: string, call: ToolCall, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || this.closing) return Promise.resolve(false);

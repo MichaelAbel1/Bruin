@@ -95,10 +95,12 @@ export class McpManager {
     session.restore(state);
     this.oauth.set(server.name, { signature, session });
   }
-  private newOAuthSession(server: McpServerConfig) {
+  private newOAuthSession(server: McpServerConfig, persist = true) {
     return new McpOAuthSession(
       server.transport === 'http' ? server.oauth?.clientId : undefined,
-      (state) => this.onCredentials?.(server.name, JSON.stringify(server), state),
+      persist
+        ? (state) => this.onCredentials?.(server.name, JSON.stringify(server), state)
+        : undefined,
     );
   }
   private oauth = new Map<string, { signature: string; session: McpOAuthSession }>();
@@ -267,7 +269,7 @@ export class McpManager {
       if (this.closing) throw new Error('MCP 管理器已关闭');
       if (server.transport !== 'http' || !server.oauth) throw new Error('服务器未启用 OAuth');
       await this.disconnectConnected(server.name);
-      const session = this.newOAuthSession(server);
+      const session = this.newOAuthSession(server, false);
       this.loggingIn.set(server.name, session);
       try {
         await session.login(server.url, open, server.oauth.callbackPort);
@@ -278,10 +280,12 @@ export class McpManager {
         session.invalidateCredentials('all');
         throw new Error('MCP 管理器已关闭');
       }
+      const signature = JSON.stringify(server);
       this.oauth.get(server.name)?.session.detachPersistence();
       this.oauth.get(server.name)?.session.invalidateCredentials('all');
-      this.oauth.set(server.name, { signature: JSON.stringify(server), session });
-      this.onCredentials?.(server.name, JSON.stringify(server), session.snapshot());
+      session.attachPersistence((state) => this.onCredentials?.(server.name, signature, state));
+      this.oauth.set(server.name, { signature, session });
+      this.onCredentials?.(server.name, signature, session.snapshot());
     });
   }
   async logout(name: string): Promise<void> {
