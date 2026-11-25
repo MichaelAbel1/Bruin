@@ -212,7 +212,9 @@ export class AiSdkGateway implements ModelGateway {
           input: part.input as Record<string, unknown>,
         });
       if (part.type === 'error') throw part.error;
+      if (part.type === 'abort') throw signal.reason ?? new Error('已取消');
     }
+    if (signal.aborted) throw signal.reason ?? new Error('已取消');
     if (pending && !hidden) {
       text += pending;
       onText(pending);

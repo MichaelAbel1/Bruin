@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-function isAllowedScratchPath(candidate: string, privateTmp: boolean): boolean {
+export function isAllowedScratchPath(candidate: string, privateTmp: boolean): boolean {
   if (candidate === '/tmp') return !privateTmp;
   return (
     candidate.startsWith('/tmp/') ||

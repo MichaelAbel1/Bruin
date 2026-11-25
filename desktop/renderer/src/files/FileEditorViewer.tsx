@@ -1,4 +1,4 @@
-import React, { useMemo, useRef } from 'react';
+import React, { useDeferredValue, useMemo, useRef } from 'react';
 import { FileCode, Code2, GitCompare, RotateCcw, Save } from 'lucide-react';
 import { computeLineDiff } from './line-diff.js';
 
@@ -78,9 +78,10 @@ export function FileEditorViewer({
 }) {
   const isDirty = file.content !== file.originalContent;
   const diffBase = file.baselineContent ?? file.originalContent;
+  const deferredContent = useDeferredValue(file.content);
   const diffResult = useMemo(
-    () => computeLineDiff(diffBase, file.content),
-    [diffBase, file.content],
+    () => computeLineDiff(diffBase, deferredContent),
+    [diffBase, deferredContent],
   );
   const mode = file.mode ?? 'edit';
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -108,10 +109,16 @@ export function FileEditorViewer({
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleContainerKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
       if (isDirty && !saving && !file.truncated && !file.readOnlyReason) onSave();
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Escape') {
+      e.currentTarget.blur();
       return;
     }
     if (file.truncated || file.readOnlyReason) return;
@@ -128,7 +135,7 @@ export function FileEditorViewer({
           if (textareaRef.current === ta) ta.selectionStart = ta.selectionEnd = start + 2;
         });
       } else {
-        const lineStart = val.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+        const lineStart = start === 0 ? 0 : val.lastIndexOf('\n', start - 1) + 1;
         const linePrefix = val.slice(lineStart, lineStart + 2);
         const removed =
           linePrefix === '  '
@@ -151,7 +158,7 @@ export function FileEditorViewer({
   };
 
   return (
-    <div className="file-editor-container">
+    <div className="file-editor-container" onKeyDown={handleContainerKeyDown}>
       <div className="file-editor-header">
         <div className="file-header-left">
           <FileCode size={17} className="file-header-icon" />
@@ -164,7 +171,7 @@ export function FileEditorViewer({
             </span>
           ) : (
             <span className="file-status-badge clean">
-              {file.readOnlyReason ? '只读' : '已保存'}
+              {file.truncated || file.readOnlyReason ? '只读' : '已保存'}
             </span>
           )}
           {(diffResult.additions > 0 || diffResult.deletions > 0) && (
@@ -184,14 +191,18 @@ export function FileEditorViewer({
         <div className="file-header-actions">
           <div className="editor-mode-toggle" role="group" aria-label="查看模式">
             <button
+              type="button"
               className={mode === 'edit' ? 'active' : ''}
+              aria-pressed={mode === 'edit'}
               onClick={() => onModeChange('edit')}
               title="代码编辑模式"
             >
               <Code2 size={13} /> 代码
             </button>
             <button
+              type="button"
               className={mode === 'diff' ? 'active' : ''}
+              aria-pressed={mode === 'diff'}
               onClick={() => onModeChange('diff')}
               title="差异对比模式"
             >
@@ -259,6 +270,7 @@ export function FileEditorViewer({
             </div>
             <textarea
               ref={textareaRef}
+              aria-label={`编辑 ${file.path}`}
               className="code-editor-textarea"
               value={file.content}
               readOnly={file.truncated || Boolean(file.readOnlyReason)}

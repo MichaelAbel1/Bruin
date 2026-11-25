@@ -9,12 +9,30 @@ import { listWorkspaceChanges } from './workspace-review.js';
 const execGit = promisify(execFile);
 const maxPatchBytes = 10_000_000;
 
+const cleanGitEnv = (): NodeJS.ProcessEnv => ({
+  ...process.env,
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_CONFIG_COUNT: '0',
+  GIT_CONFIG_PARAMETERS: undefined,
+  GIT_CONFIG: undefined,
+  GIT_ATTR_NOSYSTEM: '1',
+  LC_ALL: 'C',
+  GIT_OPTIONAL_LOCKS: '0',
+  GIT_DIR: undefined,
+  GIT_COMMON_DIR: undefined,
+  GIT_WORK_TREE: undefined,
+  GIT_INDEX_FILE: undefined,
+  GIT_OBJECT_DIRECTORY: undefined,
+  GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+});
+
 async function workspaceRepository(workspace: string, signal: AbortSignal) {
   const { stdout } = await execGit(
     'git',
     ['rev-parse', '--show-toplevel', '--path-format=absolute', '--git-path', 'objects'],
     {
       cwd: workspace,
+      env: cleanGitEnv(),
       signal,
       timeout: 5000,
       encoding: 'utf8',
@@ -41,6 +59,7 @@ async function withPatchRepository<T>(
   signal: AbortSignal,
   use: (repository: { run: GitRun; gitDir: string; temporary: string }) => Promise<T>,
 ): Promise<T> {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(baseCommit)) throw new Error('无效的基线提交哈希');
   const temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bruin-patch-'));
   try {
     const gitDir = path.join(temporary, 'repository');
@@ -171,7 +190,14 @@ export async function preflightWorkspacePatches(
       }
     }
     signal.throwIfAborted();
-    const test = await runTest?.(worktree);
+    const scope = path.relative(repository.root, fs.realpathSync.native(workspace));
+    const testRoot =
+      scope && scope !== '.' && !scope.startsWith(`..${path.sep}`) && !path.isAbsolute(scope)
+        ? path.join(worktree, scope)
+        : worktree;
+    if (runTest && (!fs.existsSync(testRoot) || !fs.statSync(testRoot).isDirectory()))
+      throw new Error('临时验证工作树中缺少对应子目录');
+    const test = await runTest?.(testRoot);
     signal.throwIfAborted();
     return {
       baseCommit,

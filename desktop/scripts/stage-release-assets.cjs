@@ -17,6 +17,11 @@ fs.rmSync(targetDir, { recursive: true, force: true });
 fs.mkdirSync(targetDir, { recursive: true });
 
 const allowedExtensions = new Set(['.dmg', '.zip', '.appimage', '.exe']);
+const escapedVersion = currentVersion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const isPrerelease = currentVersion.includes('-');
+const versionMatcher = isPrerelease
+  ? new RegExp(`(?:^|[-_ ])${escapedVersion}(?:$|[-_ ])`, 'i')
+  : new RegExp(`(?:^|[-_ ])${escapedVersion}(?:$|[-_ ](?!alpha|beta|rc|pre|dev|canary))`, 'i');
 
 const entries = fs.readdirSync(releaseDir, { withFileTypes: true });
 let stagedCount = 0;
@@ -24,7 +29,8 @@ let stagedCount = 0;
 for (const entry of entries) {
   if (entry.isFile()) {
     const ext = path.extname(entry.name).toLowerCase();
-    if (allowedExtensions.has(ext) && entry.name.includes(currentVersion)) {
+    const baseName = entry.name.slice(0, -ext.length);
+    if (allowedExtensions.has(ext) && versionMatcher.test(baseName)) {
       const src = path.join(releaseDir, entry.name);
       const dst = path.join(targetDir, entry.name);
       fs.copyFileSync(src, dst);

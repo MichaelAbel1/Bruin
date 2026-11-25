@@ -289,15 +289,18 @@ export function installGithub(repo: string, subdir: string, ref = 'HEAD'): Skill
     segments.some((part) => part === '.' || part === '..' || part === '.git')
   )
     throw new Error('无效的 Skill 子目录');
+  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-skill-'));
   try {
     execFileSync('git', ['clone', '--quiet', '--no-checkout', url, temp], {
       timeout: 120000,
-      stdio: 'pipe',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: gitEnv,
     });
     execFileSync('git', ['-C', temp, 'checkout', '--quiet', ref], {
       timeout: 30000,
-      stdio: 'pipe',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: gitEnv,
     });
     const tempReal = fs.realpathSync(temp);
     let current = tempReal;
@@ -311,6 +314,8 @@ export function installGithub(repo: string, subdir: string, ref = 'HEAD'): Skill
     if (!targetReal.startsWith(tempReal + path.sep)) throw new Error('无效的 Skill 子目录');
     const revision = execFileSync('git', ['-C', temp, 'rev-parse', 'HEAD'], {
       encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: gitEnv,
     }).trim();
     return installDirectory(targetReal, `github:${repo}:${subdir}`, revision);
   } finally {
@@ -398,6 +403,7 @@ export async function updateSkill(name: string): Promise<SkillInfo> {
     const { installSkillsSh } = await import('./skills-sh.js');
     return installSkillsSh(skill.source.slice(10));
   }
+  if (!skill.source.startsWith('github:')) throw new Error('不支持更新此来源的 Skill');
   const detail = skill.source.slice(7);
   const separator = detail.lastIndexOf(':');
   if (separator < 0) throw new Error('无法解析 GitHub Skill 来源');
@@ -425,18 +431,37 @@ export function marketEntries(name: string): MarketEntry[] {
   try {
     execFileSync('git', ['clone', '--depth', '1', '--quiet', sourceUrl(market.source), temp], {
       timeout: 120000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     });
     const file = path.join(temp, 'marketplace.json');
     const data: unknown = JSON.parse(readSkillText(file, 1_000_000));
     if (!Array.isArray(data)) throw new Error('marketplace.json 必须是数组');
     return data.map((x) => {
-      const item = x as MarketEntry;
-      safeName(item.name);
-      if (typeof item.path !== 'string' || typeof item.description !== 'string')
+      if (!x || typeof x !== 'object' || Array.isArray(x)) throw new Error('无效的市场条目');
+      const raw = x as Record<string, unknown>;
+      if (
+        typeof raw.name !== 'string' ||
+        typeof raw.path !== 'string' ||
+        typeof raw.description !== 'string'
+      )
         throw new Error('无效的市场条目');
-      if (item.repo) sourceUrl(item.repo);
-      if (item.ref) safeRef(item.ref);
-      return item;
+      safeName(raw.name);
+      if (raw.repo !== undefined) {
+        if (typeof raw.repo !== 'string' || !raw.repo) throw new Error('无效的市场仓库地址');
+        sourceUrl(raw.repo);
+      }
+      if (raw.ref !== undefined) {
+        if (typeof raw.ref !== 'string' || !raw.ref) throw new Error('无效的市场分支或提交');
+        safeRef(raw.ref);
+      }
+      return {
+        name: raw.name,
+        description: raw.description,
+        path: raw.path,
+        ...(raw.repo !== undefined ? { repo: raw.repo as string } : {}),
+        ...(raw.ref !== undefined ? { ref: raw.ref as string } : {}),
+      };
     });
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });

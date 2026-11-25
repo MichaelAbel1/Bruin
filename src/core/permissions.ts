@@ -62,6 +62,7 @@ export function decisionFor(
   )
     return { decision: 'allow', reason: '读取状态或更新规划' };
   if (call.name === 'load_skill') return { decision: 'allow', reason: '读取已安装 Skill' };
+  if (call.name === 'ask_user') return { decision: 'allow', reason: '向用户确认任务信息' };
   if (call.name === 'search') return { decision: 'allow', reason: '只读工作区搜索' };
   try {
     const root = managedPending ? path.resolve(workspace) : fs.realpathSync(workspace);
@@ -104,9 +105,9 @@ export function decisionFor(
       return { decision: 'ask', reason: '创建或覆盖工作区文件' };
     }
     if (!fs.statSync(target).isFile()) throw new Error('目标不是文件');
-    return call.name === 'edit_file'
-      ? { decision: 'ask', reason: '修改工作区文件' }
-      : { decision: 'allow', reason: '只读工作区文件' };
+    if (call.name === 'edit_file') return { decision: 'ask', reason: '修改工作区文件' };
+    if (call.name === 'read_file') return { decision: 'allow', reason: '只读工作区文件' };
+    return { decision: 'deny', reason: '未配置权限策略的工具' };
   } catch {
     return { decision: 'deny', reason: '文件不存在或无法验证路径' };
   }

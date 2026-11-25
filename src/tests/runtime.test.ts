@@ -1783,3 +1783,53 @@ test('doctor flags invalid BRUIN_WEBHOOK_URL and recoverCronJobs handles malform
     f.close();
   }
 });
+
+test('expired running tasks project as unknown and allow retry/delete; dispatched cron cannot be deleted; overlapping secrets scrub cleanly', () => {
+  const f = fixture();
+  try {
+    const task = f.store.createTask(f.session.id, 'long task', []);
+    const claimed = f.store.claimTask(f.session.id, 'worker-1', 1000);
+    assert.ok(claimed);
+    // Force expires_at into the past to simulate worker crash without another claimTask().
+    (
+      f.store as unknown as {
+        db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+      }
+    ).db
+      .prepare('UPDATE workspace_tasks SET expires_at = ? WHERE id = ?')
+      .run(Date.now() - 5000, task.id);
+    assert.equal(f.store.listTasks(f.session.id)[0]?.status, 'unknown');
+    f.store.retryTask(f.session.id, task.id);
+    assert.equal(f.store.listTasks(f.session.id)[0]?.status, 'pending');
+
+    const claimed2 = f.store.claimTask(f.session.id, 'worker-2', 1000);
+    assert.ok(claimed2);
+    (
+      f.store as unknown as {
+        db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+      }
+    ).db
+      .prepare('UPDATE workspace_tasks SET expires_at = ? WHERE id = ?')
+      .run(Date.now() - 5000, task.id);
+    f.store.deleteTask(f.session.id, task.id);
+    assert.equal(f.store.listTasks(f.session.id).length, 0);
+
+    const job = f.store.createCronJob(f.session.id, '0 9 * * *', 'check');
+    (
+      f.store as unknown as {
+        db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+      }
+    ).db
+      .prepare(`UPDATE cron_jobs SET last_status = 'dispatched' WHERE id = ?`)
+      .run(job.id);
+    assert.throws(() => f.store.deleteCronJob(f.session.id, job.id), /不能删除/);
+
+    f.store.append(f.session.id, 'user', { text: 'token=sk-overlapping1234567890' });
+    const scrubbed = f.store.scrubSecrets(['sk-overlapping12', 'sk-overlapping1234567890']);
+    assert.equal(scrubbed, 1);
+    const after = String(f.store.events(f.session.id).at(-1)?.payload.text ?? '');
+    assert.equal(after, 'token=[REDACTED]');
+  } finally {
+    f.close();
+  }
+});

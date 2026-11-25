@@ -89,3 +89,26 @@ test('memory query uses successful local file paths and excludes previous work a
   add('user', { text: 'Continue' });
   assert.equal(workspaceMemoryQuery(workspace, events), '');
 });
+
+test('memoryContext ignores single-character Latin tokens and avoids splitting UTF-16 surrogate pairs', () => {
+  const result = memoryContext(
+    [
+      page('deploy', 'Deploy via blue-green rollout.'),
+      page('ui-theme', 'Dark palette configuration with indigo accent.'),
+    ],
+    'I want to deploy',
+  );
+  assert.match(result, /Deploy via blue-green rollout/);
+  assert.doesNotMatch(result, /Dark palette configuration/);
+
+  const emojiContent = 'deploy ' + 'x'.repeat(1940) + '🚀'.repeat(40);
+  const truncated = memoryContext([page('deploy', emojiContent)], 'deploy');
+  // Verify no lone high surrogate exists anywhere in the output.
+  for (let i = 0; i < truncated.length; i++) {
+    const code = truncated.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = truncated.charCodeAt(i + 1);
+      assert.ok(next >= 0xdc00 && next <= 0xdfff, 'lone high surrogate detected');
+    }
+  }
+});

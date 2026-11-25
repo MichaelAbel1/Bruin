@@ -30,6 +30,16 @@ export const MarkdownMessage = React.memo(function MarkdownMessage({ text }: { t
   );
 });
 
+function sameToolEvents(prev: { events: SessionEvent[] }, next: { events: SessionEvent[] }) {
+  if (prev.events === next.events) return true;
+  if (prev.events.length !== next.events.length) return false;
+  for (let i = 0; i < prev.events.length; i++) {
+    if (prev.events[i].seq !== next.events[i].seq || prev.events[i].type !== next.events[i].type)
+      return false;
+  }
+  return true;
+}
+
 export const ToolActivity = React.memo(function ToolActivity({
   events,
 }: {
@@ -38,10 +48,28 @@ export const ToolActivity = React.memo(function ToolActivity({
   const results = events.filter((event) =>
     ['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type),
   );
-  const pending =
-    events.flatMap((event) =>
-      event.type === 'assistant' && Array.isArray(event.payload.calls) ? event.payload.calls : [],
-    ).length - results.length;
+  const settledCounts = new Map<string, number>();
+  let unmatchedResults = 0;
+  for (const event of results) {
+    const id = typeof event.payload.callId === 'string' ? event.payload.callId : '';
+    if (id) settledCounts.set(id, (settledCounts.get(id) ?? 0) + 1);
+    else unmatchedResults++;
+  }
+  let pending = 0;
+  for (const event of events) {
+    if (event.type !== 'assistant' || !Array.isArray(event.payload.calls)) continue;
+    for (const call of event.payload.calls as Array<{ id?: unknown }>) {
+      const id = typeof call?.id === 'string' ? call.id : '';
+      const remaining = id ? (settledCounts.get(id) ?? 0) : 0;
+      if (remaining > 0) {
+        settledCounts.set(id, remaining - 1);
+      } else if (!id && unmatchedResults > 0) {
+        unmatchedResults--;
+      } else {
+        pending++;
+      }
+    }
+  }
   const failures = results.filter(
     (event) => event.type !== 'tool_finished' || event.payload.isError,
   ).length;
@@ -50,7 +78,7 @@ export const ToolActivity = React.memo(function ToolActivity({
       <summary>
         <Terminal size={15} />
         <span>
-          工具调用 {results.length + Math.max(0, pending)} 次
+          工具调用 {results.length + pending} 次
           {failures > 0 ? ` · ${failures} 次失败或需检查` : ''}
         </span>
         <ChevronDown size={14} />
@@ -63,7 +91,7 @@ export const ToolActivity = React.memo(function ToolActivity({
       </div>
     </details>
   );
-});
+}, sameToolEvents);
 
 const noopQuote = () => {};
 
@@ -116,7 +144,7 @@ export const EventCard = React.memo(function EventCard({
               引用：{String((event.payload.quote as { text?: string }).text ?? '').slice(0, 160)}
             </div>
           )}
-          {Array.isArray(event.payload.attachments) && (
+          {Array.isArray(event.payload.attachments) && event.payload.attachments.length > 0 && (
             <div className="message-attachments">
               {(event.payload.attachments as AttachmentRef[]).map((item) => (
                 <span key={item.id}>

@@ -347,3 +347,34 @@ test(
     }
   },
 );
+
+test('snapshot sidecar metadata accelerates listing and rollback succeeds at 200-snapshot quota', async () => {
+  const f = fixture();
+  try {
+    const target = path.join(f.root, 'file.txt');
+    fs.writeFileSync(target, 'v0');
+    const read = await f.run('read_file', { path: 'file.txt' });
+    const write = await f.run(
+      'write_file',
+      { path: 'file.txt', content: 'v1' },
+      f.root,
+      read.fileVersion,
+    );
+    assert.equal(write.isError, false, write.output);
+    const snapshot = listSnapshots(f.root)[0];
+    const key = createHash('sha256').update(fs.realpathSync(f.root)).digest('hex');
+    const snapDir = path.join(f.dir, 'home', 'snapshots', key);
+    assert.equal(fs.existsSync(path.join(snapDir, `${snapshot.id}.meta.json`)), true);
+
+    // Fill directory up to 200 snapshot files to simulate hitting quota.
+    for (let i = 1; i < 200; i++) {
+      const fakeId = `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+      fs.writeFileSync(path.join(snapDir, `${fakeId}.json`), '{}');
+    }
+    const rolledBack = await f.run('restore_snapshot', { id: snapshot.id });
+    assert.equal(rolledBack.isError, false, rolledBack.output);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'v0');
+  } finally {
+    await f.close();
+  }
+});

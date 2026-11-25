@@ -25,11 +25,23 @@ export class SessionLeases {
     if (entry?.controller.signal.aborted)
       throw new Error('此会话租约已失效，等待当前任务退出后再继续');
     const owner = entry?.owner ?? randomUUID();
-    // Recheck SQLite ownership even when another local task still holds the lease.
+    // Recheck continuous SQLite ownership when another local task still holds the lease;
+    // never resurrect an expired/stolen lease via acquireLease.
     try {
-      this.store.acquireLease(id, owner, 30_000);
+      if (entry) {
+        if (!this.store.renewLease(id, owner, 30_000)) {
+          clearInterval(entry.heartbeat);
+          entry.controller.abort();
+          throw new Error('此会话租约已失效（可能已被另一个进程接管），等待当前任务退出后再继续');
+        }
+      } else {
+        this.store.acquireLease(id, owner, 30_000);
+      }
     } catch (error) {
-      entry?.controller.abort();
+      if (entry) {
+        clearInterval(entry.heartbeat);
+        entry.controller.abort();
+      }
       throw error;
     }
     if (!entry) {

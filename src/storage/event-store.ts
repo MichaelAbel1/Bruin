@@ -104,11 +104,11 @@ export class SqliteEventStore implements EventStore {
     try {
       this.db = new Database(filename);
       fs.chmodSync(filename, 0o600);
+      this.db.pragma('busy_timeout = 5000');
       this.db.pragma('journal_mode = WAL');
       this.db.pragma('synchronous = FULL');
       this.db.pragma('secure_delete = ON');
       this.db.pragma('foreign_keys = ON');
-      this.db.pragma('busy_timeout = 5000');
       const schemaVersion = this.db.pragma('user_version', { simple: true }) as number;
       if (schemaVersion > 8) throw new Error(`数据库版本 ${schemaVersion} 高于当前支持的版本`);
       this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
@@ -151,21 +151,18 @@ export class SqliteEventStore implements EventStore {
       id TEXT PRIMARY KEY, content TEXT NOT NULL, source_session_id TEXT NOT NULL,
       created_at TEXT NOT NULL
     );`);
-      if (schemaVersion < 6)
+      if (schemaVersion < 8)
         this.db
           .transaction(() => {
-            this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
+            const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
+            if (currentVersion >= 8) return;
+            if (currentVersion < 6) {
+              this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
         (id, workspace, origin_session_id, title, description, dependencies_json, status, owner, expires_at, created_at, updated_at)
         SELECT t.id, s.workspace, t.session_id, t.title, '', t.dependencies_json,
           t.status, t.owner, t.expires_at, t.created_at, t.created_at
         FROM task_nodes t JOIN sessions s ON s.id = t.session_id`);
-            this.db.pragma('user_version = 6');
-          })
-          .immediate();
-      if (schemaVersion < 7) this.db.pragma('user_version = 7');
-      if (schemaVersion < 8)
-        this.db
-          .transaction(() => {
+            }
             const columns = this.db.pragma('table_info(sessions)') as Array<{ name: string }>;
             if (!columns.some((column) => column.name === 'managed_workspace'))
               this.db.exec(
@@ -350,6 +347,7 @@ export class SqliteEventStore implements EventStore {
     return session.workspace;
   }
   private taskRows(workspace: string): TaskNode[] {
+    const now = Date.now();
     const rows = this.db
       .prepare('SELECT * FROM workspace_tasks WHERE workspace = ? ORDER BY created_at, id')
       .all(workspace) as any[];
@@ -357,19 +355,23 @@ export class SqliteEventStore implements EventStore {
     for (const row of rows)
       for (const dependency of JSON.parse(row.dependencies_json) as string[])
         blocks.set(dependency, [...(blocks.get(dependency) ?? []), row.id]);
-    return rows.map((row) => ({
-      id: row.id,
-      sessionId: row.origin_session_id,
-      title: row.title,
-      description: row.description,
-      dependencies: JSON.parse(row.dependencies_json),
-      blocks: blocks.get(row.id) ?? [],
-      status: row.status,
-      ...(row.owner ? { owner: row.owner } : {}),
-      ...(row.expires_at ? { expiresAt: row.expires_at } : {}),
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    }));
+    return rows.map((row) => {
+      const expiredRunning =
+        row.status === 'running' && typeof row.expires_at === 'number' && row.expires_at < now;
+      return {
+        id: row.id,
+        sessionId: row.origin_session_id,
+        title: row.title,
+        description: row.description,
+        dependencies: JSON.parse(row.dependencies_json),
+        blocks: blocks.get(row.id) ?? [],
+        status: expiredRunning ? 'unknown' : row.status,
+        ...(!expiredRunning && row.owner ? { owner: row.owner } : {}),
+        ...(!expiredRunning && row.expires_at ? { expiresAt: row.expires_at } : {}),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    });
   }
   /** SQLite owns concurrency; .tasks is a repairable, human-readable workspace projection. */
   private ensureTaskDirectory(workspace: string): string {
@@ -642,9 +644,9 @@ export class SqliteEventStore implements EventStore {
     const result = this.db
       .prepare(
         `UPDATE workspace_tasks SET status = 'pending', owner = NULL, expires_at = NULL, updated_at = ?
-      WHERE id = ? AND workspace = ? AND status IN ('failed', 'unknown')`,
+      WHERE id = ? AND workspace = ? AND (status IN ('failed', 'unknown') OR (status = 'running' AND expires_at < ?))`,
       )
-      .run(new Date().toISOString(), id, workspace);
+      .run(new Date().toISOString(), id, workspace, Date.now());
     if (!result.changes) throw new Error('只有失败或结果未知的任务可以重试');
     this.repairTaskFiles(workspace);
   }
@@ -662,10 +664,15 @@ export class SqliteEventStore implements EventStore {
     this.db
       .transaction(() => {
         const task = this.db
-          .prepare('SELECT status, owner FROM workspace_tasks WHERE id = ? AND workspace = ?')
-          .get(id, workspace) as { status: string; owner: string | null } | undefined;
+          .prepare(
+            'SELECT status, owner, expires_at FROM workspace_tasks WHERE id = ? AND workspace = ?',
+          )
+          .get(id, workspace) as
+          { status: string; owner: string | null; expires_at: number | null } | undefined;
         if (!task) throw new Error('任务不存在或不属于当前工作区');
-        if (task.status === 'running') throw new Error('正在执行中的任务不能删除');
+        const activeRunning =
+          task.status === 'running' && (task.expires_at === null || task.expires_at >= Date.now());
+        if (activeRunning) throw new Error('正在执行中的任务不能删除');
         const dependent = this.taskRows(workspace).find((t) => t.dependencies.includes(id));
         if (dependent) throw new Error(`无法删除被任务 "${dependent.title}" 依赖的任务`);
         this.db
@@ -747,10 +754,16 @@ export class SqliteEventStore implements EventStore {
     ).map((row) => this.rowToCronJob(row));
   }
   deleteCronJob(sessionId: string, id: string): void {
-    const result = this.db
-      .prepare('DELETE FROM cron_jobs WHERE session_id = ? AND id = ?')
-      .run(sessionId, id);
-    if (!result.changes) throw new Error('定时任务不存在');
+    this.db
+      .transaction(() => {
+        const row = this.db
+          .prepare('SELECT last_status FROM cron_jobs WHERE session_id = ? AND id = ?')
+          .get(sessionId, id) as { last_status: string | null } | undefined;
+        if (!row) throw new Error('定时任务不存在');
+        if (row.last_status === 'dispatched') throw new Error('正在派发执行中的定时任务不能删除');
+        this.db.prepare('DELETE FROM cron_jobs WHERE session_id = ? AND id = ?').run(sessionId, id);
+      })
+      .immediate();
   }
   takeDueCronJobs(now: number): CronJob[] {
     const claim = this.db.transaction(() => {
@@ -802,22 +815,36 @@ export class SqliteEventStore implements EventStore {
       .transaction(() => {
         const row = this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id) as any;
         if (!row) return;
-        const events = this.events(row.session_id);
-        const run = [...events]
-          .reverse()
-          .find((event) => event.type === 'cron_started' && event.payload.jobId === id);
-        if (
-          run &&
-          !events.some(
-            (event) => event.type === 'cron_finished' && event.payload.runId === run.payload.runId,
+        const startedRows = this.db
+          .prepare(
+            `SELECT payload_json FROM events WHERE session_id = ? AND type = 'cron_started' ORDER BY seq DESC`,
           )
-        )
-          this.append(row.session_id, 'cron_finished', {
-            jobId: id,
-            runId: run.payload.runId,
-            status,
-            ...(detail ? { detail } : {}),
-          });
+          .all(row.session_id) as Array<{ payload_json: string }>;
+        let runId: unknown;
+        for (const item of startedRows) {
+          const payload = JSON.parse(item.payload_json) as Record<string, unknown>;
+          if (payload.jobId === id) {
+            runId = payload.runId;
+            break;
+          }
+        }
+        if (runId !== undefined) {
+          const finishedRows = this.db
+            .prepare(
+              `SELECT payload_json FROM events WHERE session_id = ? AND type = 'cron_finished' ORDER BY seq DESC`,
+            )
+            .all(row.session_id) as Array<{ payload_json: string }>;
+          const alreadyFinished = finishedRows.some(
+            (item) => (JSON.parse(item.payload_json) as Record<string, unknown>).runId === runId,
+          );
+          if (!alreadyFinished)
+            this.append(row.session_id, 'cron_finished', {
+              jobId: id,
+              runId,
+              status,
+              ...(detail ? { detail } : {}),
+            });
+        }
         this.db.prepare('UPDATE cron_jobs SET last_status = ? WHERE id = ?').run(status, id);
       })
       .immediate();
@@ -870,12 +897,19 @@ export class SqliteEventStore implements EventStore {
   }
   savePreference(sessionId: string, content: string): UserPreference {
     const value = content.trim();
-    const lastUser = [...this.events(sessionId)].reverse().find((event) => event.type === 'user');
+    const lastUserRow = this.db
+      .prepare(
+        `SELECT payload_json FROM events WHERE session_id = ? AND type = 'user' ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(sessionId) as { payload_json: string } | undefined;
+    const lastUserText = lastUserRow
+      ? String((JSON.parse(lastUserRow.payload_json) as Record<string, unknown>).text ?? '')
+      : '';
     if (
       !value ||
       value.length > 1000 ||
-      !lastUser ||
-      !String(lastUser.payload.text ?? '').includes(value) ||
+      !lastUserRow ||
+      !lastUserText.includes(value) ||
       /(?:sk-|gsk_|AIza|xai-)[A-Za-z0-9_-]{16,}/i.test(value)
     )
       throw new Error('偏好必须是本轮用户明确表达的原文，且不能包含密钥');
@@ -898,8 +932,14 @@ export class SqliteEventStore implements EventStore {
     this.db.prepare('DELETE FROM user_preferences WHERE id = ?').run(id);
   }
   scrubSecrets(secrets: string[]): number {
-    const values = [...new Set(secrets.filter((value) => value.length >= 12))];
+    const values = [...new Set(secrets.filter((value) => value.length >= 12))].sort(
+      (a, b) => b.length - a.length,
+    );
     if (!values.length) return 0;
+    const needles = [
+      ...new Set(values.flatMap((secret) => [secret, JSON.stringify(secret).slice(1, -1)])),
+    ];
+    const mightContainSecret = (raw: string) => needles.some((needle) => raw.includes(needle));
     const scrub = (item: unknown): unknown => {
       if (typeof item === 'string')
         return values.reduce((text, secret) => text.replaceAll(secret, '[REDACTED]'), item);
@@ -910,30 +950,35 @@ export class SqliteEventStore implements EventStore {
     };
     const changed = this.db
       .transaction(() => {
-        let changed = 0;
-        for (const row of this.db.prepare('SELECT id, profile_json FROM sessions').all() as Array<{
+        const sessionUpdates: Array<[string, string]> = [];
+        for (const row of this.db
+          .prepare('SELECT id, profile_json FROM sessions')
+          .iterate() as Iterable<{
           id: string;
           profile_json: string;
         }>) {
+          if (!mightContainSecret(row.profile_json)) continue;
           const next = JSON.stringify(scrub(JSON.parse(row.profile_json)));
-          if (next !== row.profile_json) {
-            this.db.prepare('UPDATE sessions SET profile_json = ? WHERE id = ?').run(next, row.id);
-            changed++;
-          }
+          if (next !== row.profile_json) sessionUpdates.push([next, row.id]);
         }
-        for (const row of this.db.prepare('SELECT rowid, payload_json FROM events').all() as Array<{
+        const updateSession = this.db.prepare('UPDATE sessions SET profile_json = ? WHERE id = ?');
+        for (const [next, id] of sessionUpdates) updateSession.run(next, id);
+
+        const eventUpdates: Array<[string, number]> = [];
+        for (const row of this.db
+          .prepare('SELECT rowid, payload_json FROM events')
+          .iterate() as Iterable<{
           rowid: number;
           payload_json: string;
         }>) {
+          if (!mightContainSecret(row.payload_json)) continue;
           const next = JSON.stringify(scrub(JSON.parse(row.payload_json)));
-          if (next !== row.payload_json) {
-            this.db
-              .prepare('UPDATE events SET payload_json = ? WHERE rowid = ?')
-              .run(next, row.rowid);
-            changed++;
-          }
+          if (next !== row.payload_json) eventUpdates.push([next, row.rowid]);
         }
-        return changed;
+        const updateEvent = this.db.prepare('UPDATE events SET payload_json = ? WHERE rowid = ?');
+        for (const [next, rowid] of eventUpdates) updateEvent.run(next, rowid);
+
+        return sessionUpdates.length + eventUpdates.length;
       })
       .immediate();
     if (changed) {

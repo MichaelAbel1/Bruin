@@ -1,15 +1,97 @@
-type DiffLine = {
+export type DiffLine = {
   type: 'added' | 'deleted' | 'unchanged';
   text: string;
   oldLine?: number;
   newLine?: number;
 };
 
-type DiffResult = {
+export type DiffResult = {
   diff: DiffLine[];
   additions: number;
   deletions: number;
 };
+
+/** Bounded Myers O((m+n)*D) line diff for the middle slice; returns null when edit distance > maxD. */
+function myersDiff(
+  midOld: string[],
+  midNew: string[],
+  prefix: number,
+  maxD: number,
+): DiffLine[] | null {
+  const m = midOld.length;
+  const n = midNew.length;
+  const limit = Math.min(maxD, m + n);
+  const offset = limit;
+  const size = 2 * limit + 1;
+  const v = new Int32Array(size);
+  const trace: Int32Array[] = [];
+
+  for (let d = 0; d <= limit; d++) {
+    trace.push(v.slice());
+    for (let k = -d; k <= d; k += 2) {
+      let x: number;
+      if (k === -d || (k !== d && v[offset + k - 1] < v[offset + k + 1])) {
+        x = v[offset + k + 1];
+      } else {
+        x = v[offset + k - 1] + 1;
+      }
+      let y = x - k;
+      while (x < m && y < n && midOld[x] === midNew[y]) {
+        x++;
+        y++;
+      }
+      v[offset + k] = x;
+      if (x >= m && y >= n) {
+        const rev: DiffLine[] = [];
+        let cx = m;
+        let cy = n;
+        for (let step = d; step > 0; step--) {
+          const prev = trace[step];
+          const ck = cx - cy;
+          let prevK: number;
+          if (ck === -step || (ck !== step && prev[offset + ck - 1] < prev[offset + ck + 1])) {
+            prevK = ck + 1;
+          } else {
+            prevK = ck - 1;
+          }
+          const prevX = prev[offset + prevK];
+          const prevY = prevX - prevK;
+          while (cx > prevX && cy > prevY) {
+            rev.push({
+              type: 'unchanged',
+              text: midOld[cx - 1],
+              oldLine: prefix + cx,
+              newLine: prefix + cy,
+            });
+            cx--;
+            cy--;
+          }
+          if (cx === prevX) {
+            rev.push({ type: 'added', text: midNew[cy - 1], newLine: prefix + cy });
+            cy--;
+          } else {
+            rev.push({ type: 'deleted', text: midOld[cx - 1], oldLine: prefix + cx });
+            cx--;
+          }
+        }
+        while (cx > 0 && cy > 0) {
+          rev.push({
+            type: 'unchanged',
+            text: midOld[cx - 1],
+            oldLine: prefix + cx,
+            newLine: prefix + cy,
+          });
+          cx--;
+          cy--;
+        }
+        const ordered: DiffLine[] = [];
+        for (let idx = rev.length - 1; idx >= 0; idx--) ordered.push(rev[idx]);
+        return ordered;
+      }
+    }
+  }
+  return null;
+}
 
 export function computeLineDiff(oldText: string, newText: string): DiffResult {
   const oldLines = oldText ? oldText.split('\n') : [];
@@ -43,7 +125,7 @@ export function computeLineDiff(oldText: string, newText: string): DiffResult {
   const m = midOld.length;
   const n = midNew.length;
 
-  if (m * n > 1_500_000) {
+  if (m === 0 || n === 0) {
     for (let i = 0; i < m; i++) {
       diff.push({ type: 'deleted', text: midOld[i], oldLine: prefix + i + 1 });
     }
@@ -51,36 +133,17 @@ export function computeLineDiff(oldText: string, newText: string): DiffResult {
       diff.push({ type: 'added', text: midNew[j], newLine: prefix + j + 1 });
     }
   } else {
-    const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
-    for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        if (midOld[i - 1] === midNew[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
-        else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+    const midDiff = myersDiff(midOld, midNew, prefix, 1500);
+    if (midDiff) {
+      for (let k = 0; k < midDiff.length; k++) diff.push(midDiff[k]);
+    } else {
+      for (let i = 0; i < m; i++) {
+        diff.push({ type: 'deleted', text: midOld[i], oldLine: prefix + i + 1 });
+      }
+      for (let j = 0; j < n; j++) {
+        diff.push({ type: 'added', text: midNew[j], newLine: prefix + j + 1 });
       }
     }
-    let i = m;
-    let j = n;
-    const midDiff: DiffLine[] = [];
-    while (i > 0 || j > 0) {
-      if (i > 0 && j > 0 && midOld[i - 1] === midNew[j - 1]) {
-        midDiff.push({
-          type: 'unchanged',
-          text: midOld[i - 1],
-          oldLine: prefix + i,
-          newLine: prefix + j,
-        });
-        i--;
-        j--;
-      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-        midDiff.push({ type: 'added', text: midNew[j - 1], newLine: prefix + j });
-        j--;
-      } else {
-        midDiff.push({ type: 'deleted', text: midOld[i - 1], oldLine: prefix + i });
-        i--;
-      }
-    }
-    midDiff.reverse();
-    diff.push(...midDiff);
   }
 
   const oldSuffixStart = oldLines.length - suffix;

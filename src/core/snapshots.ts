@@ -69,14 +69,31 @@ type Snapshot = {
   mode: number;
   afterHash: string;
 };
+type SnapshotMeta = {
+  id: string;
+  root: string;
+  path: string;
+  at: string;
+  action: 'delete_created_file' | 'restore_file';
+};
 export function recordSnapshot(
   workspace: string,
   file: string,
   after: Buffer,
   expectedFileVersion?: string,
+  options: { allowOverQuota?: boolean } = {},
 ): string | undefined {
   const { root, directory } = location(workspace);
-  const relative = path.relative(root, file);
+  const resolvedWorkspace = path.resolve(workspace);
+  const candidate = path.isAbsolute(file) ? file : path.resolve(root, file);
+  let relative: string;
+  if (candidate.startsWith(root + path.sep)) {
+    relative = path.relative(root, candidate);
+  } else if (candidate.startsWith(resolvedWorkspace + path.sep)) {
+    relative = path.relative(resolvedWorkspace, candidate);
+  } else {
+    relative = path.relative(root, candidate);
+  }
   const target = checked(root, relative);
   const before = bytesAt(target);
   const beforeHash = before ? fileContentHash(before.bytes) : null;
@@ -85,25 +102,40 @@ export function recordSnapshot(
     throw new Error('文件自上次读取后已更改，请重新读取后再写入');
   if (beforeHash === afterHash) return;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const stored = fs.readdirSync(directory).filter((name) => name.endsWith('.json'));
-  if (
-    stored.length >= 200 ||
-    stored.reduce((sum, name) => sum + fs.statSync(path.join(directory, name)).size, 0) >
-      500_000_000
-  )
-    throw new Error('快照存储达到上限，请先备份并清理快照目录');
+  if (!options.allowOverQuota) {
+    const stored = fs.readdirSync(directory).filter((name) => /^[a-f0-9-]{36}\.json$/.test(name));
+    let totalBytes = 0;
+    for (const name of stored) {
+      try {
+        totalBytes += fs.lstatSync(path.join(directory, name)).size;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    }
+    if (stored.length >= 200 || totalBytes > 500_000_000)
+      throw new Error('快照存储达到上限，请先备份并清理快照目录');
+  }
   const id = randomUUID();
+  const at = new Date().toISOString();
   const snapshot: Snapshot = {
     id,
     root,
     path: relative,
-    at: new Date().toISOString(),
+    at,
     before: before?.bytes.toString('base64') ?? null,
     beforeHash,
     mode: before ? before.stat.mode & 0o777 : 0o600,
     afterHash,
   };
+  const meta: SnapshotMeta = {
+    id,
+    root,
+    path: relative,
+    at,
+    action: snapshot.before === null ? 'delete_created_file' : 'restore_file',
+  };
   const temp = path.join(directory, `${id}.tmp`);
+  const metaTemp = path.join(directory, `${id}.meta.tmp`);
   try {
     const fd = fs.openSync(temp, 'wx', 0o600);
     try {
@@ -113,6 +145,12 @@ export function recordSnapshot(
       fs.closeSync(fd);
     }
     fs.renameSync(temp, path.join(directory, `${id}.json`));
+    try {
+      fs.writeFileSync(metaTemp, JSON.stringify(meta), { flag: 'wx', mode: 0o600 });
+      fs.renameSync(metaTemp, path.join(directory, `${id}.meta.json`));
+    } catch {
+      // Optional sidecar index; full snapshot .json remains authoritative.
+    }
     if (process.platform !== 'win32') {
       const dir = fs.openSync(directory, 'r');
       try {
@@ -125,12 +163,20 @@ export function recordSnapshot(
     try {
       fs.unlinkSync(temp);
     } catch {}
+    try {
+      fs.unlinkSync(metaTemp);
+    } catch {}
   }
   return id;
 }
-function readSnapshotRaw(workspace: string, id: string, verifyContent: boolean): Snapshot {
+function readSnapshotRaw(
+  workspace: string,
+  id: string,
+  verifyContent: boolean,
+  loc?: { root: string; directory: string },
+): Snapshot {
   if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('无效快照 ID');
-  const { root, directory } = location(workspace);
+  const { root, directory } = loc ?? location(workspace);
   const file = path.join(directory, `${id}.json`);
   const fd = fs.openSync(
     file,
@@ -139,9 +185,12 @@ function readSnapshotRaw(workspace: string, id: string, verifyContent: boolean):
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.size > 14_000_000) throw new Error('快照文件无效');
-    const value = JSON.parse(
+    const parsed: unknown = JSON.parse(
       new TextDecoder('utf-8', { fatal: true }).decode(bounded(fd, 14_000_000)),
-    ) as Snapshot;
+    );
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw new Error('快照数据无效');
+    const value = parsed as Snapshot;
     const beforeBytes =
       verifyContent && typeof value.before === 'string'
         ? Buffer.from(value.before, 'base64')
@@ -177,6 +226,46 @@ function readSnapshotRaw(workspace: string, id: string, verifyContent: boolean):
     fs.closeSync(fd);
   }
 }
+function readSnapshotMeta(
+  loc: { root: string; directory: string },
+  id: string,
+): { id: string; path: string; at: string; action: 'delete_created_file' | 'restore_file' } | null {
+  const file = path.join(loc.directory, `${id}.meta.json`);
+  let fd: number;
+  try {
+    fd = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
+  } catch {
+    return null;
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > 16_000) return null;
+    const parsed: unknown = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(bounded(fd, 16_000)),
+    );
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const value = parsed as Partial<SnapshotMeta>;
+    if (
+      value.id !== id ||
+      value.root !== loc.root ||
+      typeof value.path !== 'string' ||
+      typeof value.at !== 'string' ||
+      !Number.isFinite(Date.parse(value.at)) ||
+      (value.action !== 'delete_created_file' && value.action !== 'restore_file')
+    )
+      return null;
+    const resolved = path.resolve(loc.root, value.path);
+    if (resolved === loc.root || !resolved.startsWith(loc.root + path.sep)) return null;
+    return { id: value.id, path: value.path, at: value.at, action: value.action };
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 function readSnapshot(workspace: string, id: string): Snapshot {
   return readSnapshotRaw(workspace, id, true);
 }
@@ -187,20 +276,23 @@ export function previewSnapshot(workspace: string, id: string): string {
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
 }
 export function listSnapshots(workspace: string) {
-  const { directory } = location(workspace);
-  if (!fs.existsSync(directory)) return [];
+  const loc = location(workspace);
+  if (!fs.existsSync(loc.directory)) return [];
   return fs
-    .readdirSync(directory)
+    .readdirSync(loc.directory)
     .filter((name) => /^[a-f0-9-]{36}\.json$/.test(name))
     .flatMap((name) => {
+      const id = name.slice(0, -5);
+      const fast = readSnapshotMeta(loc, id);
+      if (fast) return [fast];
       try {
-        const { id, path: file, at, before } = readSnapshotRaw(workspace, name.slice(0, -5), false);
+        const { path: file, at, before } = readSnapshotRaw(workspace, id, false, loc);
         return [
           {
             id,
             path: file,
             at,
-            action: before === null ? 'delete_created_file' : 'restore_file',
+            action: before === null ? ('delete_created_file' as const) : ('restore_file' as const),
           },
         ];
       } catch {
@@ -217,12 +309,30 @@ export function restoreSnapshot(
   const snapshot = readSnapshot(workspace, id);
   const { root } = location(workspace);
   const file = checked(root, snapshot.path);
+  const parent = path.dirname(file);
+  const parentStat = fs.lstatSync(parent);
   const current = bytesAt(file);
   if (!current || fileContentHash(current.bytes) !== snapshot.afterHash)
     throw new Error('文件已有后续修改或已删除，拒绝覆盖；请先检查差异');
   if (snapshot.before === null) {
-    const again = bytesAt(checked(root, snapshot.path));
-    if (!again || fileContentHash(again.bytes) !== snapshot.afterHash)
+    checked(root, snapshot.path);
+    const currentParent = fs.lstatSync(parent);
+    if (
+      !currentParent.isDirectory() ||
+      currentParent.isSymbolicLink() ||
+      currentParent.dev !== parentStat.dev ||
+      currentParent.ino !== parentStat.ino
+    )
+      throw new Error('回滚期间父目录发生变化');
+    const currentTarget = fs.lstatSync(file);
+    if (
+      currentTarget.isSymbolicLink() ||
+      !currentTarget.isFile() ||
+      currentTarget.dev !== current.stat.dev ||
+      currentTarget.ino !== current.stat.ino ||
+      currentTarget.size !== current.stat.size ||
+      currentTarget.mtimeMs !== current.stat.mtimeMs
+    )
       throw new Error('回滚期间文件发生变化');
     fs.unlinkSync(file);
   } else {

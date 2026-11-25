@@ -1,4 +1,12 @@
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Bot,
@@ -212,7 +220,11 @@ const EditorTab = React.memo(function EditorTab({
 }) {
   const isDirty = file.content !== file.originalContent;
   const diffBase = file.baselineContent ?? file.originalContent;
-  const stat = useMemo(() => computeLineDiff(diffBase, file.content), [diffBase, file.content]);
+  const deferredContent = useDeferredValue(file.content);
+  const stat = useMemo(
+    () => computeLineDiff(diffBase, deferredContent),
+    [diffBase, deferredContent],
+  );
   return (
     <div className={`editor-tab ${active ? 'active' : ''}`}>
       <button

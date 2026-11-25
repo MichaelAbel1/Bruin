@@ -18,6 +18,18 @@ fs.copyFileSync(
 if (process.platform !== 'win32') fs.chmodSync(path.join(stage, 'node'), 0o755);
 fs.copyFileSync(path.join(root, 'package.json'), path.join(stage, 'package.json'));
 fs.copyFileSync(path.join(root, 'package-lock.json'), path.join(stage, 'package-lock.json'));
+const nodeBinDir = path.dirname(process.execPath);
+const env = {
+  ...process.env,
+  npm_config_cache: path.join(root, '.npm-cache'),
+  npm_config_devdir: path.join(root, '.node-gyp'),
+  electron_config_cache: path.join(root, '.electron-cache'),
+};
+const pathKey =
+  Object.keys(env).find((key) => key.toLowerCase() === 'path') ??
+  (process.platform === 'win32' ? 'Path' : 'PATH');
+env[pathKey] = env[pathKey] ? `${nodeBinDir}${path.delimiter}${env[pathKey]}` : nodeBinDir;
+
 execFileSync(
   process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : 'npm',
   process.platform === 'win32'
@@ -26,12 +38,7 @@ execFileSync(
   {
     cwd: stage,
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      npm_config_cache: path.join(root, '.npm-cache'),
-      npm_config_devdir: path.join(root, '.node-gyp'),
-      electron_config_cache: path.join(root, '.electron-cache'),
-    },
+    env,
   },
 );
 console.log(`Staged desktop runtime: ${stage}`);

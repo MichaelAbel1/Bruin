@@ -24,7 +24,10 @@ async function fetchApi(endpoint: string): Promise<any> {
       redirect: 'error',
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`skills.sh API 返回 ${res.status}`);
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`skills.sh API 返回 ${res.status}`);
+    }
     if (!res.body) throw new Error('skills.sh API 响应为空');
     const reader = res.body.getReader();
     const chunks: Uint8Array[] = [];
@@ -51,7 +54,7 @@ async function fetchApi(endpoint: string): Promise<any> {
 export async function searchSkillsSh(query: string): Promise<SkillsShEntry[]> {
   if (query.length < 2) throw new Error('搜索词至少 2 个字符');
   const data = await fetchApi(`skills/search?q=${encodeURIComponent(query)}&limit=20`);
-  return Array.isArray(data.data) ? data.data : [];
+  return data && typeof data === 'object' && Array.isArray(data.data) ? data.data : [];
 }
 export async function installSkillsSh(id: string): Promise<SkillInfo> {
   const parts = id.split('/');
@@ -61,6 +64,8 @@ export async function installSkillsSh(id: string): Promise<SkillInfo> {
   )
     throw new Error('需要 owner/repo/skill 格式的 ID');
   const data = await fetchApi(`skills/${id}`);
-  if (!Array.isArray(data.files)) throw new Error('市场未提供此 Skill 的文件快照');
-  return installSnapshot(data.files, `skills.sh:${id}`, String(data.hash ?? 'unknown'));
+  if (!data || typeof data !== 'object' || !Array.isArray(data.files))
+    throw new Error('市场未提供此 Skill 的文件快照');
+  const rawHash = typeof data.hash === 'string' && data.hash.trim() ? data.hash.trim() : 'unknown';
+  return installSnapshot(data.files, `skills.sh:${id}`, rawHash.slice(0, 256));
 }

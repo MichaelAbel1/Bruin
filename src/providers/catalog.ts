@@ -2,7 +2,19 @@ import type { ModelProfile } from '../core/types.js';
 import { resolveApiKey } from './gateway.js';
 import { createHash } from 'node:crypto';
 
+const maxModelCacheEntries = 64;
 const modelCache = new Map<string, { until: number; models: string[] }>();
+
+function pruneModelCache(now: number) {
+  for (const [key, entry] of modelCache) {
+    if (entry.until <= now) modelCache.delete(key);
+  }
+  while (modelCache.size >= maxModelCacheEntries) {
+    const oldest = modelCache.keys().next().value;
+    if (oldest === undefined) break;
+    modelCache.delete(oldest);
+  }
+}
 
 const defaultBaseUrls = {
   openai: 'https://api.openai.com/v1',
@@ -15,7 +27,9 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
     profile.baseUrl ??
     (profile.provider === 'openai-compatible' ? '' : defaultBaseUrls[profile.provider]);
   if (!base) throw new Error('请先配置 Base URL');
-  const endpoint = new URL(`${base.replace(/\/+$/, '')}/models`);
+  const endpoint = new URL(base);
+  endpoint.hash = '';
+  endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, '')}/models`;
   if (!['http:', 'https:'].includes(endpoint.protocol))
     throw new Error('模型目录仅支持 HTTP 或 HTTPS');
   const key = resolveApiKey(profile);
@@ -26,8 +40,9 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
       .update(key ?? '')
       .digest('hex'),
   });
+  const now = Date.now();
   const cached = modelCache.get(cacheKey);
-  if (!refresh && cached && cached.until > Date.now()) return [...cached.models];
+  if (!refresh && cached && cached.until > now) return [...cached.models];
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (profile.provider === 'anthropic') {
     if (key) headers['x-api-key'] = key;
@@ -37,6 +52,7 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
   } else if (key) headers.Authorization = `Bearer ${key}`;
 
   const ids = new Set<string>();
+  const seenCursors = new Set<string>();
   for (let page = 0; page < 10 && ids.size < 500; page++) {
     let response: Response;
     try {
@@ -48,7 +64,10 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
     } catch {
       throw new Error('获取模型列表失败：网络错误、重定向或超时');
     }
-    if (!response.ok) throw new Error(`获取模型列表失败：HTTP ${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`获取模型列表失败：HTTP ${response.status}`);
+    }
     const body = response.body;
     if (!body) throw new Error('模型列表响应为空');
     const reader = body.getReader();
@@ -60,11 +79,15 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
         if (done) break;
         size += value.byteLength;
         if (size > 1024 * 1024) {
-          await reader.cancel();
+          await reader.cancel().catch(() => {});
           throw new Error('模型列表响应超过 1 MB');
         }
         chunks.push(value);
       }
+    } catch (error) {
+      await reader.cancel().catch(() => {});
+      if (error instanceof Error && error.message === '模型列表响应超过 1 MB') throw error;
+      throw new Error('获取模型列表失败：网络错误、重定向或超时');
     } finally {
       reader.releaseLock();
     }
@@ -94,18 +117,25 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
     if (
       profile.provider === 'google' &&
       typeof result.nextPageToken === 'string' &&
-      result.nextPageToken
+      result.nextPageToken &&
+      !seenCursors.has(result.nextPageToken)
     ) {
+      seenCursors.add(result.nextPageToken);
       endpoint.searchParams.set('pageToken', result.nextPageToken);
     } else if (
       profile.provider === 'anthropic' &&
       result.has_more === true &&
-      typeof result.last_id === 'string'
+      typeof result.last_id === 'string' &&
+      result.last_id.length > 0 &&
+      !seenCursors.has(result.last_id)
     ) {
+      seenCursors.add(result.last_id);
       endpoint.searchParams.set('after_id', result.last_id);
     } else break;
   }
   const models = [...ids].sort((a, b) => a.localeCompare(b));
-  modelCache.set(cacheKey, { until: Date.now() + 5 * 60_000, models });
+  const storedAt = Date.now();
+  pruneModelCache(storedAt);
+  modelCache.set(cacheKey, { until: storedAt + 5 * 60_000, models });
   return [...models];
 }

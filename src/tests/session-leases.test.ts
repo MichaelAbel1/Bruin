@@ -141,3 +141,22 @@ test('an observed takeover cancels existing work immediately and cleanup preserv
     f.close();
   }
 });
+
+test('retain never resurrects an expired lease after another process acquired and released it', (t) => {
+  const f = fixture();
+  const now = Date.now();
+  const clock = t.mock.method(Date, 'now', () => now);
+  const controller = new AbortController();
+  const lease = f.leases.retain(f.session.id, controller);
+  try {
+    clock.mock.mockImplementation(() => now + 31_000);
+    f.other.acquireLease(f.session.id, 'other', 30_000);
+    f.other.releaseLease(f.session.id, 'other');
+    assert.throws(() => f.leases.retain(f.session.id, new AbortController()), /租约已失效/);
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(f.store.isLeased(f.session.id), false);
+  } finally {
+    lease.release();
+    f.close();
+  }
+});

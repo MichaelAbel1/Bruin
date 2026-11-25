@@ -644,6 +644,7 @@ pre {
   bottom: 0;
   padding: 10px 14px 28px;
   overflow: hidden;
+  scrollbar-gutter: stable;
   pointer-events: none;
   white-space: pre;
   font-family: inherit;
@@ -685,6 +686,7 @@ pre {
   line-height: inherit;
   white-space: pre;
   overflow: auto;
+  scrollbar-gutter: stable;
   tab-size: 2;
   box-sizing: border-box;
   z-index: 1;

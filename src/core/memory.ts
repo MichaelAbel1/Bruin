@@ -8,7 +8,7 @@ const continuation =
 const topicReset =
   /^(?:换(?:个|一个)(?:项目|话题|任务)|新任务|switch (?:topics?|projects?)|new task)$/iu;
 const stopWords = new Set(
-  'a an the to for of in on this that please check fix update review task project workspace src test tests ts js 检查 排查 修复 更新 查看 继续 项目 任务 工作 这个 当前'.split(
+  'a an the to for of in on is it be do we my as at by or this that please check fix update review task project workspace src test tests ts js 检查 排查 修复 更新 查看 继续 项目 任务 工作 这个 当前'.split(
     ' ',
   ),
 );
@@ -69,7 +69,7 @@ function terms(text: string): string[] {
       ),
     ),
   ]
-    .filter((term) => !stopWords.has(term))
+    .filter((term) => !stopWords.has(term) && (term.length >= 2 || /\p{Script=Han}/u.test(term)))
     .slice(0, 256);
 }
 
@@ -97,8 +97,14 @@ export function memoryContext(pages: MemoryPage[], query: string, maxChars = 800
     const marker = '\n[truncated; use list_memory for the complete page]';
     let content = '';
     if (score > 0 && page.content.length <= available) content = '\n' + page.content;
-    else if (score > 0 && available > marker.length)
-      content = '\n' + page.content.slice(0, available - marker.length) + marker;
+    else if (score > 0 && available > marker.length) {
+      let clipped = page.content.slice(0, available - marker.length);
+      if (clipped.length > 0) {
+        const lastCode = clipped.charCodeAt(clipped.length - 1);
+        if (lastCode >= 0xd800 && lastCode <= 0xdbff) clipped = clipped.slice(0, -1);
+      }
+      content = '\n' + clipped + marker;
+    }
     const entry = separator + heading + content;
     selected.push(entry);
     remaining -= entry.length;

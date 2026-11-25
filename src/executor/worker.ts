@@ -15,7 +15,25 @@ import {
   snapshotMaxBytes,
 } from '../core/snapshots.js';
 import { searchRepository } from '../core/repository-index.js';
-import { workspaceMounts } from './bwrap.js';
+import { isAllowedScratchPath, workspaceMounts } from './bwrap.js';
+
+function safeScratchDir(root: string): string | undefined {
+  try {
+    const resolved = fs.realpathSync(os.tmpdir());
+    const normalized = path.posix.resolve(resolved.replace(/\\/g, '/'));
+    const normalizedRoot = path.posix.resolve(root.replace(/\\/g, '/'));
+    if (
+      normalized === normalizedRoot ||
+      normalizedRoot.startsWith(`${normalized}/`) ||
+      !isAllowedScratchPath(normalized, false)
+    ) {
+      return undefined;
+    }
+    return resolved;
+  } catch {
+    return undefined;
+  }
+}
 
 let macSandboxAvailable: boolean | undefined;
 function isMacSandboxAvailable(): boolean {
@@ -36,7 +54,7 @@ function isMacSandboxAvailable(): boolean {
 let bwrapAvailable: boolean | undefined;
 function findBwrap(): string | undefined {
   if (process.platform !== 'linux' || bwrapAvailable === false) return undefined;
-  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
+  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter).filter(Boolean)) {
     const candidate = path.join(dir, 'bwrap');
     try {
       if (fs.existsSync(candidate)) {
@@ -53,8 +71,7 @@ function findBwrap(): string | undefined {
             );
             bwrapAvailable = true;
           } catch {
-            bwrapAvailable = false;
-            return undefined;
+            continue;
           }
         }
         return candidate;
@@ -258,6 +275,7 @@ function replaceFile(
   mode: number,
   expected: fs.Stats | null,
   expectedFileVersion?: string,
+  allowOverQuota = false,
 ): void {
   const parent = path.dirname(file);
   const parentStat = fs.lstatSync(parent);
@@ -278,7 +296,7 @@ function replaceFile(
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    recordSnapshot(root, file, content, expectedFileVersion);
+    recordSnapshot(root, file, content, expectedFileVersion, { allowOverQuota });
     checkedPath(root, file, true);
     const currentParent = fs.lstatSync(parent);
     if (
@@ -375,6 +393,7 @@ async function command(
   req: ToolRequest,
   dockerName?: string,
   windowsShell = false,
+  scratchDir?: string,
 ): Promise<ToolResult> {
   return new Promise((resolve) => {
     const child = spawn(program, args, {
@@ -382,7 +401,9 @@ async function command(
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: req.workspace,
-        TMPDIR: req.workspaceOnlyWrites ? req.workspace : (process.env.TMPDIR ?? '/tmp'),
+        TMPDIR: req.workspaceOnlyWrites
+          ? req.workspace
+          : (scratchDir ?? safeScratchDir(req.workspace) ?? '/tmp'),
         LANG: process.env.LANG ?? 'C',
         ...(process.platform === 'win32'
           ? {
@@ -461,34 +482,37 @@ async function command(
     child.on('close', async (code, signal) => {
       if (!done) {
         done = true;
-        active.delete(req.requestId);
         clearTimeout(timer);
-        // A second removal closes the race between Docker creating the container and cancellation.
-        const cleaned =
-          dockerName && (interruption || code !== 0)
-            ? await removeDockerContainer(dockerName)
-            : true;
-        const interruptionText = { timeout: '\n[命令执行超时]', cancelled: '\n[命令已取消]' };
-        const termination = interruption
-          ? interruptionText[interruption]
-          : signal
-            ? `\n[命令被 ${signal} 终止]`
-            : '';
-        // ripgrep uses exit code 1 for a search that finished with no matches.
-        const validExit = code === 0 || (req.name === 'search' && code === 1);
-        resolve({
-          output:
-            new TextDecoder('utf-8', { ignoreBOM: true }).decode(Buffer.concat(chunks), {
-              stream: truncated,
-            }) +
-            (truncated ? '\n[输出已截断]' : '') +
-            termination +
-            (!cleaned ? '\n[Docker 容器清理未确认]' : ''),
-          truncated,
-          exitCode: code ?? -1,
-          isError: !validExit || Boolean(interruption) || !cleaned,
-        });
-        markSettled();
+        try {
+          // A second removal closes the race between Docker creating the container and cancellation.
+          const cleaned =
+            dockerName && (interruption || code !== 0)
+              ? await removeDockerContainer(dockerName)
+              : true;
+          const interruptionText = { timeout: '\n[命令执行超时]', cancelled: '\n[命令已取消]' };
+          const termination = interruption
+            ? interruptionText[interruption]
+            : signal
+              ? `\n[命令被 ${signal} 终止]`
+              : '';
+          // ripgrep uses exit code 1 for a search that finished with no matches.
+          const validExit = code === 0 || (req.name === 'search' && code === 1);
+          resolve({
+            output:
+              new TextDecoder('utf-8', { ignoreBOM: true }).decode(Buffer.concat(chunks), {
+                stream: truncated,
+              }) +
+              (truncated ? '\n[输出已截断]' : '') +
+              termination +
+              (!cleaned ? '\n[Docker 容器清理未确认]' : ''),
+            truncated,
+            exitCode: code ?? -1,
+            isError: !validExit || Boolean(interruption) || !cleaned,
+          });
+        } finally {
+          active.delete(req.requestId);
+          markSettled();
+        }
       }
     });
   });
@@ -510,14 +534,36 @@ function hasBinary(binary: string): boolean {
   }
   return false;
 }
+function globMatchLinear(text: string, pattern: string): boolean {
+  let ti = 0;
+  let pi = 0;
+  let starIdx = -1;
+  let matchIdx = 0;
+  while (ti < text.length) {
+    if (pi < pattern.length && (pattern[pi] === '?' || pattern[pi] === text[ti])) {
+      ti++;
+      pi++;
+    } else if (pi < pattern.length && pattern[pi] === '*') {
+      starIdx = pi;
+      matchIdx = ti;
+      pi++;
+    } else if (starIdx !== -1) {
+      pi = starIdx + 1;
+      matchIdx++;
+      ti = matchIdx;
+    } else {
+      return false;
+    }
+  }
+  while (pi < pattern.length && pattern[pi] === '*') pi++;
+  return pi === pattern.length;
+}
 function matchGlob(filename: string, glob: string): boolean {
-  const escaped = glob
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.');
+  const normalizedPath = filename.split(path.sep).join('/').toLowerCase();
+  const normalizedGlob = glob.replace(/\\/g, '/').replace(/\*+/g, '*').toLowerCase();
   return (
-    new RegExp(`^${escaped}$`, 'i').test(filename) ||
-    new RegExp(`^${escaped}$`, 'i').test(path.basename(filename))
+    globMatchLinear(normalizedPath, normalizedGlob) ||
+    globMatchLinear(path.posix.basename(normalizedPath), normalizedGlob)
   );
 }
 async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
@@ -571,7 +617,6 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
         fullPath,
         fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
       );
-      let streaming = false;
       try {
         const stat = fs.fstatSync(fd);
         if (!stat.isFile() || stat.size > 5_000_000) return true;
@@ -583,7 +628,6 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
           end: 4_999_999,
           encoding: 'utf8',
         });
-        streaming = true;
         const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
         stopReading = () => {
           rl.close();
@@ -613,7 +657,9 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
           stopReading = undefined;
         }
       } finally {
-        if (!streaming) fs.closeSync(fd);
+        try {
+          fs.closeSync(fd);
+        } catch {}
       }
     } catch {
       checkStopped();
@@ -744,7 +790,15 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
             req.workspace,
             String(req.input.id ?? ''),
             (file, bytes, mode, expected) =>
-              replaceFile(fs.realpathSync(req.workspace), file, bytes, mode, expected),
+              replaceFile(
+                fs.realpathSync(req.workspace),
+                file,
+                bytes,
+                mode,
+                expected,
+                undefined,
+                true,
+              ),
           ),
         ),
         isError: false,
@@ -900,22 +954,36 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         );
       }
       if (process.platform === 'darwin' && isMacSandboxAvailable()) {
-        const root = JSON.stringify(fs.realpathSync(req.workspace));
+        const rawRoot = fs.realpathSync(req.workspace);
+        const root = JSON.stringify(rawRoot);
+        const validatedScratch = req.workspaceOnlyWrites ? undefined : safeScratchDir(rawRoot);
         const scratch = req.workspaceOnlyWrites
           ? ''
-          : ` (allow file-write* (subpath "/private/tmp")) (allow file-write* (subpath ${JSON.stringify(fs.realpathSync(os.tmpdir()))}))`;
+          : ` (allow file-write* (subpath "/private/tmp"))${
+              validatedScratch && validatedScratch !== '/private/tmp'
+                ? ` (allow file-write* (subpath ${JSON.stringify(validatedScratch)}))`
+                : ''
+            }`;
         const profile = `(version 1) (allow default) (deny network*) (deny file-write*) (allow file-write* (subpath ${root}))${scratch}`;
-        return command('/usr/bin/sandbox-exec', ['-p', profile, '/bin/sh', '-lc', shell], req);
+        return command(
+          '/usr/bin/sandbox-exec',
+          ['-p', profile, '/bin/sh', '-lc', shell],
+          req,
+          undefined,
+          false,
+          validatedScratch,
+        );
       }
       const bwrap = findBwrap();
       if (bwrap) {
         const root = fs.realpathSync(req.workspace);
+        const validatedScratch = req.workspaceOnlyWrites ? undefined : safeScratchDir(root);
         return command(
           bwrap,
           [
             ...workspaceMounts(root, {
               privateTmp: !req.workspaceOnlyWrites,
-              sharedScratch: req.workspaceOnlyWrites ? undefined : fs.realpathSync(os.tmpdir()),
+              sharedScratch: validatedScratch,
             }),
             '--unshare-net',
             '--die-with-parent',
@@ -926,6 +994,9 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
             shell,
           ],
           req,
+          undefined,
+          false,
+          validatedScratch,
         );
       }
       if (
@@ -962,7 +1033,9 @@ process.on('message', async (raw: ToolRequest | { type: 'cancel'; requestId: str
     isError: true,
   }));
   const reply: ToolResponse = { requestId: request.requestId, result };
-  if (process.connected) process.send?.(reply);
+  try {
+    if (process.connected) process.send?.(reply, undefined, undefined, () => {});
+  } catch {}
 });
 
 const terminate = () => {
