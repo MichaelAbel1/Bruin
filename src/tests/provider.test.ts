@@ -428,3 +428,54 @@ test('resolveApiKey validates local URLs strictly against host spoofing and excl
   };
   assert.throws(() => resolveApiKey(spoofedProfile), /缺少 API Key 环境变量/);
 });
+
+test('think tag filter handles stray angle brackets before <think> and </think>', async (t) => {
+  const runChunks = async (deltas: string[]) => {
+    const mock = t.mock.method(globalThis, 'fetch', async () => {
+      const body =
+        deltas
+          .map(
+            (content, index) =>
+              `data: ${JSON.stringify({
+                id: String(index + 1),
+                object: 'chat.completion.chunk',
+                created: 1,
+                model: 'mock',
+                choices: [{ index: 0, delta: { content }, finish_reason: null }],
+              })}\n\n`,
+          )
+          .join('') +
+        `data: ${JSON.stringify({
+          id: 'done',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'mock',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        })}\n\ndata: [DONE]\n\n`;
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    });
+    try {
+      let streamed = '';
+      const reply = await new AiSdkGateway().complete(
+        {
+          alias: 'think-edge',
+          provider: 'openai-compatible',
+          model: 'mock',
+          baseUrl: 'http://127.0.0.1:1/v1',
+        },
+        [{ role: 'user', content: 'hi' }],
+        new AbortController().signal,
+        (delta) => {
+          streamed += delta;
+        },
+      );
+      assert.equal(reply.text, streamed);
+      return reply.text;
+    } finally {
+      mock.mock.restore();
+    }
+  };
+
+  assert.equal(await runChunks(['<think>x < y </t</think>', 'Visible answer']), 'Visible answer');
+  assert.equal(await runChunks(['<<think>secret</think>Shown']), '<Shown');
+});

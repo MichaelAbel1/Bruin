@@ -13,6 +13,7 @@ const roots = [
   'keys.enc.json',
   'oauth.enc.json',
   'appearance.json',
+  'builtin-skills.json',
   'AGENTS.md',
   'attachments',
   'snapshots',
@@ -63,14 +64,18 @@ async function hashFile(file: string): Promise<string> {
     file,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
   );
-  const stat = fs.fstatSync(fd);
-  if (!stat.isFile()) {
-    fs.closeSync(fd);
-    throw new Error('备份仅支持普通文件');
+  let streamOwned = false;
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('备份仅支持普通文件');
+    const hash = createHash('sha256');
+    const stream = fs.createReadStream(file, { fd });
+    streamOwned = true;
+    for await (const chunk of stream) hash.update(chunk);
+    return hash.digest('hex');
+  } finally {
+    if (!streamOwned) fs.closeSync(fd);
   }
-  const hash = createHash('sha256');
-  for await (const chunk of fs.createReadStream(file, { fd })) hash.update(chunk);
-  return hash.digest('hex');
 }
 async function copyFile(source: string, target: string, mode: number): Promise<void> {
   checked(source);
@@ -78,16 +83,18 @@ async function copyFile(source: string, target: string, mode: number): Promise<v
     source,
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
   );
-  const before = fs.fstatSync(fd);
-  if (!before.isFile()) {
-    fs.closeSync(fd);
-    throw new Error('备份仅支持普通文件');
+  let streamOwned = false;
+  let before: fs.Stats;
+  try {
+    before = fs.fstatSync(fd);
+    if (!before.isFile()) throw new Error('备份仅支持普通文件');
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    const reader = fs.createReadStream(source, { fd });
+    streamOwned = true;
+    await pipeline(reader, fs.createWriteStream(target, { flags: 'wx', mode: 0o600 }));
+  } finally {
+    if (!streamOwned) fs.closeSync(fd);
   }
-  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  await pipeline(
-    fs.createReadStream(source, { fd }),
-    fs.createWriteStream(target, { flags: 'wx', mode: 0o600 }),
-  );
   const after = fs.lstatSync(source);
   if (
     !after.isFile() ||
@@ -235,10 +242,11 @@ async function validateBackup(
   const raw = fs.readFileSync(manifestFile, 'utf8');
   const manifest = manifestSchema.parse(JSON.parse(raw));
   const names = manifest.files.map((file) => file.path);
-  if (new Set(names).size !== names.length || !names.includes('sessions.sqlite'))
+  const nameSet = new Set(names);
+  if (nameSet.size !== names.length || !nameSet.has('sessions.sqlite'))
     throw new Error('备份文件清单重复或缺少数据库');
   const actual = filesIn(path.join(root, 'data'));
-  if (actual.length !== names.length || actual.some((name) => !names.includes(name)))
+  if (actual.length !== names.length || actual.some((name) => !nameSet.has(name)))
     throw new Error('备份包含清单之外的文件');
   for (const file of manifest.files) {
     const source = path.join(root, 'data', file.path);

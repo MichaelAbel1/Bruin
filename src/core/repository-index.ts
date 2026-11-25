@@ -101,6 +101,7 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
     walk('');
   }
   const entries: Entry[] = [];
+  const buffer = Buffer.allocUnsafe(1_000_001);
   let bytes = 0;
   for (const relative of [...new Set(paths)]) {
     if (Date.now() > deadline || bytes > 20_000_000) {
@@ -131,7 +132,6 @@ export function searchRepository(workspace: string, query: string, limit = 20) {
           entries.push({ path: relative, hash: '', size: stat.size, symbols: [] });
           continue;
         }
-        const buffer = Buffer.alloc(1_000_001);
         let count = 0;
         while (count < buffer.length) {
           const read = fs.readSync(fd, buffer, count, buffer.length - count, count);

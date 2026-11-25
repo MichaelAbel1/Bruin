@@ -116,19 +116,19 @@ export async function proposeMemory(profile: ModelProfile, source: string, signa
 }
 
 export class AiSdkGateway implements ModelGateway {
+  private cachedOverheadTokens?: number;
   constructor(
     private mode: ToolMode = 'basic',
     private allowQuestions = false,
   ) {}
   inputOverheadTokens(): number {
     // Include tool definitions and a protocol margin, even before usage is available.
-    return (
+    return (this.cachedOverheadTokens ??=
       estimateTokens(
         JSON.stringify(toolsForMode(this.mode, this.allowQuestions), (_key, value) =>
           value instanceof z.ZodType ? z.toJSONSchema(value) : value,
         ),
-      ) + 256
-    );
+      ) + 256);
   }
   async summarize(
     profile: ModelProfile,
@@ -188,6 +188,9 @@ export class AiSdkGateway implements ModelGateway {
             hidden = !hidden;
             pending = '';
           }
+        } else if (char === '<') {
+          if (!hidden) visible += pending.slice(0, -1);
+          pending = '<';
         } else {
           if (!hidden) visible += pending;
           pending = '';

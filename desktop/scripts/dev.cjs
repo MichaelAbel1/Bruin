@@ -17,6 +17,13 @@ function stop() {
 }
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
+vite.on('error', (error) => {
+  if (!stopped) {
+    console.error(error);
+    stop();
+    process.exitCode = 1;
+  }
+});
 vite.on('exit', (code) => {
   if (!stopped) {
     stop();
@@ -39,6 +46,7 @@ async function waitForVite() {
     if (ready) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
+  if (stopped) return;
   throw new Error('Vite 开发服务器未启动');
 }
 void waitForVite()
@@ -52,6 +60,11 @@ void waitForVite()
         BRUIN_RENDERER_URL: 'http://127.0.0.1:5173/',
         BRUIN_NODE_BINARY: process.execPath,
       },
+    });
+    electron.on('error', (error) => {
+      console.error(error);
+      stop();
+      process.exitCode = 1;
     });
     electron.on('exit', (code) => {
       stop();

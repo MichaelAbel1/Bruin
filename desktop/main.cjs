@@ -22,8 +22,23 @@ let iconBackground = 'white';
 let uiTheme = 'light';
 let hostReady = Promise.resolve();
 let longRunPowerBlocker;
+const longRunSessions = new Set();
+let startupWarnings = [];
+let quitting = false;
+
+function sendToWindow(message) {
+  if (window && !window.isDestroyed()) window.webContents.send('bruin:event', message);
+}
+
+function flushStartupWarnings() {
+  if (!startupWarnings.length || !window || window.isDestroyed()) return;
+  const text = startupWarnings.join('；');
+  startupWarnings = [];
+  sendToWindow({ type: 'notice', message: text });
+}
 
 function stopLongRunPowerBlocker() {
+  longRunSessions.clear();
   if (longRunPowerBlocker !== undefined && powerSaveBlocker.isStarted(longRunPowerBlocker))
     powerSaveBlocker.stop(longRunPowerBlocker);
   longRunPowerBlocker = undefined;
@@ -55,8 +70,12 @@ function readEncryptedKeys(file = secretsPath()) {
 function writeEncryptedKeys(keys, file = secretsPath()) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(keys), { mode: 0o600 });
-  fs.renameSync(temp, file);
+  try {
+    fs.writeFileSync(temp, JSON.stringify(keys), { mode: 0o600 });
+    fs.renameSync(temp, file);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
 }
 function withSecretsLock(fn, file = secretsPath()) {
   const lockFile = `${file}.lock`;
@@ -74,7 +93,18 @@ function withSecretsLock(fn, file = secretsPath()) {
         0o600,
       );
       myLockToken = `${process.pid}\n${Date.now()}`;
-      fs.writeSync(fd, myLockToken);
+      try {
+        fs.writeSync(fd, myLockToken);
+      } catch (writeErr) {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+        fd = null;
+        try {
+          fs.unlinkSync(lockFile);
+        } catch {}
+        throw writeErr;
+      }
       break;
     } catch (err) {
       if (err.code === 'EEXIST') {
@@ -154,10 +184,27 @@ async function restoreStoredOAuth() {
   const saved = readEncryptedKeys(oauthPath());
   if (!Object.keys(saved).length) return;
   if (!secureStorageAvailable()) throw new Error('系统安全存储不可用，无法恢复 OAuth 登录');
+  let failed = 0;
   for (const [name, ciphertext] of Object.entries(saved)) {
-    const value = JSON.parse(safeStorage.decryptString(Buffer.from(ciphertext, 'base64')));
-    await requestHost('restoreMcpCredentials', { name, ...value });
+    if (typeof ciphertext !== 'string') {
+      failed++;
+      continue;
+    }
+    try {
+      const value = JSON.parse(safeStorage.decryptString(Buffer.from(ciphertext, 'base64')));
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        failed++;
+        continue;
+      }
+      await requestHost('restoreMcpCredentials', { name, ...value });
+    } catch {
+      failed++;
+    }
   }
+  if (failed > 0)
+    startupWarnings.push(
+      `有 ${failed} 项已保存的 OAuth 凭证无法恢复，相关 MCP 服务器可能需要重新登录`,
+    );
 }
 async function restoreStoredKeys() {
   const legacy = await requestHost('takeLegacyKeys');
@@ -177,11 +224,21 @@ async function restoreStoredKeys() {
   if (!Object.keys(keys).length) return;
   if (!secureStorageAvailable()) throw new Error('系统安全存储不可用，无法恢复 API Key');
   const restored = {};
+  let failed = 0;
   for (const [alias, ciphertext] of Object.entries(keys)) {
-    if (typeof ciphertext !== 'string') continue;
-    restored[alias] = safeStorage.decryptString(Buffer.from(ciphertext, 'base64'));
+    if (typeof ciphertext !== 'string') {
+      failed++;
+      continue;
+    }
+    try {
+      restored[alias] = safeStorage.decryptString(Buffer.from(ciphertext, 'base64'));
+    } catch {
+      failed++;
+    }
   }
-  await requestHost('restoreApiKeys', { keys: restored });
+  if (Object.keys(restored).length) await requestHost('restoreApiKeys', { keys: restored });
+  if (failed > 0)
+    startupWarnings.push(`有 ${failed} 项已保存的 API Key 无法解密恢复，请在模型设置中重新填写`);
 }
 
 function appearancePath() {
@@ -223,16 +280,21 @@ function saveAppearance(next) {
   const file = appearancePath();
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  fs.writeFileSync(
-    temp,
-    JSON.stringify({ iconBackground: nextIconBackground, uiTheme: nextUiTheme }),
-    { mode: 0o600 },
-  );
-  fs.renameSync(temp, file);
+  try {
+    fs.writeFileSync(
+      temp,
+      JSON.stringify({ iconBackground: nextIconBackground, uiTheme: nextUiTheme }),
+      { mode: 0o600 },
+    );
+    fs.renameSync(temp, file);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
   iconBackground = nextIconBackground;
   uiTheme = nextUiTheme;
   applyIcon();
-  window?.setBackgroundColor(uiTheme === 'light' ? '#FFFFFF' : '#111315');
+  if (window && !window.isDestroyed())
+    window.setBackgroundColor(uiTheme === 'light' ? '#FFFFFF' : '#111315');
   return { iconBackground, uiTheme };
 }
 
@@ -280,7 +342,7 @@ function startHost() {
           oauthSaveErrors.delete(message.name);
         } catch {
           oauthSaveErrors.set(message.name, true);
-          window?.webContents.send('bruin:event', {
+          sendToWindow({
             type: 'notice',
             message: 'OAuth 凭证保存失败，重启后可能需要重新登录。',
           });
@@ -288,38 +350,63 @@ function startHost() {
         return;
       }
       if (message.type === 'openOAuthBrowser') {
-        const url = new URL(message.url);
-        if (
-          url.protocol === 'https:' ||
-          (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
-        )
-          void shell.openExternal(url.href).catch(() => {});
+        try {
+          const url = new URL(message.url);
+          if (
+            url.protocol === 'https:' ||
+            (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
+          )
+            void shell.openExternal(url.href).catch(() => {});
+        } catch {
+          sendToWindow({ type: 'notice', message: '无效的 OAuth 授权地址' });
+        }
         return;
       }
-      if (message.type === 'runStarted' && message.longRun && longRunPowerBlocker === undefined)
-        longRunPowerBlocker = powerSaveBlocker.start('prevent-app-suspension');
-      if (message.type === 'runFinished' || message.type === 'runFailed') stopLongRunPowerBlocker();
-      if (window && !window.isDestroyed()) window.webContents.send('bruin:event', message);
+      if (message.type === 'runStarted' && message.longRun && message.sessionId) {
+        longRunSessions.add(message.sessionId);
+        if (longRunPowerBlocker === undefined)
+          longRunPowerBlocker = powerSaveBlocker.start('prevent-app-suspension');
+      }
+      if (message.type === 'runFinished' || message.type === 'runFailed') {
+        if (message.sessionId) longRunSessions.delete(message.sessionId);
+        if (!longRunSessions.size) stopLongRunPowerBlocker();
+      }
+      sendToWindow(message);
     }
   });
   host.stderr.on('data', (data) => {
     if (development) process.stderr.write(data);
   });
+  host.stdin.on('error', () => {
+    /* Handled by host exit/error events. */
+  });
+  host.on('error', (error) => {
+    stopLongRunPowerBlocker();
+    for (const entry of pending.values())
+      entry.reject(new Error(`Agent 后台进程启动失败: ${error.message}`));
+    pending.clear();
+    sendToWindow({ type: 'hostExited', code: null, signal: null });
+  });
   host.on('exit', (code, signal) => {
     stopLongRunPowerBlocker();
     for (const entry of pending.values()) entry.reject(new Error('Agent 后台进程已退出'));
     pending.clear();
-    if (window && !window.isDestroyed())
-      window.webContents.send('bruin:event', { type: 'hostExited', code, signal });
+    sendToWindow({ type: 'hostExited', code, signal });
   });
 }
 
 function requestHost(method, params) {
   if (!host || !host.stdin.writable) return Promise.reject(new Error('Agent 后台进程不可用'));
   const id = randomUUID();
+  let line;
+  try {
+    line = JSON.stringify({ id, method, params }) + '\n';
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    host.stdin.write(JSON.stringify({ id, method, params }) + '\n', (error) => {
+    host.stdin.write(line, (error) => {
       if (error) {
         pending.delete(id);
         reject(error);
@@ -337,6 +424,7 @@ async function exportSubagentPatch(params) {
   const shortId = String(params?.childId)
     .slice(0, 8)
     .replace(/[^a-f0-9]/gi, '');
+  if (!window || window.isDestroyed()) return null;
   const selected = await dialog.showSaveDialog(window, {
     title: '导出子任务补丁',
     defaultPath: `bruin-${shortId}-${baseCommit.slice(0, 12)}.patch`,
@@ -377,7 +465,10 @@ function createWindow() {
     },
   });
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://')) void shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:') void shell.openExternal(parsed.href).catch(() => {});
+    } catch {}
     return { action: 'deny' };
   });
   window.webContents.on('will-navigate', (event) => event.preventDefault());
@@ -402,16 +493,31 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     loadAppearance();
     startHost();
-    hostReady = restoreStoredKeys().then(restoreStoredOAuth);
+    hostReady = restoreStoredKeys()
+      .catch((error) => {
+        startupWarnings.push(error instanceof Error ? error.message : String(error));
+      })
+      .then(() =>
+        restoreStoredOAuth().catch((error) => {
+          startupWarnings.push(error instanceof Error ? error.message : String(error));
+        }),
+      );
     createWindow();
     applyIcon();
     ipcMain.handle('bruin:request', async (event, method, params) => {
       if (
         !window ||
+        window.isDestroyed() ||
         event.sender !== window.webContents ||
         event.senderFrame !== window.webContents.mainFrame
       )
         throw new Error('无效的界面请求');
+      if (typeof method !== 'string' || !method) throw new Error('无效的请求方法');
+      if (
+        params !== undefined &&
+        (params === null || typeof params !== 'object' || Array.isArray(params))
+      )
+        throw new Error('无效的请求参数');
       if (method === 'chooseWorkspace')
         return dialog
           .showOpenDialog(window, { properties: ['openDirectory', 'createDirectory'] })
@@ -459,19 +565,21 @@ if (!gotSingleInstanceLock) {
       )
         throw new Error('不支持此界面操作');
       await hostReady;
+      if (method === 'bootstrap') flushStartupWarnings();
       if (method === 'loginMcpServer' && !secureStorageAvailable())
         throw new Error('系统安全存储不可用，无法持久保存 OAuth 凭证');
-      if (method === 'saveProfile' && params?.apiKey && !secureStorageAvailable())
+      const apiKey =
+        typeof params?.apiKey === 'string' && params.apiKey ? params.apiKey : undefined;
+      if (method === 'saveProfile' && apiKey && !secureStorageAvailable())
         throw new Error('系统安全存储不可用，无法持久保存 API Key');
+      const alias = String(params?.alias ?? '').trim();
       const encryptedKey =
-        method === 'saveProfile' && params?.apiKey
-          ? safeStorage.encryptString(params.apiKey).toString('base64')
+        method === 'saveProfile' && apiKey
+          ? safeStorage.encryptString(apiKey).toString('base64')
           : undefined;
       const previousProfile =
         method === 'saveProfile'
-          ? (await requestHost('bootstrap')).config.profiles.find(
-              (item) => item.alias === params?.alias,
-            )
+          ? (await requestHost('bootstrap')).config.profiles.find((item) => item.alias === alias)
           : null;
       const result = await requestHost(method, params || {});
       if (
@@ -484,26 +592,40 @@ if (!gotSingleInstanceLock) {
       if (method === 'saveProfile') {
         const removeKey = Boolean(
           params?.clearApiKey ||
-          (previousProfile && previousProfile.provider !== params?.provider && !params?.apiKey),
+          (previousProfile && previousProfile.provider !== params?.provider && !apiKey),
         );
-        if (params?.apiKey || removeKey)
-          updateStoredKey(String(params.alias), encryptedKey, removeKey);
+        if (apiKey || removeKey) updateStoredKey(alias, encryptedKey, removeKey);
       }
-      if (method === 'removeProfile') updateStoredKey(String(params?.alias), undefined, true);
+      if (method === 'removeProfile' && alias) updateStoredKey(alias, undefined, true);
       return result;
     });
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   });
-  app.on('will-quit', () => {
+  app.on('will-quit', (event) => {
     stopLongRunPowerBlocker();
-    if (host && !host.killed) {
-      host.stdin.end();
-      setTimeout(() => {
-        if (host && !host.killed) host.kill('SIGKILL');
-      }, 15000).unref();
-    }
+    const alive = host && host.exitCode === null && host.signalCode === null;
+    if (!alive || quitting) return;
+    quitting = true;
+    event.preventDefault();
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(termTimer);
+      clearTimeout(killTimer);
+      app.quit();
+    };
+    host.once('exit', done);
+    host.stdin.end();
+    const termTimer = setTimeout(() => {
+      if (host && host.exitCode === null && host.signalCode === null) host.kill('SIGTERM');
+    }, 5000);
+    const killTimer = setTimeout(() => {
+      if (host && host.exitCode === null && host.signalCode === null) host.kill('SIGKILL');
+      done();
+    }, 15000);
   });
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();

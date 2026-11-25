@@ -4,6 +4,7 @@ import { toolDefinition, toolDefinitions, toolsForMode } from '../core/tools.js'
 import { toolSchemas } from '../providers/gateway.js';
 import { decisionFor } from '../core/permissions.js';
 import { planBlocks } from '../runtime/plan.js';
+import { workspaceMounts } from '../executor/bwrap.js';
 import type { ToolCall } from '../core/types.js';
 
 test('registry preserves existing tool exposure and provider compatibility export', () => {
@@ -54,4 +55,17 @@ test('unknown and prototype tool names fail closed at lookup, planning and permi
   }
   assert.equal(planBlocks({ name: 'read_file', id: 'read', input: {} }, state), false);
   assert.equal(planBlocks({ name: 'write_file', id: 'write', input: {} }, state), true);
+});
+
+test('bwrap mounts shared scratch under /tmp after private /tmp and omits redundant /tmp bind', () => {
+  const subScratch = workspaceMounts('/work/repo', {
+    privateTmp: true,
+    sharedScratch: '/tmp/ci-scratch',
+  });
+  const tmpfsIndex = subScratch.indexOf('--tmpfs');
+  const scratchIndex = subScratch.indexOf('/tmp/ci-scratch');
+  assert.ok(tmpfsIndex >= 0 && scratchIndex > tmpfsIndex);
+
+  const rootTmp = workspaceMounts('/work/repo', { privateTmp: true, sharedScratch: '/tmp' });
+  assert.equal(rootTmp.filter((arg, i) => arg === '--bind' && rootTmp[i + 1] === '/tmp').length, 0);
 });

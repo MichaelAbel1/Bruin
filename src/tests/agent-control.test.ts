@@ -1089,3 +1089,114 @@ test('compaction keeps a reminder to restore loaded skill snapshots', async () =
     f.close();
   }
 });
+
+test('successful write_file and edit_file advance tracked fileVersion while still blocking external edits', async () => {
+  const f = fixture();
+  const executor = new ProcessExecutor();
+  const target = path.join(f.dir, 'tracked.txt');
+  let step = 0;
+  const result = (id: string) =>
+    f.store
+      .events(f.session.id)
+      .find((event) => event.type === 'tool_finished' && event.payload.callId === id)?.payload;
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        switch (++step) {
+          case 1:
+            return {
+              text: '',
+              calls: [
+                { id: 'create', name: 'write_file', input: { path: 'tracked.txt', content: 'v1' } },
+                {
+                  id: 'edit',
+                  name: 'edit_file',
+                  input: { path: 'tracked.txt', oldText: 'v1', newText: 'v2' },
+                },
+                {
+                  id: 'rewrite',
+                  name: 'write_file',
+                  input: { path: 'tracked.txt', content: 'v3' },
+                },
+              ],
+            };
+          case 2:
+            assert.equal(result('create')?.isError, false);
+            assert.equal(result('edit')?.isError, false);
+            assert.equal(result('rewrite')?.isError, false);
+            assert.equal(fs.readFileSync(target, 'utf8'), 'v3');
+            fs.writeFileSync(target, 'user edit');
+            return {
+              text: '',
+              calls: [
+                {
+                  id: 'conflict',
+                  name: 'write_file',
+                  input: { path: 'tracked.txt', content: 'overwrite' },
+                },
+              ],
+            };
+          default:
+            assert.equal(result('conflict')?.isError, true);
+            assert.match(String(result('conflict')?.output), /已更改/);
+            assert.equal(fs.readFileSync(target, 'utf8'), 'user edit');
+            return { text: 'Preserved external edit', calls: [] };
+        }
+      },
+    },
+    executor,
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'write and refine tracked.txt');
+  } finally {
+    await executor.close();
+    f.close();
+  }
+});
+
+test('serial tool batch failure marks unstarted sibling calls as tool_denied', async () => {
+  const f = fixture();
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        return {
+          text: '',
+          calls: [
+            { id: 'first', name: 'write_file', input: { path: 'a.txt', content: 'a' } },
+            { id: 'second', name: 'write_file', input: { path: 'b.txt', content: 'b' } },
+          ],
+        };
+      },
+    },
+    {
+      async execute() {
+        throw new Error('worker crashed');
+      },
+      async close() {},
+    },
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+  );
+  try {
+    await assert.rejects(runner.run(f.session, 'write two files'), /worker crashed/);
+    const events = f.store.events(f.session.id);
+    assert.ok(events.some((e) => e.type === 'tool_unknown' && e.payload.callId === 'first'));
+    assert.ok(events.some((e) => e.type === 'tool_denied' && e.payload.callId === 'second'));
+  } finally {
+    f.close();
+  }
+});

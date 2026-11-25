@@ -467,7 +467,7 @@ export class RuntimeServices {
       case 'mcp_list_tools': {
         const server = this.configuredMcpServers().find((item) => item.name === input.server);
         if (!server) return { output: 'MCP 服务器未配置', isError: true };
-        const tools = await this.mcp.listTools(server, session.workspace);
+        const tools = await this.mcp.listTools(server, session.workspace, signal);
         this.store.append(session.id, 'mcp_capabilities', {
           server: server.name,
           transport: server.transport,
@@ -486,6 +486,7 @@ export class RuntimeServices {
           String(input.tool ?? ''),
           (input.arguments ?? {}) as Record<string, unknown>,
           session.workspace,
+          signal,
         );
       }
       case 'update_plan': {
@@ -518,6 +519,7 @@ export class RuntimeServices {
           cwd: session.workspace,
           timeout: 10_000,
           maxBuffer: 100_000,
+          signal,
         });
         return { output: stdout, isError: false };
       }
@@ -578,6 +580,7 @@ export class RuntimeServices {
           cwd: session.workspace,
           timeout: 10_000,
           maxBuffer: 100_000,
+          signal,
         });
         const destinationStat = fs.statSync(destination);
         const belongsToRepository = stdout.split(/\r?\n/).some((line) => {
@@ -621,6 +624,7 @@ export class RuntimeServices {
           cwd: session.workspace,
           timeout: 30_000,
           maxBuffer: 100_000,
+          signal,
         });
         return { output: `已移除 ${destination}`, isError: false };
       }
@@ -648,7 +652,7 @@ export class RuntimeServices {
           let workspace: string;
           try {
             workspace = input.worktree
-              ? fs.realpathSync(String(input.worktree))
+              ? fs.realpathSync.native(String(input.worktree))
               : session.workspace;
           } catch {
             return { output: '工作树路径不存在', isError: true };
@@ -658,9 +662,48 @@ export class RuntimeServices {
             if (!fs.existsSync(parent)) {
               return { output: '子 Agent 只能使用 Bruin 创建的工作树', isError: true };
             }
-            const parentReal = fs.realpathSync(parent);
+            const parentReal = fs.realpathSync.native(parent);
             if (!workspace.startsWith(parentReal + path.sep))
               return { output: '子 Agent 只能使用 Bruin 创建的工作树', isError: true };
+            const workspaceStat = fs.statSync(workspace);
+            if (!workspaceStat.isDirectory())
+              return { output: '工作树路径不是目录', isError: true };
+            let worktreeOutput: string;
+            try {
+              worktreeOutput = (
+                await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+                  cwd: session.workspace,
+                  timeout: 10_000,
+                  maxBuffer: 100_000,
+                  signal,
+                })
+              ).stdout;
+            } catch {
+              return { output: '该路径不属于当前仓库的工作树', isError: true };
+            }
+            const belongsToRepo = worktreeOutput.split(/\r?\n/).some((line) => {
+              if (!line.startsWith('worktree ')) return false;
+              const listedPath = line.slice('worktree '.length).trim();
+              try {
+                const listedReal = fs.realpathSync.native(listedPath);
+                const pathMatches =
+                  process.platform === 'win32'
+                    ? listedReal.toLowerCase() === workspace.toLowerCase() ||
+                      workspace.toLowerCase().startsWith(listedReal.toLowerCase() + path.sep)
+                    : listedReal === workspace || workspace.startsWith(listedReal + path.sep);
+                if (pathMatches) return true;
+                const listedStat = fs.statSync(listedPath);
+                return (
+                  workspaceStat.ino !== 0 &&
+                  listedStat.isDirectory() &&
+                  listedStat.dev === workspaceStat.dev &&
+                  listedStat.ino === workspaceStat.ino
+                );
+              } catch {
+                return false;
+              }
+            });
+            if (!belongsToRepo) return { output: '该路径不属于当前仓库的工作树', isError: true };
           }
           const childOptions: SubagentOptions = {
             mode,
@@ -983,7 +1026,10 @@ export class RuntimeServices {
               error: error instanceof Error ? error.message : String(error),
             });
           })
-          .finally(() => lease.release());
+          .finally(() => {
+            this.background.delete(id);
+            lease.release();
+          });
         this.pending.add(running);
         void running.then(
           () => this.pending.delete(running),
@@ -1013,6 +1059,7 @@ export class RuntimeServices {
             id,
             status: task?.status ?? finished?.payload.status ?? 'unknown',
             result: task?.result ?? finished?.payload.result,
+            ...(finished?.payload.error !== undefined ? { error: finished.payload.error } : {}),
           }),
           isError: false,
         };

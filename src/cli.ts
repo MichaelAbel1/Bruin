@@ -62,6 +62,29 @@ bruin market skills-sh-search QUERY | skills-sh-install OWNER/REPO/SKILL
 PROVIDER: openai, anthropic, google, openai-compatible.
 For non-interactive chat, pass a prompt as arguments or on stdin (UTF-8, up to 1 MB).
 API keys are read from environment variables and never stored in the session database.`;
+function requireArg(value: string | undefined, message = help): string {
+  if (!value) throw new Error(message);
+  return value;
+}
+async function askLine(
+  rl: ReturnType<typeof createInterface>,
+  promptText: string,
+  signal: AbortSignal,
+): Promise<string | null> {
+  if (signal.aborted) throw new Error('已取消');
+  let onClose!: () => void;
+  const closed = new Promise<null>((resolve) => {
+    onClose = () => resolve(null);
+    rl.once('close', onClose);
+  });
+  const pending = rl.question(promptText, { signal });
+  void pending.catch(() => {});
+  try {
+    return await Promise.race([pending, closed]);
+  } finally {
+    rl.removeListener('close', onClose);
+  }
+}
 function takeFlag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
   if (i < 0) return;
@@ -268,28 +291,30 @@ async function main(): Promise<void> {
       return;
     }
     if (action === 'show') {
-      console.log(readSkill(args[0]));
+      console.log(readSkill(requireArg(args[0])));
       return;
     }
     if (action === 'enable' || action === 'disable') {
-      setSkillEnabled(args[0], action === 'enable');
+      setSkillEnabled(requireArg(args[0]), action === 'enable');
       console.log(`Skill ${action === 'enable' ? '已启用' : '已禁用'}`);
       return;
     }
     if (action === 'install-local') {
-      console.log(JSON.stringify(installLocal(args[0]), null, 2));
+      console.log(JSON.stringify(installLocal(requireArg(args[0])), null, 2));
       return;
     }
     if (action === 'install-github') {
-      console.log(JSON.stringify(installGithub(args[0], args[1], args[2]), null, 2));
+      console.log(
+        JSON.stringify(installGithub(requireArg(args[0]), requireArg(args[1]), args[2]), null, 2),
+      );
       return;
     }
     if (action === 'update') {
-      console.log(JSON.stringify(await updateSkill(args[0]), null, 2));
+      console.log(JSON.stringify(await updateSkill(requireArg(args[0])), null, 2));
       return;
     }
     if (action === 'remove') {
-      uninstallSkill(args[0]);
+      uninstallSkill(requireArg(args[0]));
       console.log('已卸载');
       return;
     }
@@ -298,7 +323,7 @@ async function main(): Promise<void> {
   if (area === 'market') {
     const action = args.shift();
     if (action === 'add') {
-      addMarket(args[0], args[1]);
+      addMarket(requireArg(args[0]), requireArg(args[1]));
       console.log('市场已添加');
       return;
     }
@@ -307,11 +332,13 @@ async function main(): Promise<void> {
       return;
     }
     if (action === 'search') {
-      console.log(JSON.stringify(marketEntries(args[0]), null, 2));
+      console.log(JSON.stringify(marketEntries(requireArg(args[0])), null, 2));
       return;
     }
     if (action === 'install') {
-      console.log(JSON.stringify(installFromMarket(args[0], args[1]), null, 2));
+      console.log(
+        JSON.stringify(installFromMarket(requireArg(args[0]), requireArg(args[1])), null, 2),
+      );
       return;
     }
     if (action === 'skills-sh-search') {
@@ -319,7 +346,7 @@ async function main(): Promise<void> {
       return;
     }
     if (action === 'skills-sh-install') {
-      console.log(JSON.stringify(await installSkillsSh(args[0]), null, 2));
+      console.log(JSON.stringify(await installSkillsSh(requireArg(args[0])), null, 2));
       return;
     }
     throw new Error(help);
@@ -367,7 +394,9 @@ async function main(): Promise<void> {
         return;
       }
       if (action === 'show') {
-        console.log(JSON.stringify(store.events(args[0]), null, 2));
+        const sessionId = requireArg(args[0]);
+        if (!store.getSession(sessionId)) throw new Error('会话不存在');
+        console.log(JSON.stringify(store.events(sessionId), null, 2));
         return;
       }
       throw new Error(help);
@@ -435,11 +464,12 @@ async function main(): Promise<void> {
         }
         if (effectiveUnattended)
           return '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。';
-        const answer = await rl.question(
+        const answer = await askLine(
+          rl,
           `\n批准 ${call.name} ${JSON.stringify(call.input)}? ${reason} [y/N] `,
-          { signal },
+          signal,
         );
-        return /^y(es)?$/i.test(answer.trim());
+        return answer !== null && /^y(es)?$/i.test(answer.trim());
       },
     };
     const services = new RuntimeServices(store, executor, createSubagentRunner(store, executor));
@@ -458,7 +488,9 @@ async function main(): Promise<void> {
     const controller = new AbortController();
     const leaseSessionId = session.id;
     let lease: ReturnType<RuntimeServices['sessionLeases']['retain']> | undefined;
-    process.once('SIGINT', () => controller.abort());
+    const onStopSignal = () => controller.abort();
+    process.once('SIGINT', onStopSignal);
+    process.once('SIGTERM', onStopSignal);
     try {
       lease = services.sessionLeases.retain(leaseSessionId, controller);
       if (resume) runner.recover(session);
@@ -471,11 +503,12 @@ async function main(): Promise<void> {
           process.exitCode = 3;
           return;
         }
-        const answer = await rl.question(
+        const answer = await askLine(
+          rl,
           `发现 ${unknown.length} 个结果未知的工具调用。请检查工作区后继续。[y/N] `,
-          { signal: controller.signal },
+          controller.signal,
         );
-        if (!/^y(es)?$/i.test(answer.trim())) return;
+        if (answer === null || !/^y(es)?$/i.test(answer.trim())) return;
         const reviewLease = services.sessionLeases.retain(session.id, controller);
         try {
           recordUnknownReview(store, session.id, lastUnknown.seq, 'cli');
@@ -526,9 +559,9 @@ async function main(): Promise<void> {
       if (effectiveUnattended && turnState(store.events(session.id)) === 'paused')
         process.exitCode = 2;
       while (!effectiveUnattended && !controller.signal.aborted && !reportQuestion()) {
-        const line = await rl.question('\n你> ', { signal: controller.signal });
+        const line = await askLine(rl, '\n你> ', controller.signal);
         if (controller.signal.aborted) throw new Error('已取消');
-        if (line.trim() === '/exit') break;
+        if (line === null || line.trim() === '/exit') break;
         if (line.trim() === '/continue' || !line.trim()) {
           if (canResumeTurn(store.events(session.id))) {
             store.append(session.id, 'run_configured', {
@@ -562,12 +595,20 @@ async function main(): Promise<void> {
         stdout.write('\n');
       }
     } finally {
+      process.removeListener('SIGINT', onStopSignal);
+      process.removeListener('SIGTERM', onStopSignal);
       try {
         lease?.release();
       } finally {
-        await services.close();
-        await executor.close();
-        rl.close();
+        try {
+          await services.close();
+        } finally {
+          try {
+            await executor.close();
+          } finally {
+            rl.close();
+          }
+        }
       }
     }
   } finally {

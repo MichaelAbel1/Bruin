@@ -494,11 +494,19 @@ async function command(
   });
 }
 function hasBinary(binary: string): boolean {
-  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
-    try {
-      fs.accessSync(path.join(dir, binary), fs.constants.X_OK);
-      return true;
-    } catch {}
+  const extensions =
+    process.platform === 'win32'
+      ? path.extname(binary)
+        ? ['']
+        : ['', ...(process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';')]
+      : [''];
+  for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter).filter(Boolean)) {
+    for (const ext of extensions) {
+      try {
+        fs.accessSync(path.join(dir, binary + ext), fs.constants.X_OK);
+        return true;
+      } catch {}
+    }
   }
   return false;
 }
@@ -596,6 +604,12 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
         } finally {
           stopReading();
           await finished(stream, { cleanup: true }).catch(() => {});
+          if (!stream.closed) {
+            await new Promise<void>((resolve) => {
+              stream.once('close', resolve);
+              stream.once('error', () => resolve());
+            });
+          }
           stopReading = undefined;
         }
       } finally {
@@ -775,15 +789,20 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
           throw new Error('父路径不是工作区内的真实目录');
       }
       checkedPath(req.workspace, parent);
+      const written = Buffer.from(String(req.input.content ?? ''));
       replaceFile(
         root,
         file,
-        Buffer.from(String(req.input.content ?? '')),
+        written,
         expected ? expected.mode & 0o777 : 0o600,
         expected,
         req.expectedFileVersion,
       );
-      return { output: `已写入 ${path.relative(root, file)}`, isError: false };
+      return {
+        output: `已写入 ${path.relative(root, file)}`,
+        isError: false,
+        fileVersion: written.length <= snapshotMaxBytes ? fileContentHash(written) : undefined,
+      };
     }
     case 'edit_file': {
       const root = fs.realpathSync(req.workspace);
@@ -823,7 +842,11 @@ async function handle(req: ToolRequest): Promise<ToolResult> {
         fs.closeSync(fd);
       }
       replaceFile(root, file, updated, mode, expected);
-      return { output: `已编辑 ${path.relative(root, file)}`, isError: false };
+      return {
+        output: `已编辑 ${path.relative(root, file)}`,
+        isError: false,
+        fileVersion: updated.length <= snapshotMaxBytes ? fileContentHash(updated) : undefined,
+      };
     }
     case 'search': {
       if (!hasBinary('rg')) return fallbackSearch(req);
@@ -949,4 +972,7 @@ const terminate = () => {
 };
 process.on('disconnect', terminate);
 process.on('SIGTERM', terminate);
-process.on('SIGINT', terminate);
+process.on('SIGINT', () => {
+  // While connected to a parent over IPC, let the parent cancel in-flight tools cleanly.
+  if (!process.connected) terminate();
+});

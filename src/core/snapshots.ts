@@ -128,7 +128,7 @@ export function recordSnapshot(
   }
   return id;
 }
-function readSnapshot(workspace: string, id: string): Snapshot {
+function readSnapshotRaw(workspace: string, id: string, verifyContent: boolean): Snapshot {
   if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('无效快照 ID');
   const { root, directory } = location(workspace);
   const file = path.join(directory, `${id}.json`);
@@ -142,6 +142,10 @@ function readSnapshot(workspace: string, id: string): Snapshot {
     const value = JSON.parse(
       new TextDecoder('utf-8', { fatal: true }).decode(bounded(fd, 14_000_000)),
     ) as Snapshot;
+    const beforeBytes =
+      verifyContent && typeof value.before === 'string'
+        ? Buffer.from(value.before, 'base64')
+        : undefined;
     if (
       value.id !== id ||
       value.root !== root ||
@@ -151,19 +155,30 @@ function readSnapshot(workspace: string, id: string): Snapshot {
       !Number.isFinite(Date.parse(value.at)) ||
       (value.before === null
         ? value.beforeHash !== null
-        : Buffer.from(value.before, 'base64').toString('base64') !== value.before ||
-          fileContentHash(Buffer.from(value.before, 'base64')) !== value.beforeHash) ||
+        : typeof value.beforeHash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(value.beforeHash) ||
+          (verifyContent &&
+            (beforeBytes!.toString('base64') !== value.before ||
+              fileContentHash(beforeBytes!) !== value.beforeHash))) ||
       !Number.isInteger(value.mode) ||
       value.mode < 0 ||
       value.mode > 0o777 ||
       !/^[a-f0-9]{64}$/.test(value.afterHash)
     )
       throw new Error('快照数据无效');
-    checked(root, value.path);
+    if (verifyContent) checked(root, value.path);
+    else {
+      const resolved = path.resolve(root, value.path);
+      if (resolved === root || !resolved.startsWith(root + path.sep))
+        throw new Error('快照路径超出工作区');
+    }
     return value;
   } finally {
     fs.closeSync(fd);
   }
+}
+function readSnapshot(workspace: string, id: string): Snapshot {
+  return readSnapshotRaw(workspace, id, true);
 }
 export function previewSnapshot(workspace: string, id: string): string {
   const snapshot = readSnapshot(workspace, id);
@@ -177,14 +192,20 @@ export function listSnapshots(workspace: string) {
   return fs
     .readdirSync(directory)
     .filter((name) => /^[a-f0-9-]{36}\.json$/.test(name))
-    .map((name) => {
-      const { id, path: file, at, before } = readSnapshot(workspace, name.slice(0, -5));
-      return {
-        id,
-        path: file,
-        at,
-        action: before === null ? 'delete_created_file' : 'restore_file',
-      };
+    .flatMap((name) => {
+      try {
+        const { id, path: file, at, before } = readSnapshotRaw(workspace, name.slice(0, -5), false);
+        return [
+          {
+            id,
+            path: file,
+            at,
+            action: before === null ? 'delete_created_file' : 'restore_file',
+          },
+        ];
+      } catch {
+        return [];
+      }
     })
     .sort((a, b) => b.at.localeCompare(a.at));
 }

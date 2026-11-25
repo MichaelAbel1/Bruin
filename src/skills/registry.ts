@@ -117,8 +117,13 @@ function safeName(name: string): string {
   return name;
 }
 function sourceUrl(source: string): string {
-  if (/^[\w.-]+\/[\w.-]+$/.test(source)) return `https://github.com/${source}.git`;
-  if (/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\.git)?$/.test(source)) return source;
+  const validParts = (owner: string, repo: string) =>
+    owner !== '.' && owner !== '..' && repo !== '.' && repo !== '..';
+  const shortMatch = /^([\w.-]+)\/([\w.-]+)$/.exec(source);
+  if (shortMatch && validParts(shortMatch[1], shortMatch[2]))
+    return `https://github.com/${source}.git`;
+  const urlMatch = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?$/.exec(source);
+  if (urlMatch && validParts(urlMatch[1], urlMatch[2])) return source;
   throw new Error('仅支持 GitHub owner/repo 或 https://github.com/owner/repo');
 }
 function safeRef(ref: string): string {
@@ -211,7 +216,7 @@ function installDirectory(dir: string, source: string, revision: string): SkillI
           const priorData = JSON.parse(
             readSkillText(path.join(final, '.bruin-source.json'), 64_000),
           );
-          if (typeof priorData.enabled === 'boolean') {
+          if (priorData?.source === source && typeof priorData.enabled === 'boolean') {
             enabled = priorData.enabled;
           }
         } catch {}
@@ -274,7 +279,15 @@ export function installLocal(dir: string): SkillInfo {
 export function installGithub(repo: string, subdir: string, ref = 'HEAD'): SkillInfo {
   const url = sourceUrl(repo);
   safeRef(ref);
-  if (path.isAbsolute(subdir) || subdir.split(/[\\/]/).includes('..'))
+  const segments = subdir.split(/[\\/]/).filter(Boolean);
+  if (
+    !subdir ||
+    !segments.length ||
+    path.isAbsolute(subdir) ||
+    subdir.includes(':') ||
+    subdir.includes('\0') ||
+    segments.some((part) => part === '.' || part === '..' || part === '.git')
+  )
     throw new Error('无效的 Skill 子目录');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-skill-'));
   try {
@@ -286,10 +299,20 @@ export function installGithub(repo: string, subdir: string, ref = 'HEAD'): Skill
       timeout: 30000,
       stdio: 'pipe',
     });
+    const tempReal = fs.realpathSync(temp);
+    let current = tempReal;
+    for (const part of segments) {
+      current = path.join(current, part);
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) throw new Error('Skill 不允许符号链接');
+      if (!stat.isDirectory()) throw new Error('Skill 来源必须是普通目录');
+    }
+    const targetReal = fs.realpathSync(current);
+    if (!targetReal.startsWith(tempReal + path.sep)) throw new Error('无效的 Skill 子目录');
     const revision = execFileSync('git', ['-C', temp, 'rev-parse', 'HEAD'], {
       encoding: 'utf8',
     }).trim();
-    return installDirectory(path.join(temp, subdir), `github:${repo}:${subdir}`, revision);
+    return installDirectory(targetReal, `github:${repo}:${subdir}`, revision);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
@@ -404,7 +427,7 @@ export function marketEntries(name: string): MarketEntry[] {
       timeout: 120000,
     });
     const file = path.join(temp, 'marketplace.json');
-    const data: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const data: unknown = JSON.parse(readSkillText(file, 1_000_000));
     if (!Array.isArray(data)) throw new Error('marketplace.json 必须是数组');
     return data.map((x) => {
       const item = x as MarketEntry;
@@ -433,16 +456,33 @@ export function installSnapshot(
 ): SkillInfo {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-snapshot-'));
   try {
-    if (files.length > 500) throw new Error('Skill 文件过多');
+    if (!Array.isArray(files) || files.length > 500) throw new Error('Skill 文件过多');
     let total = 0;
+    const tempRoot = path.resolve(temp);
     for (const file of files) {
-      if (!file.path || path.isAbsolute(file.path) || file.path.split(/[\\/]/).includes('..'))
+      if (
+        !file ||
+        typeof file !== 'object' ||
+        typeof file.path !== 'string' ||
+        typeof file.contents !== 'string'
+      )
+        throw new Error('Skill 文件快照格式无效');
+      const parts = file.path.split('/');
+      if (
+        !file.path ||
+        file.path.includes('\\') ||
+        file.path.includes(':') ||
+        file.path.includes('\0') ||
+        path.isAbsolute(file.path) ||
+        parts.some((part) => !part || part === '.' || part === '..')
+      )
         throw new Error('Skill 文件路径无效');
       total += Buffer.byteLength(file.contents);
       if (total > 25 * 1024 * 1024) throw new Error('Skill 过大');
-      const target = path.join(temp, file.path);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, file.contents);
+      const target = path.resolve(tempRoot, file.path);
+      if (!target.startsWith(tempRoot + path.sep)) throw new Error('Skill 文件路径无效');
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(target, file.contents, { mode: 0o600, flag: 'wx' });
     }
     return installDirectory(temp, source, revision);
   } finally {

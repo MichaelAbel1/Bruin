@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Bot,
@@ -187,6 +187,63 @@ function sessionTitle(session: Session, events?: SessionEvent[]) {
   if (session.managedWorkspace) return `新会话 (${short(session.workspace).slice(-8)})`;
   return short(session.workspace);
 }
+function normalizeLineEndings(text: string): string {
+  return text.replace(/\r\n/g, '\n');
+}
+
+function restoreLineEndings(text: string, eol?: '\r\n' | '\n'): string {
+  return eol === '\r\n' ? text.replace(/\n/g, '\r\n') : text;
+}
+
+const EditorTab = React.memo(function EditorTab({
+  file,
+  active,
+  savingFile,
+  onSelect,
+  onClose,
+}: {
+  file: OpenFile;
+  active: boolean;
+  savingFile: boolean;
+  onSelect: (path: string) => void;
+  onClose: (path: string) => void;
+}) {
+  const isDirty = file.content !== file.originalContent;
+  const diffBase = file.baselineContent ?? file.originalContent;
+  const stat = useMemo(() => computeLineDiff(diffBase, file.content), [diffBase, file.content]);
+  return (
+    <div className={`editor-tab ${active ? 'active' : ''}`}>
+      <button
+        role="tab"
+        aria-selected={active}
+        title={file.path}
+        onClick={() => onSelect(file.path)}
+      >
+        <FileCode size={14} />
+        <span className="tab-title">{short(file.path)}</span>
+        {(stat.additions > 0 || stat.deletions > 0) && (
+          <span className="tab-diff-stats">
+            {stat.additions > 0 && <span className="diff-add">+{stat.additions}</span>}
+            {stat.deletions > 0 && <span className="diff-del">-{stat.deletions}</span>}
+          </span>
+        )}
+        {isDirty && (
+          <span className="tab-dirty-dot" title="未保存">
+            ●
+          </span>
+        )}
+      </button>
+      <button
+        aria-label={`关闭 ${file.path}`}
+        disabled={savingFile}
+        onClick={() => onClose(file.path)}
+      >
+        <X size={13} />
+      </button>
+    </div>
+  );
+});
+
 function App() {
   const [config, setConfig] = useState<Config>({
     profiles: [],
@@ -199,7 +256,8 @@ function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [view, setView] = useState<SessionView | null>(null);
   const [skills, setSkills] = useState<Skill[]>([]);
-  const [busy, setBusy] = useState(false);
+  const [busySessionId, setBusySessionId] = useState<string | null>(null);
+  const busy = busySessionId !== null;
   const [sending, setSending] = useState(false);
   const [delivery, setDelivery] = useState<'steer' | 'follow-up'>('steer');
   const [stream, setStream] = useState('');
@@ -239,9 +297,13 @@ function App() {
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [modelLoading, setModelLoading] = useState(false);
   const [modelRefresh, setModelRefresh] = useState(0);
+  const forceModelRefresh = useRef(false);
   const [deletingSession, setDeletingSession] = useState<string | null>(null);
   const selected = useRef<string | null>(null);
   const viewRevision = useRef(0);
+  const errorTimer = useRef<number | undefined>(undefined);
+  const openFilesRef = useRef(openFiles);
+  openFilesRef.current = openFiles;
   const bottom = useRef<HTMLDivElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
@@ -250,26 +312,47 @@ function App() {
   const draft = (view && drafts.get(view.session.id)?.get(view.session.workspace)) ?? emptyDraft;
   const { composer, attachments, quote } = draft;
 
-  function updateDraft(session: Session, update: (previous: ComposerDraft) => ComposerDraft) {
-    setDrafts((previous) => {
-      const workspaces = new Map(previous.get(session.id));
-      const before = workspaces.get(session.workspace) ?? emptyDraft;
-      const next = update(before);
-      if (before === next) return previous;
-      if (next.composer || next.attachments.length || next.quote)
-        workspaces.set(session.workspace, next);
-      else workspaces.delete(session.workspace);
-      const result = new Map(previous);
-      if (workspaces.size) result.set(session.id, workspaces);
-      else result.delete(session.id);
-      return result;
-    });
-  }
+  const updateDraft = useCallback(
+    (session: Session, update: (previous: ComposerDraft) => ComposerDraft) => {
+      setDrafts((previous) => {
+        const workspaces = new Map(previous.get(session.id));
+        const before = workspaces.get(session.workspace) ?? emptyDraft;
+        const next = update(before);
+        if (before === next) return previous;
+        if (next.composer || next.attachments.length || next.quote)
+          workspaces.set(session.workspace, next);
+        else workspaces.delete(session.workspace);
+        const result = new Map(previous);
+        if (workspaces.size) result.set(session.id, workspaces);
+        else result.delete(session.id);
+        return result;
+      });
+    },
+    [],
+  );
 
-  const fail = (err: unknown) => {
+  const dismissError = useCallback(() => {
+    if (errorTimer.current !== undefined) {
+      window.clearTimeout(errorTimer.current);
+      errorTimer.current = undefined;
+    }
+    setError('');
+  }, []);
+
+  const fail = useCallback((err: unknown) => {
     setError(err instanceof Error ? err.message : String(err));
-    window.setTimeout(() => setError(''), 6500);
-  };
+    if (errorTimer.current !== undefined) window.clearTimeout(errorTimer.current);
+    errorTimer.current = window.setTimeout(() => {
+      errorTimer.current = undefined;
+      setError('');
+    }, 6500);
+  }, []);
+  useEffect(
+    () => () => {
+      if (errorTimer.current !== undefined) window.clearTimeout(errorTimer.current);
+    },
+    [],
+  );
   async function refreshSessions() {
     setSessions(await api<Session[]>('listSessions'));
   }
@@ -374,11 +457,18 @@ function App() {
           return review
             ? current.map((item) => (item.path === path ? { ...item, mode: 'diff' } : item))
             : current;
+        const eol: '\r\n' | '\n' = file.content.includes('\r\n') ? '\r\n' : '\n';
+        const normalizedContent = normalizeLineEndings(file.content);
+        const normalizedBaseline =
+          file.baselineContent !== undefined
+            ? normalizeLineEndings(file.baselineContent)
+            : normalizedContent;
         const openItem: OpenFile = {
           path: file.path,
-          content: file.content,
-          originalContent: file.content,
-          baselineContent: file.baselineContent ?? file.content,
+          content: normalizedContent,
+          originalContent: normalizedContent,
+          baselineContent: normalizedBaseline,
+          eol,
           truncated: file.truncated,
           mode: review ? 'diff' : (existing?.mode ?? 'edit'),
           readOnlyReason: file.readOnlyReason,
@@ -399,8 +489,8 @@ function App() {
     await api('writeWorkspaceFile', {
       sessionId: view.session.id,
       path: file.path,
-      content: file.content,
-      expectedContent: file.originalContent,
+      content: restoreLineEndings(file.content, file.eol),
+      expectedContent: restoreLineEndings(file.originalContent, file.eol),
     });
     if (!isCurrentView(revision, view.session.id)) return;
     setOpenFiles((current) =>
@@ -454,13 +544,6 @@ function App() {
     }
   }
 
-  function closeFile(path: string) {
-    void protectFileEdits(() => {
-      setOpenFiles((current) => current.filter((file) => file.path !== path));
-      setActiveFile((current) => (current === path ? null : current));
-    }, path);
-  }
-
   function revertFile(file: OpenFile) {
     setOpenFiles((current) =>
       current.map((item) =>
@@ -509,6 +592,8 @@ function App() {
       if (isCurrentView(revision, view.session.id)) fail(err);
     }
   }
+  const protectFileEditsRef = useRef(protectFileEdits);
+  protectFileEditsRef.current = protectFileEdits;
   useEffect(() => {
     function beforeUnload(event: BeforeUnloadEvent) {
       if (allowWindowClose.current) {
@@ -517,19 +602,19 @@ function App() {
       }
       if (
         !fileOperation.current &&
-        !openFiles.some((file) => file.content !== file.originalContent)
+        !openFilesRef.current.some((file) => file.content !== file.originalContent)
       )
         return;
       event.preventDefault();
       event.returnValue = '';
-      void protectFileEdits(() => {
+      void protectFileEditsRef.current(() => {
         allowWindowClose.current = true;
         window.close();
       });
     }
     window.addEventListener('beforeunload', beforeUnload);
     return () => window.removeEventListener('beforeunload', beforeUnload);
-  });
+  }, []);
   useEffect(() => {
     let disposed = false;
     void api<{ iconBackground: string; uiTheme: 'light' | 'dark' }>('getAppearance')
@@ -552,7 +637,7 @@ function App() {
         setConfig(data.config);
         setSessions(data.sessions);
         setSkills(data.skills);
-        setBusy(Boolean(data.busySessionId));
+        setBusySessionId(data.busySessionId ?? null);
         if (data.legacyKeyExposure)
           setSecurityNotice(
             '检测到旧版本曾保存 API Key。请在服务商后台轮换该密钥；旧数据库页和备份可能仍有副本。',
@@ -564,7 +649,7 @@ function App() {
     const unsubscribe = window.bruin.onEvent((message) => {
       if (message.type === 'hostExited') {
         fail(new Error('Agent 后台进程已退出，请重新启动 Bruin'));
-        setBusy(false);
+        setBusySessionId(null);
         setApproval(null);
         return;
       }
@@ -579,15 +664,22 @@ function App() {
         });
         return;
       }
+      if (message.type === 'notice' && !message.sessionId) {
+        setNotice(message.message ?? '');
+        return;
+      }
+      if (message.type === 'runStarted' && message.sessionId) {
+        setBusySessionId(message.sessionId);
+      }
       if (message.type === 'runFinished' || message.type === 'runFailed') {
+        setBusySessionId((current) =>
+          !message.sessionId || current === message.sessionId ? null : current,
+        );
         setApproval((current) => (current?.sessionId === message.sessionId ? null : current));
-        setMaxModelCalls(24);
-        setAllowWorkspaceEdits(false);
-        setUnattended(false);
+        void refreshSessions().catch(fail);
       }
       if (message.sessionId !== selected.current) return;
       if (message.type === 'runStarted') {
-        setBusy(true);
         setNotice('');
       }
       if (message.type === 'text') setStream((previous) => previous + (message.delta ?? ''));
@@ -601,7 +693,9 @@ function App() {
         setStream('');
       }
       if (message.type === 'runFinished' || message.type === 'runFailed') {
-        setBusy(false);
+        setMaxModelCalls(24);
+        setAllowWorkspaceEdits(false);
+        setUnattended(false);
         setStream('');
         if (message.events)
           setView((previous) =>
@@ -613,7 +707,6 @@ function App() {
                 }
               : previous,
           );
-        void refreshSessions().catch(fail);
         if (message.sessionId) {
           const revision = viewRevision.current;
           void api<SessionView>('openSession', { sessionId: message.sessionId })
@@ -636,6 +729,10 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = uiTheme;
   }, [uiTheme]);
+  const activeProfile = config.profiles.find((p) => p.alias === view?.session.profile.alias);
+  const activeProfileKey = activeProfile
+    ? `${activeProfile.alias}|${activeProfile.provider}|${activeProfile.baseUrl ?? ''}|${activeProfile.apiKeyEnv ?? ''}`
+    : (view?.session.profile.alias ?? '');
   useEffect(() => {
     const alias = view?.session.profile.alias;
     if (!alias) {
@@ -643,10 +740,12 @@ function App() {
       return;
     }
     let cancelled = false;
+    const refresh = forceModelRefresh.current;
+    forceModelRefresh.current = false;
     setModelLoading(true);
     setDiscoveredModels([]);
     setModelDiscoveryError('');
-    void api<string[]>('discoverModels', { alias, refresh: modelRefresh > 0 })
+    void api<string[]>('discoverModels', { alias, refresh })
       .then((models) => {
         if (!cancelled) setDiscoveredModels(models);
       })
@@ -659,7 +758,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [view?.session.profile.alias, config, modelRefresh]);
+  }, [activeProfileKey, modelRefresh]);
   const handleConversationScroll = () => {
     const el = conversationRef.current;
     if (!el) return;
@@ -669,12 +768,10 @@ function App() {
   useEffect(() => {
     if (!autoScrollRef.current) return;
     const el = conversationRef.current;
-    if (stream) {
-      if (el) {
-        el.scrollTop = el.scrollHeight;
-      }
+    if (el) {
+      el.scrollTop = el.scrollHeight;
     } else {
-      bottom.current?.scrollIntoView({ behavior: 'smooth' });
+      bottom.current?.scrollIntoView();
     }
   }, [view?.events.length, stream, notice, approval]);
 
@@ -691,6 +788,7 @@ function App() {
     const { session } = view;
     const revision = viewRevision.current;
     const text = composer.trim();
+    const wasBusy = busy;
     const optimistic: SessionEvent = {
       seq: -Date.now(),
       type: 'user',
@@ -698,9 +796,9 @@ function App() {
       payload: { text, attachments, quote },
     };
     setSending(true);
-    if (!busy) {
+    if (!wasBusy) {
       autoScrollRef.current = true;
-      setBusy(true);
+      setBusySessionId(session.id);
       setView((previous) =>
         previous ? { ...previous, events: [...previous.events, optimistic] } : previous,
       );
@@ -711,7 +809,7 @@ function App() {
         prompt: text,
         attachments: attachments.map((item) => item.id),
         quoteSeq: quote?.seq,
-        ...(busy
+        ...(wasBusy
           ? { delivery }
           : {
               maxModelCalls,
@@ -720,7 +818,7 @@ function App() {
             }),
       });
       updateDraft(session, (current) => (current === draft ? emptyDraft : current));
-      if (!busy || !isCurrentView(revision, session.id)) return;
+      if (!wasBusy || !isCurrentView(revision, session.id)) return;
       if (result.events)
         setView((previous) =>
           acceptsEventSnapshot(previous, session.id, result.events!)
@@ -729,9 +827,9 @@ function App() {
         );
       setNotice(result.queued ? '消息已排队，将在安全边界处理。' : '消息已开始处理。');
     } catch (err) {
+      if (!wasBusy) setBusySessionId((current) => (current === session.id ? null : current));
       if (!isCurrentView(revision, session.id)) return;
-      if (!busy) {
-        setBusy(false);
+      if (!wasBusy) {
         setView((previous) =>
           previous
             ? { ...previous, events: previous.events.filter((event) => event !== optimistic) }
@@ -762,7 +860,7 @@ function App() {
     }
   }
   async function cancel() {
-    const sessionId = approval?.sessionId ?? view?.session.id;
+    const sessionId = approval?.sessionId ?? busySessionId ?? view?.session.id;
     if (sessionId)
       try {
         await api('cancel', { sessionId });
@@ -818,16 +916,17 @@ function App() {
   }
   async function resume() {
     if (!view || busy || view.needsReview) return;
+    const sessionId = view.session.id;
     try {
-      setBusy(true);
+      setBusySessionId(sessionId);
       await api('resume', {
-        sessionId: view.session.id,
+        sessionId,
         maxModelCalls,
         allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
         unattended: maxModelCalls > 24 && unattended,
       });
     } catch (err) {
-      setBusy(false);
+      setBusySessionId((current) => (current === sessionId ? null : current));
       fail(err);
     }
   }
@@ -865,6 +964,35 @@ function App() {
   }
   const usage = useMemo(() => recordedUsage(view?.events ?? []), [view?.events]);
   const reviewTurns = useMemo(() => memoryReviewTurns(view?.events ?? []), [view?.events]);
+  const groupedEvents = useMemo(
+    () => (view ? groupConversationEvents(view.events) : []),
+    [view?.events],
+  );
+  const currentSessionRef = useRef<Session | null>(null);
+  currentSessionRef.current = view?.session ?? null;
+  const sendingRef = useRef(sending);
+  sendingRef.current = sending;
+  const handleQuote = useCallback(
+    (selectedEvent: SessionEvent) => {
+      const currentSession = currentSessionRef.current;
+      if (!currentSession || sendingRef.current) return;
+      updateDraft(currentSession, (current) => ({
+        ...current,
+        quote: {
+          seq: selectedEvent.seq,
+          text: String(selectedEvent.payload.text ?? '').slice(0, 4000),
+        },
+      }));
+    },
+    [updateDraft],
+  );
+  const handleSelectFileTab = useCallback((path: string) => setActiveFile(path), []);
+  const handleCloseFileTab = useCallback((path: string) => {
+    void protectFileEditsRef.current(() => {
+      setOpenFiles((current) => current.filter((file) => file.path !== path));
+      setActiveFile((current) => (current === path ? null : current));
+    }, path);
+  }, []);
   const currentTurn = turnState(view?.events ?? []);
   const question = pendingQuestion(view?.events ?? []);
   const canResume = Boolean(view && !busy && canResumeTurn(view.events));
@@ -1033,45 +1161,24 @@ function App() {
         </header>
         {view && openFiles.length > 0 && (
           <div className="editor-tabs" role="tablist" aria-label="会话与文件">
-            <button className={!activeFile ? 'active' : ''} onClick={() => setActiveFile(null)}>
+            <button
+              role="tab"
+              aria-selected={!activeFile}
+              className={!activeFile ? 'active' : ''}
+              onClick={() => setActiveFile(null)}
+            >
               <MessageSquare size={14} /> 对话
             </button>
-            {openFiles.map((file) => {
-              const isDirty = file.content !== file.originalContent;
-              const stat = computeLineDiff(
-                file.baselineContent ?? file.originalContent,
-                file.content,
-              );
-              return (
-                <div
-                  className={`editor-tab ${activeFile === file.path ? 'active' : ''}`}
-                  key={file.path}
-                >
-                  <button title={file.path} onClick={() => setActiveFile(file.path)}>
-                    <FileCode size={14} />
-                    <span className="tab-title">{short(file.path)}</span>
-                    {(stat.additions > 0 || stat.deletions > 0) && (
-                      <span className="tab-diff-stats">
-                        {stat.additions > 0 && <span className="diff-add">+{stat.additions}</span>}
-                        {stat.deletions > 0 && <span className="diff-del">-{stat.deletions}</span>}
-                      </span>
-                    )}
-                    {isDirty && (
-                      <span className="tab-dirty-dot" title="未保存">
-                        ●
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    aria-label={`关闭 ${file.path}`}
-                    disabled={savingFile}
-                    onClick={() => closeFile(file.path)}
-                  >
-                    <X size={13} />
-                  </button>
-                </div>
-              );
-            })}
+            {openFiles.map((file) => (
+              <EditorTab
+                key={file.path}
+                file={file}
+                active={activeFile === file.path}
+                savingFile={savingFile}
+                onSelect={handleSelectFileTab}
+                onClose={handleCloseFileTab}
+              />
+            ))}
           </div>
         )}
         {securityNotice && (
@@ -1112,6 +1219,7 @@ function App() {
           </div>
         ) : activeFile && openFiles.find((file) => file.path === activeFile) ? (
           <FileEditorViewer
+            key={activeFile}
             file={openFiles.find((file) => file.path === activeFile)!}
             onContentChange={(content) => updateFileContent(activeFile, content)}
             onSave={() => saveFile(openFiles.find((file) => file.path === activeFile)!)}
@@ -1243,24 +1351,11 @@ function App() {
                     {view.plan.approved && <small>计划已批准。工具仍遵循当前审批设置。</small>}
                   </div>
                 )}
-                {groupConversationEvents(view.events).map((item) =>
+                {groupedEvents.map((item) =>
                   item.kind === 'tools' ? (
                     <ToolActivity key={`tools-${item.events[0].seq}`} events={item.events} />
                   ) : (
-                    <EventCard
-                      key={item.event.seq}
-                      event={item.event}
-                      onQuote={(selected) => {
-                        if (!sending)
-                          updateDraft(view.session, (current) => ({
-                            ...current,
-                            quote: {
-                              seq: selected.seq,
-                              text: String(selected.payload.text ?? '').slice(0, 4000),
-                            },
-                          }));
-                      }}
-                    />
+                    <EventCard key={item.event.seq} event={item.event} onQuote={handleQuote} />
                   ),
                 )}
                 {stream && (
@@ -1509,45 +1604,69 @@ function App() {
                       <select
                         className="composer-model-select"
                         aria-label="切换模型"
-                        value={
-                          config.profiles.length > 1
-                            ? `${view.session.profile.alias}::${view.session.profile.model}`
-                            : view.session.profile.model
-                        }
+                        value={JSON.stringify([
+                          view.session.profile.alias,
+                          view.session.profile.model,
+                        ])}
                         onChange={(e) => {
-                          const val = e.target.value;
-                          if (val.includes('::')) {
-                            const [alias, mId] = val.split('::');
+                          try {
+                            const [alias, mId] = JSON.parse(e.target.value) as [string, string];
                             void switchModel(mId, alias);
-                          } else {
-                            void switchModel(val);
+                          } catch {
+                            void switchModel(e.target.value);
                           }
                         }}
                         disabled={busy || modelLoading}
                       >
-                        {config.profiles.length > 1
-                          ? config.profiles.map((p) => {
+                        {config.profiles.length > 1 ? (
+                          <>
+                            {!config.profiles.some(
+                              (p) => p.alias === view.session.profile.alias,
+                            ) && (
+                              <optgroup
+                                label={`${view.session.profile.alias} (${view.session.profile.provider} · 已删除)`}
+                              >
+                                <option
+                                  value={JSON.stringify([
+                                    view.session.profile.alias,
+                                    view.session.profile.model,
+                                  ])}
+                                >
+                                  {view.session.profile.model}
+                                </option>
+                              </optgroup>
+                            )}
+                            {config.profiles.map((p) => {
                               const isCurrent = p.alias === view.session.profile.alias;
                               const models = isCurrent
                                 ? [...new Set([view.session.profile.model, ...discoveredModels])]
                                 : [p.model];
                               return (
                                 <optgroup label={`${p.alias} (${p.provider})`} key={p.alias}>
-                                  {models.map((m) => (
-                                    <option value={`${p.alias}::${m}`} key={`${p.alias}::${m}`}>
-                                      {m}
-                                    </option>
-                                  ))}
+                                  {models.map((m) => {
+                                    const val = JSON.stringify([p.alias, m]);
+                                    return (
+                                      <option value={val} key={val}>
+                                        {m}
+                                      </option>
+                                    );
+                                  })}
                                 </optgroup>
                               );
-                            })
-                          : [...new Set([view.session.profile.model, ...discoveredModels])].map(
-                              (id) => (
-                                <option value={id} key={id}>
+                            })}
+                          </>
+                        ) : (
+                          [...new Set([view.session.profile.model, ...discoveredModels])].map(
+                            (id) => {
+                              const val = JSON.stringify([view.session.profile.alias, id]);
+                              return (
+                                <option value={val} key={val}>
                                   {id}
                                 </option>
-                              ),
-                            )}
+                              );
+                            },
+                          )
+                        )}
                       </select>
                       <ChevronDown size={11} className="composer-model-chevron" />
                     </div>
@@ -1558,7 +1677,10 @@ function App() {
                       aria-label="刷新可用模型"
                       title={modelDiscoveryError || '刷新可用模型'}
                       disabled={busy || modelLoading}
-                      onClick={() => setModelRefresh((value) => value + 1)}
+                      onClick={() => {
+                        forceModelRefresh.current = true;
+                        setModelRefresh((value) => value + 1);
+                      }}
                     >
                       <LoaderCircle size={14} className={modelLoading ? 'spinning' : ''} />
                     </button>
@@ -1702,10 +1824,10 @@ function App() {
         )}
       </main>
       {error && (
-        <div className="toast error">
+        <div className="toast error" role="alert">
           <CircleAlert size={16} />
           {error}
-          <button onClick={() => setError('')}>
+          <button onClick={dismissError} aria-label="关闭错误提示">
             <X size={14} />
           </button>
         </div>
@@ -1902,7 +2024,9 @@ function WorkspaceFolder({
       .then((items) => {
         if (!cancelled) setEntries(items);
       })
-      .catch(fail)
+      .catch((err) => {
+        if (!cancelled) fail(err);
+      })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
@@ -2097,11 +2221,14 @@ function MemoryReviewDialog({
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
 
+  const [generating, setGenerating] = useState(false);
+
   async function generate() {
     setPreview(undefined);
     setError('');
     setStatus('');
     setPending(true);
+    setGenerating(true);
     try {
       setPreview(
         await api<MemoryReviewPreview>('previewMemoryReview', { sessionId: session.id, endSeq }),
@@ -2109,6 +2236,7 @@ function MemoryReviewDialog({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      setGenerating(false);
       setPending(false);
     }
   }
@@ -2135,6 +2263,11 @@ function MemoryReviewDialog({
   }
 
   async function discard() {
+    if (generating) {
+      void api('cancelMemoryReview', {}).catch(() => {});
+      close();
+      return;
+    }
     if (pending) return;
     setPending(true);
     try {
@@ -2204,8 +2337,12 @@ function MemoryReviewDialog({
         </section>
       ))}
       <div className="modal-actions">
-        <button className="secondary" disabled={pending} onClick={() => void discard()}>
-          {preview?.candidates.length ? '放弃未保存候选' : '关闭'}
+        <button
+          className="secondary"
+          disabled={pending && !generating}
+          onClick={() => void discard()}
+        >
+          {generating ? '取消生成' : preview?.candidates.length ? '放弃未保存候选' : '关闭'}
         </button>
         <button
           className="primary"
@@ -2230,6 +2367,19 @@ function Modal({
   close: () => void;
   children: React.ReactNode;
 }) {
+  const titleId = useId();
+  const closeRef = useRef(close);
+  closeRef.current = close;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
   return (
     <div
       className="modal-backdrop"
@@ -2237,13 +2387,13 @@ function Modal({
         if (e.target === e.currentTarget) close();
       }}
     >
-      <div className="modal">
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
         <div className="modal-top">
           <div>
             <span className="eyebrow">{eyebrow}</span>
-            <h2>{title}</h2>
+            <h2 id={titleId}>{title}</h2>
           </div>
-          <button className="icon-button" onClick={close}>
+          <button type="button" className="icon-button" aria-label="关闭" onClick={close}>
             <X size={19} />
           </button>
         </div>
@@ -2405,8 +2555,20 @@ function RuntimeDialog({
   useEffect(() => {
     if (!session) return;
     let active = true;
-    void api<CronJob[]>('listCronJobs', { sessionId: session.id }).then(setCronJobs).catch(fail);
-    void api<TaskNode[]>('listTasks', { sessionId: session.id }).then(setGraphTasks).catch(fail);
+    void api<CronJob[]>('listCronJobs', { sessionId: session.id })
+      .then((jobs) => {
+        if (active) setCronJobs(jobs);
+      })
+      .catch((error) => {
+        if (active) fail(error);
+      });
+    void api<TaskNode[]>('listTasks', { sessionId: session.id })
+      .then((tasks) => {
+        if (active) setGraphTasks(tasks);
+      })
+      .catch((error) => {
+        if (active) fail(error);
+      });
     void api<PatchCandidate[]>('listSubagentPatches', { sessionId: session.id })
       .then((candidates) => {
         if (active) setPatchCandidates(candidates);
@@ -3720,6 +3882,7 @@ function SkillsDialog({
   const [newMarketRepo, setNewMarketRepo] = useState('');
   const [entries, setEntries] = useState<MarketEntry[]>([]);
   const [working, setWorking] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   async function act<T>(
     method: string,
     params: Record<string, unknown>,
@@ -3736,6 +3899,7 @@ function SkillsDialog({
   }
   async function show(skill: Skill) {
     setSelected(skill);
+    setConfirmRemove(null);
     try {
       setContent(await api<string>('readSkill', { name: skill.name }));
     } catch (err) {
@@ -3765,11 +3929,11 @@ function SkillsDialog({
               <div className="skill-icon">
                 <Layers size={17} />
               </div>
-              <div className="skill-copy" onClick={() => void show(skill)}>
+              <button type="button" className="skill-copy" onClick={() => void show(skill)}>
                 <strong>{skill.name}</strong>
                 <small>{skill.description}</small>
                 <em>{skill.source.startsWith('builtin:') ? 'Bruin 内置' : skill.source}</em>
-              </div>
+              </button>
               <button
                 className={`toggle ${skill.enabled ? 'on' : ''}`}
                 aria-label={`${skill.enabled ? '停用' : '启用'} ${skill.name}`}
@@ -3819,20 +3983,39 @@ function SkillsDialog({
                     更新
                   </button>
                 )}
-                {!selected.source.startsWith('builtin:') && (
-                  <button
-                    className="danger-text"
-                    onClick={() => {
-                      if (window.confirm(`卸载 ${selected.name}？`))
-                        void act<Skill[]>('removeSkill', { name: selected.name }, (value) => {
-                          changed(value);
-                          setSelected(null);
-                        });
-                    }}
-                  >
-                    卸载
-                  </button>
-                )}
+                {!selected.source.startsWith('builtin:') &&
+                  (confirmRemove === selected.name ? (
+                    <>
+                      <button
+                        className="subtle-button"
+                        disabled={working}
+                        onClick={() => setConfirmRemove(null)}
+                      >
+                        取消
+                      </button>
+                      <button
+                        className="danger-text"
+                        disabled={working}
+                        onClick={() =>
+                          void act<Skill[]>('removeSkill', { name: selected.name }, (value) => {
+                            changed(value);
+                            setSelected(null);
+                            setConfirmRemove(null);
+                          })
+                        }
+                      >
+                        确认卸载
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className="danger-text"
+                      disabled={working}
+                      onClick={() => setConfirmRemove(selected.name)}
+                    >
+                      卸载
+                    </button>
+                  ))}
               </div>
             </div>
           )}

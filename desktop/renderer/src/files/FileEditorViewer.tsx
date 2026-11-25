@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useMemo, useRef } from 'react';
 import { FileCode, Code2, GitCompare, RotateCcw, Save } from 'lucide-react';
 import { computeLineDiff } from './line-diff.js';
 
@@ -7,6 +7,7 @@ export type OpenFile = {
   content: string;
   originalContent: string;
   baselineContent?: string;
+  eol?: '\r\n' | '\n';
   truncated: boolean;
   mode?: 'edit' | 'diff';
   readOnlyReason?: string;
@@ -45,7 +46,7 @@ function tokenizeLine(line: string): Token[] {
   return parts;
 }
 
-function HighlightedTokens({ text }: { text: string }) {
+const HighlightedTokens = React.memo(function HighlightedTokens({ text }: { text: string }) {
   if (!text) return <span>&nbsp;</span>;
   const tokens = tokenizeLine(text);
   return (
@@ -57,7 +58,7 @@ function HighlightedTokens({ text }: { text: string }) {
       ))}
     </>
   );
-}
+});
 
 export function FileEditorViewer({
   file,
@@ -75,20 +76,27 @@ export function FileEditorViewer({
   saving: boolean;
 }) {
   const isDirty = file.content !== file.originalContent;
-  const diffResult = computeLineDiff(file.baselineContent ?? file.originalContent, file.content);
+  const diffBase = file.baselineContent ?? file.originalContent;
+  const diffResult = useMemo(
+    () => computeLineDiff(diffBase, file.content),
+    [diffBase, file.content],
+  );
   const mode = file.mode ?? 'edit';
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
 
-  const addedLines = new Set<number>();
-  for (const item of diffResult.diff) {
-    if (item.type === 'added' && item.newLine !== undefined) {
-      addedLines.add(item.newLine);
+  const addedLines = useMemo(() => {
+    const set = new Set<number>();
+    for (const item of diffResult.diff) {
+      if (item.type === 'added' && item.newLine !== undefined) {
+        set.add(item.newLine);
+      }
     }
-  }
+    return set;
+  }, [diffResult]);
 
-  const lines = file.content.split('\n');
+  const lines = useMemo(() => file.content.split('\n'), [file.content]);
 
   const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
     const { scrollTop, scrollLeft } = e.currentTarget;
@@ -100,9 +108,9 @@ export function FileEditorViewer({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
-      if (isDirty && !file.truncated && !file.readOnlyReason) onSave();
+      if (isDirty && !saving && !file.truncated && !file.readOnlyReason) onSave();
       return;
     }
     if (file.truncated || file.readOnlyReason) return;
@@ -115,9 +123,28 @@ export function FileEditorViewer({
       if (!e.shiftKey) {
         const next = val.substring(0, start) + '  ' + val.substring(end);
         onContentChange(next);
-        setTimeout(() => {
-          ta.selectionStart = ta.selectionEnd = start + 2;
-        }, 0);
+        requestAnimationFrame(() => {
+          if (textareaRef.current === ta) ta.selectionStart = ta.selectionEnd = start + 2;
+        });
+      } else {
+        const lineStart = val.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+        const linePrefix = val.slice(lineStart, lineStart + 2);
+        const removed =
+          linePrefix === '  '
+            ? 2
+            : linePrefix.startsWith(' ') || linePrefix.startsWith('\t')
+              ? 1
+              : 0;
+        if (removed > 0) {
+          const next = val.slice(0, lineStart) + val.slice(lineStart + removed);
+          onContentChange(next);
+          requestAnimationFrame(() => {
+            if (textareaRef.current === ta) {
+              ta.selectionStart = Math.max(lineStart, start - removed);
+              ta.selectionEnd = Math.max(lineStart, end - removed);
+            }
+          });
+        }
       }
     }
   };

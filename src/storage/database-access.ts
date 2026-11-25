@@ -19,7 +19,9 @@ function alive(pid: unknown): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return false;
+    if (code === 'EPERM') return true;
     throw error;
   }
 }
@@ -49,8 +51,8 @@ function claim(filename: string, maintenance: boolean): () => void {
   let released = false;
   return () => {
     if (!released) {
-      fs.unlinkSync(file);
       released = true;
+      fs.rmSync(file, { force: true });
     }
   };
 }

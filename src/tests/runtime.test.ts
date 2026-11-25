@@ -1531,3 +1531,115 @@ test('save_memory rethrows unexpected store/database errors instead of returning
     await services.close();
   }
 });
+
+test('spawn_subagent rejects a Bruin worktree belonging to a different Git repository', async () => {
+  const f = fixture();
+  const repoA = path.join(f.dir, 'repo-a');
+  const repoB = path.join(f.dir, 'repo-b');
+  for (const repo of [repoA, repoB]) {
+    fs.mkdirSync(repo);
+    execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'README.md'), path.basename(repo));
+    execFileSync('git', ['add', 'README.md'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+  }
+  const sessionA = f.store.createSession(fs.realpathSync(repoA), f.session.profile);
+  const sessionB = f.store.createSession(fs.realpathSync(repoB), f.session.profile);
+  const executor: ToolExecutor = {
+    async execute() {
+      return { output: 'done', isError: false };
+    },
+    async close() {},
+  };
+  const services = new RuntimeServices(f.store, executor, async () => {});
+  try {
+    const created = await services.execute(
+      { id: 'wt-b', name: 'create_worktree', input: { name: 'other-repo-wt' } },
+      sessionB,
+      new AbortController().signal,
+    );
+    assert.equal(created.isError, false, created.output);
+    const rejected = await services.execute(
+      {
+        id: 'spawn-cross-repo',
+        name: 'spawn_subagent',
+        input: { prompt: 'inspect', worktree: created.output },
+      },
+      sessionA,
+      new AbortController().signal,
+    );
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.output, /不属于当前仓库/);
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
+
+test('McpManager reconnects after a stdio server exits and does not deadlock on heavy stderr', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-mcp-reconnect-'));
+  const marker = path.join(dir, 'starts.txt');
+  const script = path.join(dir, 'server.mjs');
+  fs.writeFileSync(
+    script,
+    `
+import fs from 'node:fs';
+import readline from 'node:readline';
+fs.appendFileSync(${JSON.stringify(marker)}, 'start\\n');
+// Write > 128 KB to stderr to ensure unconsumed stderr never deadlocks the pipe.
+process.stderr.write('x'.repeat(150_000) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: {
+        protocolVersion: msg.params?.protocolVersion ?? '2025-03-26',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'noisy', version: '1.0.0' },
+      },
+    }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: { tools: [{ name: 'crash', description: 'exit now', inputSchema: { type: 'object' } }] },
+    }) + '\\n');
+  } else if (msg.method === 'tools/call') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: { content: [{ type: 'text', text: 'exiting' }] },
+    }) + '\\n');
+    setTimeout(() => process.exit(0), 20);
+  }
+});
+`,
+  );
+  const manager = new McpManager();
+  const server = mcpServerSchema.parse({
+    name: 'noisy',
+    transport: 'stdio',
+    command: process.execPath,
+    args: [script],
+    envNames: [],
+  });
+  try {
+    const tools = await manager.listTools(server, dir);
+    assert.equal(tools[0]?.name, 'crash');
+    const call = await manager.callTool(server, 'crash', {}, dir);
+    assert.equal(call.isError, false);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const afterReconnect = await manager.listTools(server, dir);
+    assert.equal(afterReconnect[0]?.name, 'crash');
+    assert.equal(fs.readFileSync(marker, 'utf8').trim().split('\n').length, 2);
+  } finally {
+    await manager.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

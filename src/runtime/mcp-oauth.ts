@@ -40,7 +40,9 @@ export class McpOAuthSession implements OAuthClientProvider {
   private discovery?: OAuthDiscoveryState;
   private redirect?: (url: URL) => Promise<void>;
   private cancelPending?: () => void;
+  private cancelled = false;
   cancelLogin() {
+    this.cancelled = true;
     this.cancelPending?.();
   }
   constructor(
@@ -129,6 +131,7 @@ export class McpOAuthSession implements OAuthClientProvider {
     port = 0,
     timeoutMs = 120_000,
   ) {
+    this.cancelled = false;
     this.nonce = randomBytes(32).toString('hex');
     let resolve!: (params: URLSearchParams) => void;
     let reject!: (error: Error) => void;
@@ -180,22 +183,26 @@ export class McpOAuthSession implements OAuthClientProvider {
       server.once('error', fail);
       server.listen(port, '127.0.0.1', ok);
     });
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('OAuth 回调监听失败');
-    this.redirectUrl = `http://127.0.0.1:${address.port}/callback`;
-    const controller = new AbortController();
-    this.cancelPending = () => {
-      controller.abort();
-      reject(new Error('OAuth 登录已取消'));
-    };
-    const timer = setTimeout(() => {
-      controller.abort();
-      reject(new Error('OAuth 登录超时'));
-    }, timeoutMs);
-    const fetchFn: typeof fetch = (input, init) =>
-      fetch(input, { ...init, signal: controller.signal });
-    this.redirect = async (url) => open(url.href);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      if (this.cancelled) throw new Error('OAuth 登录已取消');
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('OAuth 回调监听失败');
+      this.redirectUrl = `http://127.0.0.1:${address.port}/callback`;
+      const controller = new AbortController();
+      this.cancelPending = () => {
+        controller.abort();
+        reject(new Error('OAuth 登录已取消'));
+      };
+      if (this.cancelled) throw new Error('OAuth 登录已取消');
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error('OAuth 登录超时'));
+      }, timeoutMs);
+      timer.unref();
+      const fetchFn: typeof fetch = (input, init) =>
+        fetch(input, { ...init, signal: controller.signal });
+      this.redirect = async (url) => open(url.href);
       const response = await fetchFn(serverUrl, { method: 'GET' });
       const challenge = response.status === 401 ? extractWWWAuthenticateParams(response) : {};
       await response.body?.cancel();

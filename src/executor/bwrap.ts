@@ -3,13 +3,22 @@ export function workspaceMounts(
   options: { privateTmp: boolean; sharedScratch?: string },
 ): string[] {
   const workspaceBind = ['--bind', workspace, workspace];
+  const scratch =
+    options.sharedScratch && !(options.privateTmp && options.sharedScratch === '/tmp')
+      ? options.sharedScratch
+      : undefined;
+  const scratchInsidePrivateTmp = Boolean(
+    options.privateTmp && scratch && scratch.startsWith('/tmp/'),
+  );
+  const scratchBind = scratch ? ['--bind', scratch, scratch] : [];
   const otherMounts = [
-    ...(options.sharedScratch ? ['--bind', options.sharedScratch, options.sharedScratch] : []),
+    ...(!scratchInsidePrivateTmp ? scratchBind : []),
     '--dev',
     '/dev',
     '--proc',
     '/proc',
     ...(options.privateTmp ? ['--tmpfs', '/tmp'] : []),
+    ...(scratchInsidePrivateTmp ? scratchBind : []),
   ];
   // Bind a workspace inside /tmp after its parent so the private mount doesn't hide it.
   const insidePrivateTmp =

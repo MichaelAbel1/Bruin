@@ -119,11 +119,16 @@ export class McpManager {
     }
   }
 
-  private async connect(server: McpServerConfig, workspace?: string): Promise<Client> {
+  private async connect(
+    server: McpServerConfig,
+    workspace?: string,
+    signal?: AbortSignal,
+  ): Promise<Client> {
     if (this.closing) throw new Error('MCP 管理器已关闭');
+    if (signal?.aborted) throw new Error('已取消');
     const previous = this.connecting.get(server.name);
     const pending = (previous?.catch(() => {}) ?? Promise.resolve()).then(() =>
-      this.connectUnshared(server, workspace),
+      this.connectUnshared(server, workspace, signal),
     );
     this.connecting.set(server.name, pending);
     try {
@@ -133,8 +138,13 @@ export class McpManager {
     }
   }
 
-  private async connectUnshared(server: McpServerConfig, workspace?: string): Promise<Client> {
+  private async connectUnshared(
+    server: McpServerConfig,
+    workspace?: string,
+    signal?: AbortSignal,
+  ): Promise<Client> {
     if (this.closing) throw new Error('MCP 管理器已关闭');
+    if (signal?.aborted) throw new Error('已取消');
     // Direct library callers predating workspace support use the server script's directory.
     // Desktop and agent calls always pass the selected session workspace explicitly.
     const script =
@@ -203,7 +213,7 @@ export class McpManager {
               .map((name) => [name, this.sessionEnv[server.name]?.[name] ?? process.env[name]!]),
           ),
         },
-        stderr: 'pipe',
+        stderr: 'ignore',
         maxBufferSize: 1_000_000,
       });
     } else {
@@ -229,8 +239,15 @@ export class McpManager {
           : {}),
       });
     }
+    client.onclose = () => {
+      if (this.clients.get(server.name)?.client === client) this.clients.delete(server.name);
+    };
     try {
-      await client.connect(transport, { timeout: 10_000, maxTotalTimeout: 10_000 });
+      await client.connect(transport, {
+        timeout: 10_000,
+        maxTotalTimeout: 10_000,
+        ...(signal ? { signal } : {}),
+      });
       this.clients.set(server.name, { client, signature });
       return client;
     } catch (error) {
@@ -283,12 +300,16 @@ export class McpManager {
   async listTools(
     server: McpServerConfig,
     workspace?: string,
+    signal?: AbortSignal,
   ): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
+    if (signal?.aborted) throw new Error('已取消');
     return this.serialize(server.name, async () => {
-      const client = await this.connect(server, workspace);
+      if (signal?.aborted) throw new Error('已取消');
+      const client = await this.connect(server, workspace, signal);
       const result = await client.listTools(undefined, {
         timeout: 10_000,
         maxTotalTimeout: 10_000,
+        ...(signal ? { signal } : {}),
       });
       return result.tools.map(({ name, description, inputSchema }) => ({
         name,
@@ -303,18 +324,26 @@ export class McpManager {
     name: string,
     args: Record<string, unknown>,
     workspace?: string,
+    signal?: AbortSignal,
   ): Promise<{ output: string; isError: boolean; truncated?: boolean }> {
+    if (signal?.aborted) throw new Error('已取消');
     return this.serialize(server.name, async () => {
-      const client = await this.connect(server, workspace);
+      if (signal?.aborted) throw new Error('已取消');
+      const client = await this.connect(server, workspace, signal);
       const available = await client.listTools(undefined, {
         timeout: 10_000,
         maxTotalTimeout: 10_000,
+        ...(signal ? { signal } : {}),
       });
       if (!available.tools.some((tool) => tool.name === name))
         return { output: `MCP 工具不存在: ${name}`, isError: true };
       const result = await client.callTool(
         { name, arguments: args },
-        { timeout: 30_000, maxTotalTimeout: 30_000 },
+        {
+          timeout: 30_000,
+          maxTotalTimeout: 30_000,
+          ...(signal ? { signal } : {}),
+        },
       );
       const serialized = JSON.stringify(result);
       const limit = 100_000;

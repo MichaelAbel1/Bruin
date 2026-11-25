@@ -120,8 +120,11 @@ export function buildPrompt(
   let remainingCurrentAttachmentText = 60_000;
   const pendingCalls = new Map<string, ToolCall>();
   const completedCalls = new Map<string, ModelMessage>();
+  const flushedCallIds = new Set<string>();
+  const deferredMessages: ModelMessage[] = [];
   const flushPendingCalls = () => {
     for (const [id, call] of pendingCalls.entries()) {
+      flushedCallIds.add(id);
       const completed = completedCalls.get(id);
       if (completed) {
         messages.push(completed);
@@ -144,13 +147,20 @@ export function buildPrompt(
     }
     pendingCalls.clear();
     completedCalls.clear();
+    if (deferredMessages.length) {
+      messages.push(...deferredMessages);
+      deferredMessages.length = 0;
+    }
   };
   for (const event of events) {
-    if (event.type === 'workspace_changed')
-      messages.push({
+    if (event.type === 'workspace_changed') {
+      const workspaceNote: ModelMessage = {
         role: 'user',
         content: `The active workspace changed to ${String(event.payload.workspace ?? '')}. Earlier file references may belong to the previous workspace. Inspect the current workspace before editing.`,
-      });
+      };
+      if (pendingCalls.size > 0) deferredMessages.push(workspaceNote);
+      else messages.push(workspaceNote);
+    }
     if (event.type === 'user') {
       flushPendingCalls();
       const quote = event.payload.quote as { text?: string; seq?: number } | undefined;
@@ -278,8 +288,8 @@ export function buildPrompt(
     ) {
       const callId = String(event.payload.callId || 'call');
       const pending = pendingCalls.get(callId);
-      // Standalone desktop actions have no corresponding model tool call.
-      if (!pending && desktopCalls.has(callId)) continue;
+      // Standalone desktop actions or already-flushed calls have no pending model tool call.
+      if (!pending && (desktopCalls.has(callId) || flushedCallIds.has(callId))) continue;
       const toolName = String(event.payload.name || pending?.name || 'tool');
       const result: ModelMessage = {
         role: 'tool',

@@ -412,3 +412,31 @@ test('tool result reconstruction falls back to pending call name or "tool" when 
   const result2 = (toolMessages[1].content as Array<{ type: string; toolName: string }>)[0];
   assert.equal(result2.toolName, 'tool');
 });
+
+test('workspace_changed between assistant tool-call and tool result preserves tool adjacency', () => {
+  const event = (
+    seq: number,
+    type: SessionEvent['type'],
+    payload: Record<string, unknown>,
+  ): SessionEvent => ({ sessionId: 'ws-mid-tool', seq, type, at: '', payload });
+
+  const messages = buildPrompt(
+    [
+      event(1, 'user', { text: 'check files' }),
+      event(2, 'assistant', {
+        text: '',
+        calls: [{ id: 'c1', name: 'read_file', input: { path: 'a.txt' } }],
+      }),
+      event(3, 'workspace_changed', { previous: '/repo-a', workspace: '/repo-b' }),
+      event(4, 'tool_unknown', { callId: 'c1', name: 'read_file', output: 'interrupted' }),
+      event(5, 'user', { text: 'continue' }),
+    ],
+    'rules',
+  );
+
+  assert.deepEqual(
+    messages.map((m) => m.role),
+    ['system', 'user', 'assistant', 'tool', 'user', 'user'],
+  );
+  assert.match(String(messages[4].content), /workspace changed to \/repo-b/i);
+});

@@ -190,7 +190,18 @@ export function withFileLock<T>(
         0o600,
       );
       myLockToken = `${process.pid}\n${Date.now()}`;
-      fs.writeSync(fd, myLockToken);
+      try {
+        fs.writeSync(fd, myLockToken);
+      } catch (writeErr) {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+        fd = null;
+        try {
+          fs.unlinkSync(lockFile);
+        } catch {}
+        throw writeErr;
+      }
       break;
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;

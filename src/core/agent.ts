@@ -429,8 +429,9 @@ export class AgentRunner {
       checkBudget();
       try {
         return await operation();
-      } finally {
+      } catch (error) {
         checkBudget();
+        throw error;
       }
     };
     const summaryAttempts: SummaryAttempts = {
@@ -940,6 +941,7 @@ export class AgentRunner {
             });
             askedQuestion = true;
           }
+          settledCalls.add(call.id);
           return;
         }
         const policy =
@@ -1119,8 +1121,15 @@ export class AgentRunner {
                 },
                 signal,
               );
-              if (call.name === 'read_file' && !result.isError && result.fileVersion)
+              if (
+                (call.name === 'read_file' ||
+                  call.name === 'write_file' ||
+                  call.name === 'edit_file') &&
+                !result.isError &&
+                result.fileVersion
+              )
                 fileVersions.set(versionKey, result.fileVersion);
+              else if (call.name === 'restore_snapshot' && !result.isError) fileVersions.clear();
             }
           }
           this.store.append(session.id, 'tool_finished', {
@@ -1190,14 +1199,29 @@ export class AgentRunner {
           throw failed ? failure : new Error('已取消');
         }
       } else {
-        for (const [index, call] of reply!.calls.entries()) {
-          if (askedQuestion)
-            this.store.append(session.id, 'tool_denied', {
-              callId: call.id,
-              name: call.name,
-              output: '任务已暂停等待用户答复，此工具尚未开始执行',
-            });
-          else await executeCall(call, index);
+        try {
+          for (const [index, call] of reply!.calls.entries()) {
+            if (askedQuestion) {
+              this.store.append(session.id, 'tool_denied', {
+                callId: call.id,
+                name: call.name,
+                output: '任务已暂停等待用户答复，此工具尚未开始执行',
+              });
+              settledCalls.add(call.id);
+            } else await executeCall(call, index);
+          }
+        } catch (error) {
+          for (const pending of reply!.calls) {
+            if (!startedCalls.has(pending.id) && !settledCalls.has(pending.id)) {
+              this.store.append(session.id, 'tool_denied', {
+                callId: pending.id,
+                name: pending.name,
+                output: '工具批次已停止，此工具尚未开始执行',
+              });
+              settledCalls.add(pending.id);
+            }
+          }
+          throw error;
         }
       }
       if (askedQuestion) return;

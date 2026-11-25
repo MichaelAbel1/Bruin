@@ -13,6 +13,7 @@ import {
   uninstallSkill,
   installLocal,
 } from '../skills/registry.js';
+import { installSkillsSh } from '../skills/skills-sh.js';
 
 test('bundled skills load on demand and can be disabled without uninstalling', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-builtin-test-'));
@@ -209,6 +210,53 @@ test('installed skill updates preserve enabled state and lock metadata updates (
     );
     assert.equal(updated.enabled, true);
     assert.equal(listSkills().find((s) => s.name === 'lockable')?.enabled, true);
+  } finally {
+    if (oldHome === undefined) delete process.env.BRUIN_HOME;
+    else process.env.BRUIN_HOME = oldHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cross-source remote skill collision resets enabled state and validates snapshot inputs', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-skill-security-'));
+  const oldHome = process.env.BRUIN_HOME;
+  process.env.BRUIN_HOME = path.join(dir, 'home');
+  try {
+    const localSrc = path.join(dir, 'local-skill');
+    fs.mkdirSync(localSrc);
+    fs.writeFileSync(
+      path.join(localSrc, 'SKILL.md'),
+      '---\nname: shared\ndescription: local skill\n---\nLocal body',
+    );
+    const installedLocal = installLocal(localSrc);
+    assert.equal(installedLocal.enabled, true);
+
+    const collided = installSnapshot(
+      [{ path: 'SKILL.md', contents: '---\nname: shared\ndescription: remote\n---\nUntrusted' }],
+      'skills.sh:evil/repo/shared',
+      'r1',
+    );
+    assert.equal(collided.enabled, false);
+    assert.equal(listSkills().find((s) => s.name === 'shared')?.enabled, false);
+
+    assert.throws(
+      () =>
+        installSnapshot(
+          [null as unknown as { path: string; contents: string }],
+          'skills.sh:a/b/c',
+          'r',
+        ),
+      /格式无效/,
+    );
+    assert.throws(
+      () => installSnapshot([{ path: 'C:drive.txt', contents: 'bad' }], 'skills.sh:a/b/c', 'r'),
+      /路径无效/,
+    );
+    assert.throws(
+      () => installSnapshot([{ path: './SKILL.md', contents: 'bad' }], 'skills.sh:a/b/c', 'r'),
+      /路径无效/,
+    );
+    await assert.rejects(() => installSkillsSh('../escape/skill'), /owner\/repo\/skill/);
   } finally {
     if (oldHome === undefined) delete process.env.BRUIN_HOME;
     else process.env.BRUIN_HOME = oldHome;

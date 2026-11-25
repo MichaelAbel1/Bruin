@@ -6,7 +6,7 @@ import type { AttachmentRef } from '../../../../src/core/attachments.js';
 import type { SessionEvent } from './events.js';
 import { date } from '../formatting.js';
 
-export function MarkdownMessage({ text }: { text: string }) {
+export const MarkdownMessage = React.memo(function MarkdownMessage({ text }: { text: string }) {
   return (
     <div className="message-text markdown-body">
       <ReactMarkdown
@@ -28,9 +28,13 @@ export function MarkdownMessage({ text }: { text: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
-export function ToolActivity({ events }: { events: SessionEvent[] }) {
+export const ToolActivity = React.memo(function ToolActivity({
+  events,
+}: {
+  events: SessionEvent[];
+}) {
   const results = events.filter((event) =>
     ['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type),
   );
@@ -53,15 +57,17 @@ export function ToolActivity({ events }: { events: SessionEvent[] }) {
       </summary>
       <div className="tool-activity-list">
         {results.map((event) => (
-          <EventCard key={event.seq} event={event} onQuote={() => {}} />
+          <EventCard key={event.seq} event={event} onQuote={noopQuote} />
         ))}
         {pending > 0 && <small>{pending} 项调用尚无结果</small>}
       </div>
     </details>
   );
-}
+});
 
-export function EventCard({
+const noopQuote = () => {};
+
+export const EventCard = React.memo(function EventCard({
   event,
   onQuote,
 }: {
@@ -176,4 +182,4 @@ export function EventCard({
       <pre>{String(event.payload.output ?? '')}</pre>
     </details>
   );
-}
+});

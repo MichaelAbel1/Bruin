@@ -187,3 +187,24 @@ test('doctor does not migrate or expose legacy credentials', () => {
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test('backup and restore preserves builtin-skills.json settings', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-backup-builtin-'));
+  const home = path.join(base, 'home');
+  const archive = path.join(base, 'archive');
+  try {
+    fs.mkdirSync(home, { recursive: true });
+    const store = new SqliteEventStore(path.join(home, 'sessions.sqlite'));
+    store.close();
+    fs.writeFileSync(path.join(home, 'builtin-skills.json'), JSON.stringify({ debug: false }));
+    await createBackup(home, archive);
+    const preview = await previewBackup(archive);
+    fs.writeFileSync(path.join(home, 'builtin-skills.json'), JSON.stringify({ debug: true }));
+    await restoreBackup(home, archive, preview.confirmation);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'builtin-skills.json'), 'utf8')), {
+      debug: false,
+    });
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

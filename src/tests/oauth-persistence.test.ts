@@ -110,7 +110,18 @@ test('desktop stores OAuth separately through safeStorage and restores only over
     assert.equal(fs.existsSync(path.join(dir, 'keys.enc.json')), false);
     await vm.runInContext('restoreStoredOAuth()', context);
     assert.match(JSON.stringify(restored), /restoreMcpCredentials.*PRIVATE_OAUTH_TOKEN/);
+    vm.runInContext(
+      `
+      updateStoredKey('corrupt', 'not-valid-json', false, oauthPath());
+    `,
+      context,
+    );
+    restored.length = 0;
+    await vm.runInContext('restoreStoredOAuth()', context);
+    assert.match(JSON.stringify(restored), /restoreMcpCredentials.*PRIVATE_OAUTH_TOKEN/);
+    assert.ok(vm.runInContext('startupWarnings.length > 0', context));
     vm.runInContext("updateStoredKey('notion', undefined, true, oauthPath())", context);
+    vm.runInContext("updateStoredKey('corrupt', undefined, true, oauthPath())", context);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'oauth.enc.json'), 'utf8')), {});
     vm.runInContext("safeStorage.getSelectedStorageBackend = () => 'basic_text'", context);
     assert.equal(vm.runInContext('secureStorageAvailable()', context), false);

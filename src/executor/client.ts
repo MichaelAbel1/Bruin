@@ -1,6 +1,7 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ToolRequest, ToolResponse, ToolResult } from '../core/types.js';
+import { dataDir } from '../config.js';
 
 export interface ToolExecutor {
   execute(request: ToolRequest, signal?: AbortSignal): Promise<ToolResult>;
@@ -32,7 +33,7 @@ export class ProcessExecutor implements ToolExecutor {
         PATH: process.env.PATH,
         TMPDIR: process.env.TMPDIR,
         LANG: process.env.LANG,
-        BRUIN_HOME: process.env.BRUIN_HOME,
+        BRUIN_HOME: dataDir(),
         BRUIN_ALLOW_UNSANDBOXED_SHELL: process.env.BRUIN_ALLOW_UNSANDBOXED_SHELL,
         BRUIN_ENFORCE_SANDBOX: process.env.BRUIN_ENFORCE_SANDBOX,
         BRUIN_SHELL_BACKEND: process.env.BRUIN_SHELL_BACKEND,
@@ -62,6 +63,7 @@ export class ProcessExecutor implements ToolExecutor {
     });
 
     child.on('error', (err) => {
+      if (child.pid === undefined) this.workers.delete(instance);
       for (const p of pending.values()) p.reject(err);
       pending.clear();
     });
@@ -122,8 +124,16 @@ export class ProcessExecutor implements ToolExecutor {
     this.closing = true;
     const exitPromises: Promise<void>[] = [];
     for (const worker of this.workers) {
-      if (worker.child.exitCode !== null || worker.child.signalCode !== null) continue;
-      const exited = new Promise<void>((resolve) => worker.child.once('exit', () => resolve()));
+      if (
+        worker.child.pid === undefined ||
+        worker.child.exitCode !== null ||
+        worker.child.signalCode !== null
+      )
+        continue;
+      const exited = new Promise<void>((resolve) => {
+        worker.child.once('exit', () => resolve());
+        worker.child.once('error', () => resolve());
+      });
       if (worker.child.connected) worker.child.disconnect();
       const timer = setTimeout(() => worker.child.kill('SIGKILL'), 12000);
       timer.unref();

@@ -601,7 +601,7 @@ pre {
   border-right: 1px solid #232a25;
   user-select: none;
   overflow: hidden;
-  padding: 10px 0;
+  padding: 10px 0 28px;
   box-sizing: border-box;
 }
 .gutter-row {
@@ -642,7 +642,7 @@ pre {
   left: 0;
   right: 0;
   bottom: 0;
-  padding: 10px 14px;
+  padding: 10px 14px 28px;
   overflow: hidden;
   pointer-events: none;
   white-space: pre;
@@ -655,6 +655,8 @@ pre {
 }
 .code-row {
   height: 20px;
+  min-width: 100%;
+  width: max-content;
   white-space: pre;
 }
 .code-row-added {
@@ -691,11 +693,9 @@ pre {
 /* IDEA Dark theme syntax highlighting */
 .token-keyword {
   color: #cc7832;
-  font-weight: 600;
 }
 .token-type {
   color: #e5c07b;
-  font-weight: 500;
 }
 .token-string {
   color: #6a8759;
@@ -709,7 +709,6 @@ pre {
 }
 .token-boolean {
   color: #cc7832;
-  font-weight: 600;
 }
 .token-function {
   color: #ffc66d;
@@ -2156,6 +2155,12 @@ pre {
 }
 .skill-copy {
   cursor: pointer;
+  background: transparent;
+  border: none;
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
 }
 .skill-copy em {
   font:
@@ -2829,7 +2834,6 @@ pre {
 }
 :root[data-theme='light'] .token-type {
   color: #000000;
-  font-weight: 600;
 }
 :root[data-theme='light'] .token-string {
   color: #067d17;

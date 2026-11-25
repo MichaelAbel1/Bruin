@@ -131,9 +131,14 @@ export function listWorkspaceChanges(
   for (const [relative, range] of writes) {
     const target = path.resolve(root, relative);
     if (!target.startsWith(root + path.sep)) continue;
-    const name = path.relative(root, target);
+    const name = path.relative(root, target).split(path.sep).join('/');
     const first = snapshots
-      .filter((item) => item.path === name && item.at >= range.from && item.at <= range.to)
+      .filter(
+        (item) =>
+          item.path.split(path.sep).join('/') === name &&
+          item.at >= range.from &&
+          item.at <= range.to,
+      )
       .at(-1);
     changes.set(name, {
       path: name,
@@ -221,8 +226,14 @@ export function readWorkspaceReview(
     )?.[1];
     if (range) {
       try {
+        const normalizedRelative = relative.split(path.sep).join('/');
         const snapshot = listSnapshots(workspace)
-          .filter((item) => item.path === relative && item.at >= range.from && item.at <= range.to)
+          .filter(
+            (item) =>
+              item.path.split(path.sep).join('/') === normalizedRelative &&
+              item.at >= range.from &&
+              item.at <= range.to,
+          )
           .at(-1);
         if (snapshot) baseline = previewSnapshot(workspace, snapshot.id);
       } catch {

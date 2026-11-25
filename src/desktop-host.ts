@@ -500,6 +500,9 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         memoryReviewRun = undefined;
       }
     }
+    case 'cancelMemoryReview':
+      memoryReviewRun?.controller.abort();
+      return { cancelled: Boolean(memoryReviewRun) };
     case 'discardMemoryReview':
       if (memoryReview && memoryReview.id === p.reviewId && memoryReview.sessionId === p.sessionId)
         memoryReview = undefined;
@@ -1280,17 +1283,30 @@ lines.on('line', (line) => {
   let request: Request;
   try {
     request = JSON.parse(line) as Request;
-    if (!request || typeof request !== 'object' || typeof request.method !== 'string') return;
+    if (!request || typeof request !== 'object' || Array.isArray(request)) return;
   } catch {
     return;
   }
-  void dispatch(request.method, request.params ?? {})
+  if (typeof request.method !== 'string') {
+    if (request.id !== undefined) send({ id: request.id, error: '无效的请求方法' });
+    return;
+  }
+  if (shuttingDown) {
+    if (request.id !== undefined) send({ id: request.id, error: 'Agent 后台进程正在关闭' });
+    return;
+  }
+  const params =
+    request.params && typeof request.params === 'object' && !Array.isArray(request.params)
+      ? request.params
+      : {};
+  void dispatch(request.method, params)
     .then((result) => send({ id: request.id, result }))
     .catch((error) =>
       send({ id: request.id, error: error instanceof Error ? error.message : String(error) }),
     );
 });
 async function shutdown() {
+  lines.close();
   clearInterval(scheduler);
   active?.controller.abort();
   memoryReviewRun?.controller.abort();

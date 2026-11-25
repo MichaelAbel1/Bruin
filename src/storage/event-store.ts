@@ -152,24 +152,28 @@ export class SqliteEventStore implements EventStore {
       created_at TEXT NOT NULL
     );`);
       if (schemaVersion < 6)
-        this.db.transaction(() => {
-          this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
+        this.db
+          .transaction(() => {
+            this.db.exec(`INSERT OR IGNORE INTO workspace_tasks
         (id, workspace, origin_session_id, title, description, dependencies_json, status, owner, expires_at, created_at, updated_at)
         SELECT t.id, s.workspace, t.session_id, t.title, '', t.dependencies_json,
           t.status, t.owner, t.expires_at, t.created_at, t.created_at
         FROM task_nodes t JOIN sessions s ON s.id = t.session_id`);
-          this.db.pragma('user_version = 6');
-        })();
+            this.db.pragma('user_version = 6');
+          })
+          .immediate();
       if (schemaVersion < 7) this.db.pragma('user_version = 7');
       if (schemaVersion < 8)
-        this.db.transaction(() => {
-          const columns = this.db.pragma('table_info(sessions)') as Array<{ name: string }>;
-          if (!columns.some((column) => column.name === 'managed_workspace'))
-            this.db.exec(
-              'ALTER TABLE sessions ADD COLUMN managed_workspace INTEGER NOT NULL DEFAULT 0',
-            );
-          this.db.pragma('user_version = 8');
-        })();
+        this.db
+          .transaction(() => {
+            const columns = this.db.pragma('table_info(sessions)') as Array<{ name: string }>;
+            if (!columns.some((column) => column.name === 'managed_workspace'))
+              this.db.exec(
+                'ALTER TABLE sessions ADD COLUMN managed_workspace INTEGER NOT NULL DEFAULT 0',
+              );
+            this.db.pragma('user_version = 8');
+          })
+          .immediate();
     } catch (error) {
       if (this.db?.open) this.db.close();
       this.releaseAccess();
@@ -220,22 +224,24 @@ export class SqliteEventStore implements EventStore {
   setWorkspace(id: string, workspace: string): void {
     const canonical = fs.realpathSync(workspace);
     if (!fs.statSync(canonical).isDirectory()) throw new Error('工作区必须是目录');
-    this.db.transaction(() => {
-      const session = this.getSession(id);
-      if (!session) throw new Error('会话不存在');
-      if (this.isLeased(id)) throw new Error('运行中的会话不能更换工作区');
-      const isSameWorkspace =
-        process.platform === 'win32'
-          ? session.workspace.toLowerCase() === canonical.toLowerCase()
-          : session.workspace === canonical;
-      if (isSameWorkspace && !session.managedWorkspace) return;
-      this.db
-        .prepare(
-          'UPDATE sessions SET workspace = ?, managed_workspace = 0, updated_at = ? WHERE id = ?',
-        )
-        .run(canonical, new Date().toISOString(), id);
-      this.append(id, 'workspace_changed', { previous: session.workspace, workspace: canonical });
-    })();
+    this.db
+      .transaction(() => {
+        const session = this.getSession(id);
+        if (!session) throw new Error('会话不存在');
+        if (this.isLeased(id)) throw new Error('运行中的会话不能更换工作区');
+        const isSameWorkspace =
+          process.platform === 'win32'
+            ? session.workspace.toLowerCase() === canonical.toLowerCase()
+            : session.workspace === canonical;
+        if (isSameWorkspace && !session.managedWorkspace) return;
+        this.db
+          .prepare(
+            'UPDATE sessions SET workspace = ?, managed_workspace = 0, updated_at = ? WHERE id = ?',
+          )
+          .run(canonical, new Date().toISOString(), id);
+        this.append(id, 'workspace_changed', { previous: session.workspace, workspace: canonical });
+      })
+      .immediate();
   }
   materializeWorkspace(id: string): void {
     const session = this.getSession(id);
@@ -265,17 +271,19 @@ export class SqliteEventStore implements EventStore {
       throw new Error('托管工作区路径已被替换');
   }
   setProfile(id: string, profile: ModelProfile, leaseOwner?: string): void {
-    this.db.transaction(() => {
-      if (!this.getSession(id)) throw new Error(`会话不存在: ${id}`);
-      const lease = this.db
-        .prepare('SELECT owner FROM session_leases WHERE session_id = ? AND expires_at >= ?')
-        .get(id, Date.now()) as { owner: string } | undefined;
-      if (lease && lease.owner !== leaseOwner) throw new Error('此会话正在另一个进程中运行');
-      this.db
-        .prepare('UPDATE sessions SET profile_json = ? WHERE id = ?')
-        .run(JSON.stringify(profile), id);
-      this.append(id, 'model_switched', { profile });
-    })();
+    this.db
+      .transaction(() => {
+        if (!this.getSession(id)) throw new Error(`会话不存在: ${id}`);
+        const lease = this.db
+          .prepare('SELECT owner FROM session_leases WHERE session_id = ? AND expires_at >= ?')
+          .get(id, Date.now()) as { owner: string } | undefined;
+        if (lease && lease.owner !== leaseOwner) throw new Error('此会话正在另一个进程中运行');
+        this.db
+          .prepare('UPDATE sessions SET profile_json = ? WHERE id = ?')
+          .run(JSON.stringify(profile), id);
+        this.append(id, 'model_switched', { profile });
+      })
+      .immediate();
   }
   listSessions(): Session[] {
     return this.db
@@ -284,14 +292,16 @@ export class SqliteEventStore implements EventStore {
       .map((x) => this.rowToSession(x));
   }
   deleteSession(id: string): void {
-    this.db.transaction(() => {
-      if (!this.getSession(id)) throw new Error(`会话不存在: ${id}`);
-      if (this.isLeased(id)) throw new Error('运行中的会话不能删除');
-      this.db.prepare('DELETE FROM events WHERE session_id = ?').run(id);
-      this.db.prepare('DELETE FROM task_nodes WHERE session_id = ?').run(id);
-      this.db.prepare('DELETE FROM cron_jobs WHERE session_id = ?').run(id);
-      this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
-    })();
+    this.db
+      .transaction(() => {
+        if (!this.getSession(id)) throw new Error(`会话不存在: ${id}`);
+        if (this.isLeased(id)) throw new Error('运行中的会话不能删除');
+        this.db.prepare('DELETE FROM events WHERE session_id = ?').run(id);
+        this.db.prepare('DELETE FROM task_nodes WHERE session_id = ?').run(id);
+        this.db.prepare('DELETE FROM cron_jobs WHERE session_id = ?').run(id);
+        this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+      })
+      .immediate();
     try {
       deleteAttachments(id);
     } catch (error) {
@@ -450,38 +460,40 @@ export class SqliteEventStore implements EventStore {
       throw new Error('无效任务');
     this.ensureTaskDirectory(workspace);
     this.syncTaskFiles(workspace);
-    const id = this.db.transaction(() => {
-      const count = (
+    const id = this.db
+      .transaction(() => {
+        const count = (
+          this.db
+            .prepare('SELECT COUNT(*) AS n FROM workspace_tasks WHERE workspace = ?')
+            .get(workspace) as { n: number }
+        ).n;
+        if (count >= 200) throw new Error('工作区任务已达到 200 项上限');
+        for (const dependency of dependencies)
+          if (
+            !this.db
+              .prepare('SELECT 1 FROM workspace_tasks WHERE id = ? AND workspace = ?')
+              .get(dependency, workspace)
+          )
+            throw new Error('依赖任务不存在或不属于当前工作区');
+        const id = randomUUID();
+        const now = new Date().toISOString();
         this.db
-          .prepare('SELECT COUNT(*) AS n FROM workspace_tasks WHERE workspace = ?')
-          .get(workspace) as { n: number }
-      ).n;
-      if (count >= 200) throw new Error('工作区任务已达到 200 项上限');
-      for (const dependency of dependencies)
-        if (
-          !this.db
-            .prepare('SELECT 1 FROM workspace_tasks WHERE id = ? AND workspace = ?')
-            .get(dependency, workspace)
-        )
-          throw new Error('依赖任务不存在或不属于当前工作区');
-      const id = randomUUID();
-      const now = new Date().toISOString();
-      this.db
-        .prepare(
-          `INSERT INTO workspace_tasks VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`,
-        )
-        .run(
-          id,
-          workspace,
-          sessionId,
-          title.trim(),
-          description.trim(),
-          JSON.stringify(dependencies),
-          now,
-          now,
-        );
-      return id;
-    })();
+          .prepare(
+            `INSERT INTO workspace_tasks VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`,
+          )
+          .run(
+            id,
+            workspace,
+            sessionId,
+            title.trim(),
+            description.trim(),
+            JSON.stringify(dependencies),
+            now,
+            now,
+          );
+        return id;
+      })
+      .immediate();
     this.repairTaskFiles(workspace);
     return this.taskRows(workspace).find((task) => task.id === id)!;
   }
@@ -498,82 +510,87 @@ export class SqliteEventStore implements EventStore {
   updateTask(sessionId: string, id: string, update: TaskUpdate): TaskNode {
     const workspace = this.taskWorkspace(sessionId);
     this.syncTaskFiles(workspace);
-    this.db.transaction(() => {
-      const tasks = this.taskRows(workspace);
-      const current = tasks.find((task) => task.id === id);
-      if (!current) throw new Error('任务不存在或不属于当前工作区');
-      if (
-        update.title === undefined &&
-        update.description === undefined &&
-        update.addBlockedBy === undefined
-      )
-        throw new Error('没有任务修改内容');
-      const title = update.title ?? current.title;
-      const description = update.description ?? current.description;
-      if (!title.trim() || title.length > 500 || description.length > 8000)
-        throw new Error('无效任务内容');
-      const additions = update.addBlockedBy ?? [];
-      if (!Array.isArray(additions) || additions.some((dep) => typeof dep !== 'string'))
-        throw new Error('无效依赖任务');
-      const dependencies = [...new Set([...current.dependencies, ...additions])];
-      if (dependencies.length > 30) throw new Error('任务依赖已达到 30 项上限');
-      if (additions.length && current.status !== 'pending')
-        throw new Error('只能修改待执行任务的依赖');
-      const byId = new Map(tasks.map((task) => [task.id, task]));
-      for (const dependency of dependencies) {
-        if (!byId.has(dependency)) throw new Error('依赖任务不存在或不属于当前工作区');
-        const visited = new Set<string>();
-        const stack = [dependency];
-        while (stack.length) {
-          const node = stack.pop()!;
-          if (node === id) throw new Error('任务依赖会形成环');
-          if (visited.has(node)) continue;
-          visited.add(node);
-          stack.push(...(byId.get(node)?.dependencies ?? []));
-        }
-      }
-      this.db
-        .prepare(
-          `UPDATE workspace_tasks SET title = ?, description = ?, dependencies_json = ?, updated_at = ? WHERE id = ?`,
+    this.db
+      .transaction(() => {
+        const tasks = this.taskRows(workspace);
+        const current = tasks.find((task) => task.id === id);
+        if (!current) throw new Error('任务不存在或不属于当前工作区');
+        if (
+          update.title === undefined &&
+          update.description === undefined &&
+          update.addBlockedBy === undefined
         )
-        .run(
-          title.trim(),
-          description.trim(),
-          JSON.stringify(dependencies),
-          new Date().toISOString(),
-          id,
-        );
-    })();
+          throw new Error('没有任务修改内容');
+        const title = update.title ?? current.title;
+        const description = update.description ?? current.description;
+        if (!title.trim() || title.length > 500 || description.length > 8000)
+          throw new Error('无效任务内容');
+        const additions = update.addBlockedBy ?? [];
+        if (!Array.isArray(additions) || additions.some((dep) => typeof dep !== 'string'))
+          throw new Error('无效依赖任务');
+        const dependencies = [...new Set([...current.dependencies, ...additions])];
+        if (dependencies.length > 30) throw new Error('任务依赖已达到 30 项上限');
+        if (additions.length && current.status !== 'pending')
+          throw new Error('只能修改待执行任务的依赖');
+        const byId = new Map(tasks.map((task) => [task.id, task]));
+        for (const dependency of dependencies) {
+          if (!byId.has(dependency)) throw new Error('依赖任务不存在或不属于当前工作区');
+          const visited = new Set<string>();
+          const stack = [dependency];
+          while (stack.length) {
+            const node = stack.pop()!;
+            if (node === id) throw new Error('任务依赖会形成环');
+            if (visited.has(node)) continue;
+            visited.add(node);
+            stack.push(...(byId.get(node)?.dependencies ?? []));
+          }
+        }
+        this.db
+          .prepare(
+            `UPDATE workspace_tasks SET title = ?, description = ?, dependencies_json = ?, updated_at = ? WHERE id = ?`,
+          )
+          .run(
+            title.trim(),
+            description.trim(),
+            JSON.stringify(dependencies),
+            new Date().toISOString(),
+            id,
+          );
+      })
+      .immediate();
     this.repairTaskFiles(workspace);
     return this.taskRows(workspace).find((task) => task.id === id)!;
   }
   claimTask(sessionId: string, owner: string, ttlMs: number): TaskNode | undefined {
     if (!owner || ttlMs < 1000 || ttlMs > 3600000) throw new Error('无效任务租约');
     const workspace = this.taskWorkspace(sessionId);
-    const id = this.db.transaction(() => {
-      this.db
-        .prepare(
-          `UPDATE workspace_tasks SET status = 'unknown', owner = NULL, expires_at = NULL, updated_at = ?
+    const id = this.db
+      .transaction(() => {
+        this.db
+          .prepare(
+            `UPDATE workspace_tasks SET status = 'unknown', owner = NULL, expires_at = NULL, updated_at = ?
         WHERE workspace = ? AND status = 'running' AND expires_at < ?`,
-        )
-        .run(new Date().toISOString(), workspace, Date.now());
-      const tasks = this.taskRows(workspace);
-      const held = tasks.find((task) => task.status === 'running' && task.owner === owner);
-      if (held) return undefined;
-      const completed = new Set(
-        tasks.filter((task) => task.status === 'completed').map((task) => task.id),
-      );
-      const candidate = tasks.find(
-        (task) => task.status === 'pending' && task.dependencies.every((dep) => completed.has(dep)),
-      );
-      if (!candidate) return undefined;
-      this.db
-        .prepare(
-          `UPDATE workspace_tasks SET status = 'running', owner = ?, expires_at = ?, updated_at = ? WHERE id = ?`,
-        )
-        .run(owner, Date.now() + ttlMs, new Date().toISOString(), candidate.id);
-      return candidate.id;
-    })();
+          )
+          .run(new Date().toISOString(), workspace, Date.now());
+        const tasks = this.taskRows(workspace);
+        const held = tasks.find((task) => task.status === 'running' && task.owner === owner);
+        if (held) return undefined;
+        const completed = new Set(
+          tasks.filter((task) => task.status === 'completed').map((task) => task.id),
+        );
+        const candidate = tasks.find(
+          (task) =>
+            task.status === 'pending' && task.dependencies.every((dep) => completed.has(dep)),
+        );
+        if (!candidate) return undefined;
+        this.db
+          .prepare(
+            `UPDATE workspace_tasks SET status = 'running', owner = ?, expires_at = ?, updated_at = ? WHERE id = ?`,
+          )
+          .run(owner, Date.now() + ttlMs, new Date().toISOString(), candidate.id);
+        return candidate.id;
+      })
+      .immediate();
     this.repairTaskFiles(workspace);
     if (!id) return undefined;
     // Snapshot I/O can outlast the lease. Return only the current owner's claim.
@@ -642,18 +659,20 @@ export class SqliteEventStore implements EventStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    this.db.transaction(() => {
-      const task = this.db
-        .prepare('SELECT status, owner FROM workspace_tasks WHERE id = ? AND workspace = ?')
-        .get(id, workspace) as { status: string; owner: string | null } | undefined;
-      if (!task) throw new Error('任务不存在或不属于当前工作区');
-      if (task.status === 'running') throw new Error('正在执行中的任务不能删除');
-      const dependent = this.taskRows(workspace).find((t) => t.dependencies.includes(id));
-      if (dependent) throw new Error(`无法删除被任务 "${dependent.title}" 依赖的任务`);
-      this.db
-        .prepare('DELETE FROM workspace_tasks WHERE id = ? AND workspace = ?')
-        .run(id, workspace);
-    })();
+    this.db
+      .transaction(() => {
+        const task = this.db
+          .prepare('SELECT status, owner FROM workspace_tasks WHERE id = ? AND workspace = ?')
+          .get(id, workspace) as { status: string; owner: string | null } | undefined;
+        if (!task) throw new Error('任务不存在或不属于当前工作区');
+        if (task.status === 'running') throw new Error('正在执行中的任务不能删除');
+        const dependent = this.taskRows(workspace).find((t) => t.dependencies.includes(id));
+        if (dependent) throw new Error(`无法删除被任务 "${dependent.title}" 依赖的任务`);
+        this.db
+          .prepare('DELETE FROM workspace_tasks WHERE id = ? AND workspace = ?')
+          .run(id, workspace);
+      })
+      .immediate();
     try {
       const realDir = fs.realpathSync(directory);
       const dirMatches =
@@ -779,27 +798,29 @@ export class SqliteEventStore implements EventStore {
     return claim.immediate();
   }
   markCronJob(id: string, status: string, detail?: string): void {
-    this.db.transaction(() => {
-      const row = this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id) as any;
-      if (!row) return;
-      const events = this.events(row.session_id);
-      const run = [...events]
-        .reverse()
-        .find((event) => event.type === 'cron_started' && event.payload.jobId === id);
-      if (
-        run &&
-        !events.some(
-          (event) => event.type === 'cron_finished' && event.payload.runId === run.payload.runId,
+    this.db
+      .transaction(() => {
+        const row = this.db.prepare('SELECT * FROM cron_jobs WHERE id = ?').get(id) as any;
+        if (!row) return;
+        const events = this.events(row.session_id);
+        const run = [...events]
+          .reverse()
+          .find((event) => event.type === 'cron_started' && event.payload.jobId === id);
+        if (
+          run &&
+          !events.some(
+            (event) => event.type === 'cron_finished' && event.payload.runId === run.payload.runId,
+          )
         )
-      )
-        this.append(row.session_id, 'cron_finished', {
-          jobId: id,
-          runId: run.payload.runId,
-          status,
-          ...(detail ? { detail } : {}),
-        });
-      this.db.prepare('UPDATE cron_jobs SET last_status = ? WHERE id = ?').run(status, id);
-    })();
+          this.append(row.session_id, 'cron_finished', {
+            jobId: id,
+            runId: run.payload.runId,
+            status,
+            ...(detail ? { detail } : {}),
+          });
+        this.db.prepare('UPDATE cron_jobs SET last_status = ? WHERE id = ?').run(status, id);
+      })
+      .immediate();
   }
   listMemory(workspace: string): MemoryPage[] {
     return (
@@ -859,16 +880,18 @@ export class SqliteEventStore implements EventStore {
     )
       throw new Error('偏好必须是本轮用户明确表达的原文，且不能包含密钥');
     const id = createHash('sha256').update(value).digest('hex').slice(0, 32);
-    this.db.transaction(() => {
-      const count = (
-        this.db.prepare('SELECT COUNT(*) AS n FROM user_preferences').get() as { n: number }
-      ).n;
-      if (count >= 50 && !this.db.prepare('SELECT 1 FROM user_preferences WHERE id = ?').get(id))
-        throw new Error('用户偏好已达到 50 项上限');
-      this.db
-        .prepare('INSERT OR IGNORE INTO user_preferences VALUES (?, ?, ?, ?)')
-        .run(id, value, sessionId, new Date().toISOString());
-    })();
+    this.db
+      .transaction(() => {
+        const count = (
+          this.db.prepare('SELECT COUNT(*) AS n FROM user_preferences').get() as { n: number }
+        ).n;
+        if (count >= 50 && !this.db.prepare('SELECT 1 FROM user_preferences WHERE id = ?').get(id))
+          throw new Error('用户偏好已达到 50 项上限');
+        this.db
+          .prepare('INSERT OR IGNORE INTO user_preferences VALUES (?, ?, ?, ?)')
+          .run(id, value, sessionId, new Date().toISOString());
+      })
+      .immediate();
     return this.listPreferences().find((item) => item.id === id)!;
   }
   deletePreference(id: string): void {
@@ -885,32 +908,34 @@ export class SqliteEventStore implements EventStore {
         return Object.fromEntries(Object.entries(item).map(([key, value]) => [key, scrub(value)]));
       return item;
     };
-    const changed = this.db.transaction(() => {
-      let changed = 0;
-      for (const row of this.db.prepare('SELECT id, profile_json FROM sessions').all() as Array<{
-        id: string;
-        profile_json: string;
-      }>) {
-        const next = JSON.stringify(scrub(JSON.parse(row.profile_json)));
-        if (next !== row.profile_json) {
-          this.db.prepare('UPDATE sessions SET profile_json = ? WHERE id = ?').run(next, row.id);
-          changed++;
+    const changed = this.db
+      .transaction(() => {
+        let changed = 0;
+        for (const row of this.db.prepare('SELECT id, profile_json FROM sessions').all() as Array<{
+          id: string;
+          profile_json: string;
+        }>) {
+          const next = JSON.stringify(scrub(JSON.parse(row.profile_json)));
+          if (next !== row.profile_json) {
+            this.db.prepare('UPDATE sessions SET profile_json = ? WHERE id = ?').run(next, row.id);
+            changed++;
+          }
         }
-      }
-      for (const row of this.db.prepare('SELECT rowid, payload_json FROM events').all() as Array<{
-        rowid: number;
-        payload_json: string;
-      }>) {
-        const next = JSON.stringify(scrub(JSON.parse(row.payload_json)));
-        if (next !== row.payload_json) {
-          this.db
-            .prepare('UPDATE events SET payload_json = ? WHERE rowid = ?')
-            .run(next, row.rowid);
-          changed++;
+        for (const row of this.db.prepare('SELECT rowid, payload_json FROM events').all() as Array<{
+          rowid: number;
+          payload_json: string;
+        }>) {
+          const next = JSON.stringify(scrub(JSON.parse(row.payload_json)));
+          if (next !== row.payload_json) {
+            this.db
+              .prepare('UPDATE events SET payload_json = ? WHERE rowid = ?')
+              .run(next, row.rowid);
+            changed++;
+          }
         }
-      }
-      return changed;
-    })();
+        return changed;
+      })
+      .immediate();
     if (changed) {
       try {
         this.db.pragma('wal_checkpoint(TRUNCATE)');
@@ -949,7 +974,7 @@ export class SqliteEventStore implements EventStore {
       this.db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(at, id);
       return { sessionId: id, seq, type, at, payload };
     });
-    return run();
+    return run.immediate();
   }
   close(): void {
     try {
