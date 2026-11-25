@@ -275,6 +275,7 @@ function App() {
   const isCurrentBusy = Boolean(view && busySessionId === view.session.id);
   const isOtherBusy = Boolean(busySessionId && busySessionId !== view?.session.id);
   const [sending, setSending] = useState(false);
+  const [deciding, setDeciding] = useState(false);
   const [approvalSaving, setApprovalSaving] = useState(false);
   const [fileSavedVersion, setFileSavedVersion] = useState(0);
   const [delivery, setDelivery] = useState<'steer' | 'follow-up'>('steer');
@@ -922,24 +923,33 @@ function App() {
       }
   }
   async function decide(approved: boolean) {
-    if (!approval) return;
+    if (!approval || deciding) return;
+    const currentApproval = approval;
+    const scope = approvalScope;
+    setDeciding(true);
     try {
       await api('answerApproval', {
-        approvalId: approval.approvalId,
+        approvalId: currentApproval.approvalId,
         approved,
-        scope: approvalScope,
+        scope,
       });
-      setApproval((current) => (current?.approvalId === approval.approvalId ? null : current));
-      if (approved && approvalScope !== 'once') {
+      setApproval((current) =>
+        current?.approvalId === currentApproval.approvalId ? null : current,
+      );
+      if (approved && scope !== 'once') {
         const settings = await api<{ config: Config; sessionCommands: [string, string][] }>(
           'getApprovalSettings',
-          { sessionId: approval.sessionId },
+          { sessionId: currentApproval.sessionId },
         );
         setConfig(settings.config);
-        setSessionApprovedCommands(settings.sessionCommands);
+        if (currentApproval.sessionId === selected.current) {
+          setSessionApprovedCommands(settings.sessionCommands);
+        }
       }
     } catch (err) {
       fail(err);
+    } finally {
+      setDeciding(false);
     }
   }
   async function openApprovalSettings() {
@@ -1058,7 +1068,10 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} inert={fileTransitioning}>
+      <aside
+        className={`sidebar ${sidebarOpen ? 'open' : ''}`}
+        inert={fileTransitioning || dialog !== null}
+      >
         <div className="brand">
           <div className="brand-mark">
             <Code2 size={21} strokeWidth={2.4} />
@@ -1155,7 +1168,7 @@ function App() {
           </button>
         </div>
       </aside>
-      <main className="main-area" inert={fileTransitioning}>
+      <main className="main-area" inert={fileTransitioning || dialog !== null}>
         <header className="topbar">
           <button
             className="mobile-menu icon-button"
@@ -1350,9 +1363,15 @@ function App() {
                       <div className="plan-title-wrap">
                         <strong>规划模式</strong>
                         <span
-                          className={`plan-badge ${view.plan.approved ? 'approved' : 'pending'}`}
+                          className={`plan-badge ${
+                            view.plan.approved
+                              ? 'approved'
+                              : view.plan.enabled
+                                ? 'pending'
+                                : 'inactive'
+                          }`}
                         >
-                          {view.plan.approved ? '已批准' : '待批准'}
+                          {view.plan.approved ? '已批准' : view.plan.enabled ? '待批准' : '已关闭'}
                         </span>
                       </div>
                       {view.plan.enabled && (
@@ -1373,6 +1392,7 @@ function App() {
                             <span>{step}</span>
                             {view.plan.approved && (
                               <select
+                                disabled={busy}
                                 value={view.plan.progress[index] ?? 'pending'}
                                 onChange={(e) =>
                                   void planAction('setPlanProgress', {
@@ -1392,7 +1412,7 @@ function App() {
                     ) : (
                       <p>规划模式已开启。请在对话框发送任务，Bruin 将先制定详细计划供您审批。</p>
                     )}
-                    {view.plan.steps.length > 0 && !view.plan.approved && (
+                    {view.plan.enabled && view.plan.steps.length > 0 && !view.plan.approved && (
                       <button
                         className="primary"
                         disabled={busy}
@@ -1789,6 +1809,7 @@ function App() {
                     <div
                       role="switch"
                       aria-checked={view.plan.enabled}
+                      aria-disabled={busy}
                       tabIndex={0}
                       className={`composer-plan-toggle ${view.plan.enabled ? 'active' : ''} ${busy ? 'disabled' : ''}`}
                       title={
@@ -1889,6 +1910,7 @@ function App() {
                   <label htmlFor="approval-scope">授权范围（仅对相同工作区中的完整命令生效）</label>
                   <select
                     id="approval-scope"
+                    disabled={deciding}
                     value={approvalScope}
                     onChange={(e) => setApprovalScope(e.target.value as ApprovalScope)}
                   >
@@ -1899,10 +1921,14 @@ function App() {
                 </div>
               )}
               <div className="modal-actions">
-                <button className="secondary" onClick={() => void decide(false)}>
+                <button
+                  className="secondary"
+                  disabled={deciding}
+                  onClick={() => void decide(false)}
+                >
                   拒绝
                 </button>
-                <button className="primary" onClick={() => void decide(true)}>
+                <button className="primary" disabled={deciding} onClick={() => void decide(true)}>
                   <Check size={16} /> 允许
                   {approvalScope === 'session' && approval.call.name === 'shell'
                     ? '本会话'
@@ -2024,6 +2050,8 @@ function App() {
           close={() => setDialog(null)}
           changed={(next) => {
             setConfig(next);
+            forceModelRefresh.current = true;
+            setModelRefresh((v) => v + 1);
             void refreshSessions().catch(fail);
             if (view && !busy) void refreshView('openSession').catch(fail);
           }}
@@ -2117,7 +2145,12 @@ function WorkspaceFolder({
         if (!cancelled) setEntries(items);
       })
       .catch((err) => {
-        if (!cancelled) fail(err);
+        if (cancelled) return;
+        if (path && err instanceof Error && err.message.includes('路径不存在')) {
+          setEntries([]);
+          return;
+        }
+        fail(err);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -2128,7 +2161,7 @@ function WorkspaceFolder({
   }, [sessionId, path, refresh]);
   return (
     <div className="explorer-children">
-      {loading && <small>正在读取…</small>}
+      {loading && !entries.length && <small>正在读取…</small>}
       {!loading && !entries.length && <small>空文件夹</small>}
       {!loading && entries.length === 300 && <small>仅显示前 300 项</small>}
       {entries.map((entry) => (
@@ -2187,20 +2220,27 @@ function WorkspaceReviewDock({
   const [expanded, setExpanded] = useState(true);
   const [error, setError] = useState('');
   const [refresh, setRefresh] = useState(0);
+  const immediateKeyRef = useRef('');
   useEffect(() => {
     let cancelled = false;
-    void api<typeof changes>('listWorkspaceChanges', { sessionId })
-      .then((next) => {
-        if (!cancelled) {
-          setChanges(next);
-          setError('');
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      });
+    const immediateKey = `${sessionId}:${refresh}`;
+    const delayMs = immediateKeyRef.current === immediateKey ? 250 : 0;
+    immediateKeyRef.current = immediateKey;
+    const timer = window.setTimeout(() => {
+      void api<typeof changes>('listWorkspaceChanges', { sessionId })
+        .then((next) => {
+          if (!cancelled) {
+            setChanges(next);
+            setError('');
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        });
+    }, delayMs);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [sessionId, refreshKey, refresh]);
   return (
@@ -2460,9 +2500,13 @@ function Modal({
   children: React.ReactNode;
 }) {
   const titleId = useId();
+  const modalRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(close);
   closeRef.current = close;
   useEffect(() => {
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    modalRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (
         event.key === 'Escape' &&
@@ -2474,7 +2518,10 @@ function Modal({
       }
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
   }, []);
   return (
     <div
@@ -2483,7 +2530,14 @@ function Modal({
         if (e.target === e.currentTarget) close();
       }}
     >
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+      <div
+        ref={modalRef}
+        tabIndex={-1}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+      >
         <div className="modal-top">
           <div>
             <span className="eyebrow">{eyebrow}</span>
@@ -3345,7 +3399,7 @@ function RuntimeDialog({
           />
           <button
             disabled={working || !session || !graphTaskId.trim()}
-            onClick={() => void runtime('finish_task', { id: graphTaskId, success: true })}
+            onClick={() => void runtime('finish_task', { id: graphTaskId.trim(), success: true })}
           >
             标记完成
           </button>
@@ -3353,7 +3407,7 @@ function RuntimeDialog({
             disabled={working || !session || !graphTaskId.trim() || !taskDependencies.trim()}
             onClick={() =>
               void runtime('update_task', {
-                id: graphTaskId,
+                id: graphTaskId.trim(),
                 addBlockedBy: taskDependencies
                   .split(',')
                   .map((x) => x.trim())
@@ -3383,7 +3437,9 @@ function RuntimeDialog({
         <button
           className="secondary"
           disabled={working || !session || !memoryKey.trim() || !memoryContent.trim()}
-          onClick={() => void runtime('save_memory', { key: memoryKey, content: memoryContent })}
+          onClick={() =>
+            void runtime('save_memory', { key: memoryKey.trim(), content: memoryContent })
+          }
         >
           保存工作区记忆
         </button>
@@ -3397,7 +3453,10 @@ function RuntimeDialog({
           <button
             disabled={working || !session}
             onClick={() =>
-              void runtime('create_worktree', worktreeName ? { name: worktreeName } : {})
+              void runtime(
+                'create_worktree',
+                worktreeName.trim() ? { name: worktreeName.trim() } : {},
+              )
             }
           >
             创建工作树
@@ -3484,25 +3543,25 @@ function RuntimeDialog({
           />
           <button
             disabled={working || !session || !taskId.trim()}
-            onClick={() => void runtime('subagent_status', { id: taskId })}
+            onClick={() => void runtime('subagent_status', { id: taskId.trim() })}
           >
             子 Agent 状态
           </button>
           <button
             disabled={working || !session || !taskId.trim()}
-            onClick={() => void runtime('cancel_subagent', { id: taskId })}
+            onClick={() => void runtime('cancel_subagent', { id: taskId.trim() })}
           >
             停止子 Agent
           </button>
           <button
             disabled={working || !session || !taskId.trim()}
-            onClick={() => void runtime('background_status', { id: taskId })}
+            onClick={() => void runtime('background_status', { id: taskId.trim() })}
           >
             后台状态
           </button>
           <button
             disabled={working || !session || !taskId.trim()}
-            onClick={() => void runtime('cancel_background', { id: taskId })}
+            onClick={() => void runtime('cancel_background', { id: taskId.trim() })}
           >
             停止后台
           </button>
@@ -3516,7 +3575,10 @@ function RuntimeDialog({
           <button
             disabled={working || !session || !taskId.trim() || !subagentReviewPath.trim()}
             onClick={() =>
-              void runtime('subagent_review', { id: taskId, path: subagentReviewPath.trim() })
+              void runtime('subagent_review', {
+                id: taskId.trim(),
+                path: subagentReviewPath.trim(),
+              })
             }
           >
             审核子任务文件
@@ -3787,6 +3849,7 @@ function ModelDialog({
   const [contextWindowTokens, setContextWindowTokens] = useState('32768');
   const [apiKey, setApiKey] = useState('');
   const [clearApiKey, setClearApiKey] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deletingAlias, setDeletingAlias] = useState<string | null>(null);
   const formRef = useRef<HTMLDivElement>(null);
@@ -3800,6 +3863,7 @@ function ModelDialog({
     setContextWindowTokens('32768');
     setApiKey('');
     setClearApiKey(false);
+    setAdvancedOpen(false);
   }
   function edit(profile: Profile) {
     setEditingAlias(profile.alias);
@@ -3811,6 +3875,7 @@ function ModelDialog({
     setContextWindowTokens(String(profile.contextWindowTokens ?? 32768));
     setApiKey('');
     setClearApiKey(false);
+    setAdvancedOpen(Boolean(profile.apiKeyEnv));
     formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
   useEffect(() => {
@@ -3849,19 +3914,27 @@ function ModelDialog({
     }
   }
   async function setDefault(value: string) {
+    if (saving) return;
     try {
+      setSaving(true);
       changed(await api<Config>('setDefaultModel', { alias: value }));
     } catch (err) {
       fail(err);
+    } finally {
+      setSaving(false);
     }
   }
   async function removeProfile(value: string) {
+    if (saving) return;
     try {
+      setSaving(true);
       changed(await api<Config>('removeProfile', { alias: value }));
       if (editingAlias === value) reset();
       setDeletingAlias(null);
     } catch (err) {
       fail(err);
+    } finally {
+      setSaving(false);
     }
   }
   return (
@@ -3883,18 +3956,18 @@ function ModelDialog({
             ) : (
               <button
                 className="subtle-button"
-                disabled={busy}
+                disabled={busy || saving}
                 onClick={() => void setDefault(p.alias)}
               >
                 设为默认
               </button>
             )}
-            <button className="subtle-button" disabled={busy} onClick={() => edit(p)}>
+            <button className="subtle-button" disabled={busy || saving} onClick={() => edit(p)}>
               编辑
             </button>
             <button
               className="subtle-button"
-              disabled={busy}
+              disabled={busy || saving}
               title={deletingAlias === p.alias ? '再次点击，删除本地模型配置' : '删除本地模型配置'}
               onClick={() =>
                 deletingAlias === p.alias ? void removeProfile(p.alias) : setDeletingAlias(p.alias)
@@ -3994,7 +4067,11 @@ function ModelDialog({
             清除已保存的密钥，改用环境变量
           </label>
         )}
-        <details className="model-advanced" open={Boolean(apiKeyEnv)}>
+        <details
+          className="model-advanced"
+          open={advancedOpen}
+          onToggle={(e) => setAdvancedOpen((e.currentTarget as HTMLDetailsElement).open)}
+        >
           <summary>高级：从环境变量读取密钥</summary>
           <label>环境变量名称（不是密钥值）</label>
           <input
@@ -4051,8 +4128,10 @@ function SkillsDialog({
   const [newMarket, setNewMarket] = useState('');
   const [newMarketRepo, setNewMarketRepo] = useState('');
   const [entries, setEntries] = useState<MarketEntry[]>([]);
+  const [entriesMarket, setEntriesMarket] = useState('');
   const [working, setWorking] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const readSeqRef = useRef(0);
   async function act<T>(
     method: string,
     params: Record<string, unknown>,
@@ -4068,12 +4147,15 @@ function SkillsDialog({
     }
   }
   async function show(skill: Skill) {
+    const seq = ++readSeqRef.current;
     setSelected(skill);
+    setContent('');
     setConfirmRemove(null);
     try {
-      setContent(await api<string>('readSkill', { name: skill.name }));
+      const text = await api<string>('readSkill', { name: skill.name });
+      if (readSeqRef.current === seq) setContent(text);
     } catch (err) {
-      fail(err);
+      if (readSeqRef.current === seq) fail(err);
     }
   }
   return (
@@ -4143,10 +4225,12 @@ function SkillsDialog({
                 {!selected.source.startsWith('builtin:') && (
                   <button
                     className="subtle-button"
+                    disabled={working}
                     onClick={() =>
                       void act<Skill[]>('updateSkill', { name: selected.name }, (value) => {
                         changed(value);
                         setSelected(null);
+                        setContent('');
                       })
                     }
                   >
@@ -4170,6 +4254,7 @@ function SkillsDialog({
                           void act<Skill[]>('removeSkill', { name: selected.name }, (value) => {
                             changed(value);
                             setSelected(null);
+                            setContent('');
                             setConfirmRemove(null);
                           })
                         }
@@ -4267,6 +4352,10 @@ function SkillsDialog({
               void act<Market[]>('addMarket', { name: newMarket, repo: newMarketRepo }, (value) => {
                 marketsChanged(value);
                 setMarketName(newMarket);
+                setEntries([]);
+                setEntriesMarket('');
+                setNewMarket('');
+                setNewMarketRepo('');
               })
             }
           >
@@ -4275,7 +4364,14 @@ function SkillsDialog({
           <div className="divider" />
           <h3>浏览市场</h3>
           <div className="field-with-button">
-            <select value={marketName} onChange={(e) => setMarketName(e.target.value)}>
+            <select
+              value={marketName}
+              onChange={(e) => {
+                setMarketName(e.target.value);
+                setEntries([]);
+                setEntriesMarket('');
+              }}
+            >
               <option value="">选择市场</option>
               {markets.map((m) => (
                 <option key={m.name} value={m.name}>
@@ -4285,9 +4381,13 @@ function SkillsDialog({
             </select>
             <button
               disabled={!marketName || working}
-              onClick={() =>
-                void act<MarketEntry[]>('marketEntries', { name: marketName }, setEntries)
-              }
+              onClick={() => {
+                const targetMarket = marketName;
+                void act<MarketEntry[]>('marketEntries', { name: targetMarket }, (items) => {
+                  setEntries(items);
+                  setEntriesMarket(targetMarket);
+                });
+              }}
             >
               浏览
             </button>
@@ -4299,11 +4399,11 @@ function SkillsDialog({
                 <small>{entry.description}</small>
               </div>
               <button
-                disabled={working}
+                disabled={working || !entriesMarket}
                 onClick={() =>
                   void act<Skill[]>(
                     'installFromMarket',
-                    { market: marketName, skill: entry.name },
+                    { market: entriesMarket, skill: entry.name },
                     (value) => {
                       changed(value);
                       setTab('installed');

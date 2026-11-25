@@ -19,6 +19,13 @@ const node = process.env.BRUIN_NODE_BINARY ?? 'node';
 process.env.BRUIN_HOME = home;
 delete process.env.BRUIN_RENDERER_URL;
 app.setPath('userData', path.join(scratch, 'electron'));
+process.on('exit', () => {
+  try {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup of temp scratch directory.
+  }
+});
 
 async function waitFor(check, description) {
   for (let i = 0; i < 200; i++) {
@@ -307,7 +314,7 @@ async function run() {
     window.close();
     await waitFor(() => js(`Boolean(${button('保存并继续')})`), 'native close dialog');
     await js(`${button('保存并继续')}.click()`).catch((error) => {
-      if (!window.isDestroyed()) throw error;
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) throw error;
     });
     await waitFor(() => window.isDestroyed(), 'window closed after save');
     assert.equal(
@@ -326,7 +333,9 @@ run().then(
   () => app.quit(),
   (error) => {
     console.error(error);
+    process.exitCode = 1;
     for (const window of BrowserWindow.getAllWindows()) window.destroy();
-    app.exit(1);
+    app.quit();
+    setTimeout(() => app.exit(1), 5000).unref();
   },
 );

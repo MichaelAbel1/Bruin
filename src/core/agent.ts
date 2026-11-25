@@ -957,6 +957,7 @@ export class AgentRunner {
       // Freeze tool hooks for the batch, including recovery policy. Config changes apply next batch.
       const toolHooks = this.services ? loadConfig().hooks : [];
       let askedQuestion = false;
+      let planUpdated = false;
       const hasToolHooks = toolHooks.some(
         (hook) => hook.enabled && ['before_tool', 'after_tool'].includes(hook.event),
       );
@@ -1215,13 +1216,20 @@ export class AgentRunner {
                 (call.name === 'read_file' ||
                   call.name === 'write_file' ||
                   call.name === 'edit_file') &&
-                !result.isError &&
-                result.fileVersion
-              )
-                fileVersions.set(versionKey, result.fileVersion);
-              else if (call.name === 'restore_snapshot' && !result.isError) fileVersions.clear();
+                !result.isError
+              ) {
+                if (result.fileVersion) fileVersions.set(versionKey, result.fileVersion);
+                else if (call.name !== 'read_file') fileVersions.delete(versionKey);
+              } else if (
+                call.name === 'write_file' &&
+                result.isError &&
+                result.output.includes('文件自上次读取后已删除')
+              ) {
+                fileVersions.delete(versionKey);
+              } else if (call.name === 'restore_snapshot' && !result.isError) fileVersions.clear();
             }
           }
+          if (call.name === 'update_plan' && !result.isError) planUpdated = true;
           this.store.append(session.id, 'tool_finished', {
             callId: call.id,
             name: call.name,
@@ -1320,9 +1328,9 @@ export class AgentRunner {
       checkBudget();
 
       if (
+        planUpdated &&
         planState(this.store.events(session.id)).enabled &&
-        !planState(this.store.events(session.id)).approved &&
-        reply!.calls.some((call) => call.name === 'update_plan')
+        !planState(this.store.events(session.id)).approved
       ) {
         this.store.append(session.id, 'turn_completed', { awaitingPlanApproval: true });
         return;

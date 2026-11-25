@@ -1833,3 +1833,57 @@ test('expired running tasks project as unknown and allow retry/delete; dispatche
     f.close();
   }
 });
+
+test('runtime services return deterministic tool error instead of throwing on invalid plan progress', async () => {
+  const f = fixture();
+  const services = new RuntimeServices(
+    f.store,
+    {
+      async execute() {
+        return { output: '', isError: false };
+      },
+      async close() {},
+    },
+    async () => {},
+  );
+  try {
+    setPlanMode(f.store, f.session.id, true);
+    f.store.append(f.session.id, 'plan_updated', { steps: ['Step 1'] });
+    approvePlan(f.store, f.session.id);
+
+    const badProgress = await services.execute(
+      { id: 'p1', name: 'update_plan_progress', input: { index: 5, status: 'completed' } },
+      f.session,
+      new AbortController().signal,
+    );
+    assert.equal(badProgress.isError, true);
+    assert.match(badProgress.output, /不可更新/);
+  } finally {
+    await services.close();
+    f.close();
+  }
+});
+
+test('McpManager rejects insecure remote HTTP URLs and embedded credentials at runtime', async () => {
+  const manager = new McpManager();
+  try {
+    await assert.rejects(
+      manager.listTools(
+        { name: 'insecure', transport: 'http', url: 'http://example.com/mcp' },
+        process.cwd(),
+        new AbortController().signal,
+      ),
+      /HTTPS|localhost|URL/,
+    );
+    await assert.rejects(
+      manager.listTools(
+        { name: 'creds', transport: 'http', url: 'https://user:pass@example.com/mcp' },
+        process.cwd(),
+        new AbortController().signal,
+      ),
+      /内嵌凭据|凭据|URL/,
+    );
+  } finally {
+    await manager.close();
+  }
+});

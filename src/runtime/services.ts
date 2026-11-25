@@ -506,13 +506,19 @@ export class RuntimeServices {
       case 'update_plan_progress': {
         if (!planState(this.store.events(session.id)).enabled)
           return { output: '当前会话未开启规划模式', isError: true };
-        const state = setPlanProgress(
-          this.store,
-          session.id,
-          Number(input.index),
-          String(input.status) as 'pending' | 'in_progress' | 'completed',
-        );
-        return { output: JSON.stringify(state), isError: false };
+        try {
+          const state = setPlanProgress(
+            this.store,
+            session.id,
+            Number(input.index),
+            String(input.status) as 'pending' | 'in_progress' | 'completed',
+          );
+          return { output: JSON.stringify(state), isError: false };
+        } catch (error) {
+          if (error instanceof Error && error.message === '规划步骤不可更新')
+            return { output: error.message, isError: true };
+          throw error;
+        }
       }
       case 'list_worktrees': {
         const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
@@ -678,9 +684,11 @@ export class RuntimeServices {
                   signal,
                 })
               ).stdout;
-            } catch {
+            } catch (error) {
+              if (signal.aborted) throw error;
               return { output: '该路径不属于当前仓库的工作树', isError: true };
             }
+            if (this.closing) return { output: '运行时正在关闭，不能启动新任务', isError: true };
             const belongsToRepo = worktreeOutput.split(/\r?\n/).some((line) => {
               if (!line.startsWith('worktree ')) return false;
               const listedPath = line.slice('worktree '.length).trim();
@@ -1002,44 +1010,55 @@ export class RuntimeServices {
         }
         this.background.set(id, { sessionId: session.id, controller, status: 'running' });
         const running = Promise.resolve()
-          .then(() => {
-            if (controller.signal.aborted) throw new Error('已取消');
-            return this.executor.execute(
-              {
-                requestId: id,
-                name: 'shell',
-                input: { command },
-                workspace: fs.realpathSync(session.workspace),
-                timeoutMs: 600_000,
-                maxOutputBytes: 100_000,
-              },
-              controller.signal,
-            );
-          })
-          .then((result) => {
-            const task = this.background.get(id);
-            if (task) {
-              task.status = controller.signal.aborted
+          .then(async () => {
+            let status: 'completed' | 'failed' | 'cancelled' = 'completed';
+            let payload: Record<string, unknown>;
+            try {
+              if (controller.signal.aborted) throw new Error('已取消');
+              const result = await this.executor.execute(
+                {
+                  requestId: id,
+                  name: 'shell',
+                  input: { command },
+                  workspace: fs.realpathSync(session.workspace),
+                  timeoutMs: 600_000,
+                  maxOutputBytes: 100_000,
+                },
+                controller.signal,
+              );
+              status = controller.signal.aborted
                 ? 'cancelled'
                 : result.isError
                   ? 'failed'
                   : 'completed';
-              task.result = result;
+              const task = this.background.get(id);
+              if (task) {
+                task.status = status;
+                task.result = result;
+              }
+              payload = { id, status, result };
+            } catch (error) {
+              status = controller.signal.aborted ? 'cancelled' : 'failed';
+              const task = this.background.get(id);
+              if (task) task.status = status;
+              payload = {
+                id,
+                status,
+                error: error instanceof Error ? error.message : String(error),
+              };
             }
-            this.store.append(session.id, 'background_finished', {
-              id,
-              status: task?.status,
-              result,
-            });
-          })
-          .catch((error) => {
-            const task = this.background.get(id);
-            if (task) task.status = controller.signal.aborted ? 'cancelled' : 'failed';
-            this.store.append(session.id, 'background_finished', {
-              id,
-              status: task?.status ?? 'failed',
-              error: error instanceof Error ? error.message : String(error),
-            });
+            try {
+              if (
+                this.store.renewLease(session.id, lease.owner, 30_000) &&
+                !this.store
+                  .events(session.id)
+                  .some((event) => event.type === 'background_finished' && event.payload.id === id)
+              ) {
+                this.store.append(session.id, 'background_finished', payload);
+              }
+            } catch {
+              // Lease lost or store closed during shutdown; avoid writing stale/duplicate receipts.
+            }
           })
           .finally(() => {
             this.background.delete(id);

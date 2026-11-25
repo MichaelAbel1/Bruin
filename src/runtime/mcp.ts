@@ -219,14 +219,32 @@ export class McpManager {
         maxBufferSize: 1_000_000,
       });
     } else {
-      transport = new StreamableHTTPClientTransport(new URL(server.url), {
-        fetch: (input, init) =>
-          fetch(input, {
+      const validateMcpUrl = (rawUrl: string) => {
+        const parsed = new URL(rawUrl);
+        if (parsed.username || parsed.password) throw new Error('MCP 服务器地址不允许包含内嵌凭据');
+        if (
+          parsed.protocol !== 'https:' &&
+          !(
+            parsed.protocol === 'http:' &&
+            ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
+          )
+        )
+          throw new Error('远程 MCP 服务器必须使用 HTTPS');
+        return parsed;
+      };
+      const serverUrl = validateMcpUrl(server.url);
+      transport = new StreamableHTTPClientTransport(serverUrl, {
+        fetch: (input, init) => {
+          const rawUrl = typeof input === 'string' ? input : input.href;
+          validateMcpUrl(rawUrl);
+          return fetch(input, {
             ...init,
+            redirect: 'error',
             signal: init?.signal
               ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)])
               : AbortSignal.timeout(30_000),
-          }),
+          });
+        },
         ...(server.oauth ? { authProvider: this.oauthProvider(server) } : {}),
         ...(server.tokenEnv
           ? {
@@ -292,6 +310,7 @@ export class McpManager {
     this.cancelLogin(name);
     await this.serialize(name, async () => {
       await this.disconnectConnected(name);
+      this.oauth.get(name)?.session.detachPersistence();
       this.oauth.get(name)?.session.invalidateCredentials('all');
       this.oauth.delete(name);
       this.onCredentials?.(name, '', undefined);

@@ -51,34 +51,33 @@ function isMacSandboxAvailable(): boolean {
   return macSandboxAvailable;
 }
 
-let bwrapAvailable: boolean | undefined;
+let bwrapPath: string | null | undefined;
 function findBwrap(): string | undefined {
-  if (process.platform !== 'linux' || bwrapAvailable === false) return undefined;
+  if (process.platform !== 'linux') return undefined;
+  if (bwrapPath !== undefined) return bwrapPath ?? undefined;
   for (const dir of (process.env.PATH ?? '/usr/bin:/bin').split(path.delimiter).filter(Boolean)) {
     const candidate = path.join(dir, 'bwrap');
     try {
       if (fs.existsSync(candidate)) {
         fs.accessSync(candidate, fs.constants.X_OK);
-        if (bwrapAvailable === undefined) {
-          try {
-            execFileSync(
-              candidate,
-              ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', 'true'],
-              {
-                stdio: 'ignore',
-                timeout: 2000,
-              },
-            );
-            bwrapAvailable = true;
-          } catch {
-            continue;
-          }
+        try {
+          execFileSync(
+            candidate,
+            ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', 'true'],
+            {
+              stdio: 'ignore',
+              timeout: 2000,
+            },
+          );
+          bwrapPath = candidate;
+          return candidate;
+        } catch {
+          continue;
         }
-        return candidate;
       }
     } catch {}
   }
-  bwrapAvailable = false;
+  bwrapPath = null;
   return undefined;
 }
 
@@ -401,18 +400,21 @@ async function command(
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: req.workspace,
-        TMPDIR: req.workspaceOnlyWrites
-          ? req.workspace
-          : (scratchDir ?? safeScratchDir(req.workspace) ?? '/tmp'),
-        LANG: process.env.LANG ?? 'C',
         ...(process.platform === 'win32'
           ? {
               SystemRoot: process.env.SystemRoot,
               COMSPEC: process.env.COMSPEC,
               PATHEXT: process.env.PATHEXT,
               USERPROFILE: req.workspace,
+              TEMP: req.workspaceOnlyWrites ? req.workspace : os.tmpdir(),
+              TMP: req.workspaceOnlyWrites ? req.workspace : os.tmpdir(),
             }
-          : {}),
+          : {
+              TMPDIR: req.workspaceOnlyWrites
+                ? req.workspace
+                : (scratchDir ?? safeScratchDir(req.workspace) ?? '/tmp'),
+            }),
+        LANG: process.env.LANG ?? 'C',
         ...(program === 'docker' ? dockerEnvironment() : {}),
       },
       detached: process.platform !== 'win32',
@@ -617,6 +619,7 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
         fullPath,
         fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
       );
+      let streamOwnsFd = false;
       try {
         const stat = fs.fstatSync(fd);
         if (!stat.isFile() || stat.size > 5_000_000) return true;
@@ -628,6 +631,9 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
           end: 4_999_999,
           encoding: 'utf8',
         });
+        // Node's ReadStream._destroy() always closes fd when stream.destroy() is called,
+        // even with autoClose: false. Track ownership so we never double-close a reused fd.
+        streamOwnsFd = true;
         const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
         stopReading = () => {
           rl.close();
@@ -657,9 +663,7 @@ async function fallbackSearch(req: ToolRequest): Promise<ToolResult> {
           stopReading = undefined;
         }
       } finally {
-        try {
-          fs.closeSync(fd);
-        } catch {}
+        if (!streamOwnsFd) fs.closeSync(fd);
       }
     } catch {
       checkStopped();

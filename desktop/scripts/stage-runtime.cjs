@@ -9,7 +9,16 @@ const root = path.resolve(__dirname, '../..');
 const stage = path.join(root, '.desktop-runtime');
 fs.rmSync(stage, { recursive: true, force: true });
 fs.mkdirSync(stage, { recursive: true });
-fs.cpSync(path.join(root, 'dist'), path.join(stage, 'dist'), { recursive: true });
+const distRoot = path.join(root, 'dist');
+const testsDir = path.join(distRoot, 'tests');
+fs.cpSync(distRoot, path.join(stage, 'dist'), {
+  recursive: true,
+  filter: (src) =>
+    src !== testsDir &&
+    !src.startsWith(`${testsDir}${path.sep}`) &&
+    !src.endsWith('.d.ts') &&
+    !src.endsWith('.d.ts.map'),
+});
 fs.cpSync(path.join(root, 'skills'), path.join(stage, 'skills'), { recursive: true });
 fs.copyFileSync(
   process.execPath,

@@ -11,6 +11,7 @@ import { ProcessExecutor } from '../executor/client.js';
 import { importAttachments } from '../core/attachments.js';
 import { enqueueInput } from '../core/input-queue.js';
 import { pendingQuestion } from '../core/question.js';
+import { RuntimeServices } from '../runtime/services.js';
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-control-'));
@@ -1400,6 +1401,115 @@ test('structured ask_user persists options, context, and kind on tool_finished',
     assert.equal(q.kind, 'decision');
     assert.deepEqual(q.options, ['Dual-write', 'Cutover']);
   } finally {
+    f.close();
+  }
+});
+
+test('a failed update_plan does not end the turn awaiting approval', async () => {
+  const f = fixture();
+  let modelCalls = 0;
+  const executor = {
+    async execute(): Promise<ToolResult> {
+      throw new Error('unused');
+    },
+    async close() {},
+  };
+  const runtime = new RuntimeServices(f.store, executor, async () => {});
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        modelCalls++;
+        if (modelCalls === 1) {
+          return {
+            text: '',
+            calls: [{ id: 'plan-bad', name: 'update_plan', input: { steps: [] } }],
+          };
+        }
+        return {
+          text: '',
+          calls: [{ id: 'plan-ok', name: 'update_plan', input: { steps: ['Inspect files'] } }],
+        };
+      },
+    },
+    executor,
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+    runtime,
+  );
+  try {
+    f.store.append(f.session.id, 'plan_mode', { enabled: true });
+    await runner.run(f.session, 'make a plan');
+    assert.equal(modelCalls, 2);
+    const completed = f.store.events(f.session.id).at(-1);
+    assert.equal(completed?.type, 'turn_completed');
+    assert.equal(completed?.payload.awaitingPlanApproval, true);
+  } finally {
+    await runtime.close();
+    f.close();
+  }
+});
+
+test('write_file clears stale tracked version after external deletion so retry succeeds', async () => {
+  const f = fixture();
+  const executor = new ProcessExecutor();
+  const target = path.join(f.dir, 'a.txt');
+  fs.writeFileSync(target, 'v1');
+  let step = 0;
+  const result = (id: string) =>
+    f.store
+      .events(f.session.id)
+      .find((event) => event.type === 'tool_finished' && event.payload.callId === id)?.payload;
+  const runner = new AgentRunner(
+    f.store,
+    {
+      async complete() {
+        switch (++step) {
+          case 1:
+            return {
+              text: '',
+              calls: [{ id: 'r1', name: 'read_file', input: { path: 'a.txt' } }],
+            };
+          case 2:
+            assert.equal(result('r1')?.isError, false);
+            fs.unlinkSync(target);
+            return {
+              text: '',
+              calls: [{ id: 'w1', name: 'write_file', input: { path: 'a.txt', content: 'v2' } }],
+            };
+          case 3:
+            assert.equal(result('w1')?.isError, true);
+            assert.match(String(result('w1')?.output), /文件自上次读取后已删除/);
+            return {
+              text: '',
+              calls: [{ id: 'w2', name: 'write_file', input: { path: 'a.txt', content: 'v2' } }],
+            };
+          default:
+            assert.equal(result('w2')?.isError, false);
+            assert.equal(fs.readFileSync(target, 'utf8'), 'v2');
+            return { text: 'Recreated a.txt', calls: [] };
+        }
+      },
+    },
+    executor,
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+  );
+  try {
+    await runner.run(f.session, 'update a.txt');
+    assert.equal(f.store.events(f.session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    await executor.close();
     f.close();
   }
 });

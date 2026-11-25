@@ -42,8 +42,9 @@ jobs:
         if: matrix.platform == 'windows'
       - run: unzip -tq desktop/release-current/Bruin-*-mac.zip
         if: matrix.platform == 'macos'
+      - run: npm run desktop:stage-artifacts
       - uses: actions/upload-artifact@v7
         with:
           name: bruin-${{ matrix.platform }}-unsigned
-          path: desktop/release-current/*
+          path: stage-artifacts/*
           if-no-files-found: error

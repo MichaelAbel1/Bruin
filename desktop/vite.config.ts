@@ -20,6 +20,29 @@ export default defineConfig(({ command }) => ({
       },
     },
   ],
-  build: { outDir: path.resolve(here, 'build/renderer'), emptyOutDir: true },
+  build: {
+    outDir: path.resolve(here, 'build/renderer'),
+    emptyOutDir: true,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'react',
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+            },
+            {
+              name: 'markdown',
+              test: /[\\/]node_modules[\\/](react-markdown|remark-|rehype-|mdast-|micromark|unist-|unified|hast-|vfile|property-information|comma-separated-tokens|space-separated-tokens|html-url-attributes|devlop|decode-named-character-reference|character-entities)/,
+            },
+            {
+              name: 'icons',
+              test: /[\\/]node_modules[\\/]lucide-react[\\/]/,
+            },
+          ],
+        },
+      },
+    },
+  },
   server: { host: '127.0.0.1', port: 5173, strictPort: true },
 }));

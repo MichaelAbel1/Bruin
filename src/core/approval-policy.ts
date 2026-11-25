@@ -63,23 +63,152 @@ function stripLeadingDelimiters(token: string): string {
   return token.replace(/^(?:\$\(|\(|`|\{)+/, '').replace(/(?:\)|`|\})+$/, '');
 }
 
+/** Split a command into segments on unquoted separators (; & | \n). */
+function splitSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (
+        ch === '\\' &&
+        i + 1 < command.length &&
+        (command[i + 1] === '"' || command[i + 1] === '\\')
+      ) {
+        current += ch + command[++i];
+        continue;
+      }
+      if (ch === '"') quote = null;
+      current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '\n') {
+      if (current.trim()) segments.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) segments.push(current);
+  return segments;
+}
+
+/** Split on unquoted pipeline separators (;, &, &&, ||, \n) while preserving single `|`. */
+function splitPipelines(command: string): string[] {
+  const pipelines: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (
+        ch === '\\' &&
+        i + 1 < command.length &&
+        (command[i + 1] === '"' || command[i + 1] === '\\')
+      ) {
+        current += ch + command[++i];
+        continue;
+      }
+      if (ch === '"') quote = null;
+      current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === ';' || ch === '&' || ch === '\n') {
+      if (current.trim()) pipelines.push(current);
+      current = '';
+      continue;
+    }
+    if (ch === '|' && command[i + 1] === '|') {
+      if (current.trim()) pipelines.push(current);
+      current = '';
+      i++;
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) pipelines.push(current);
+  return pipelines;
+}
+
+function stageCommandName(stage: string): string {
+  const tokens = tokenizeSegment(stage.trim())
+    .map(stripLeadingDelimiters)
+    .filter((token) => token.length > 0);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+    const base = path.posix.basename(token.replace(/\\/g, '/')).toLowerCase();
+    if (base === 'sudo' || base === 'env' || base === 'command') continue;
+    if (token.startsWith('-') && i > 0) continue;
+    return base;
+  }
+  return '';
+}
+
+function hasPipeToInterpreter(command: string): boolean {
+  const downloaders = new Set(['curl', 'wget', 'curl.exe', 'wget.exe']);
+  const psDownloaders = new Set(['iwr', 'irm', 'invoke-webrequest', 'invoke-restmethod']);
+  const interpreters = new Set([
+    'bash',
+    'sh',
+    'zsh',
+    'dash',
+    'ksh',
+    'ash',
+    'python',
+    'python3',
+    'perl',
+    'ruby',
+    'node',
+    'powershell',
+    'pwsh',
+    'bash.exe',
+    'sh.exe',
+    'powershell.exe',
+    'pwsh.exe',
+  ]);
+  const psInterpreters = new Set(['iex', 'invoke-expression', 'powershell', 'pwsh']);
+  for (const pipeline of splitPipelines(command)) {
+    const stages = splitSegments(pipeline);
+    if (stages.length < 2) continue;
+    let sawDownloader = false;
+    let sawPsDownloader = false;
+    for (const stage of stages) {
+      const cmd = stageCommandName(stage);
+      if (sawDownloader && interpreters.has(cmd)) return true;
+      if (sawPsDownloader && psInterpreters.has(cmd)) return true;
+      if (downloaders.has(cmd)) sawDownloader = true;
+      if (psDownloaders.has(cmd)) sawPsDownloader = true;
+    }
+  }
+  return false;
+}
+
 function isProtectedPosixTarget(raw: string): boolean {
   const cleaned = stripLeadingDelimiters(raw.replace(/^["']|["']$/g, ''));
   if (!cleaned) return false;
-  if (/^(?:~|\$HOME|\$\{HOME\})(?:\/(?:\.|\*|.*)?)?$/i.test(cleaned)) {
-    const sub = cleaned.replace(/^(?:~|\$HOME|\$\{HOME\})/i, '');
-    if (!sub || sub === '/') return true;
-    const normSub = path.posix.normalize(sub);
-    if (
-      normSub === '/' ||
-      normSub === '/.' ||
-      normSub === '.' ||
-      normSub === '/*' ||
-      normSub === '/.*'
-    )
-      return true;
-    return true;
-  }
+  if (/^(?:~|\$HOME|\$\{HOME\})(?:\/.*)?$/i.test(cleaned)) return true;
   if (!cleaned.startsWith('/')) return false;
   const normalized = path.posix.normalize(cleaned).replace(/\/+$/, '') || '/';
   return (
@@ -103,20 +232,29 @@ export function isMaliciousShell(command: string, depth = 0): boolean {
   if (!trimmed) return false;
 
   // 1. Destructive deletion of system/root/user directories (POSIX and Windows)
-  // Split on command separators, also stripping outer subshell/backtick wrappers.
-  const segments = trimmed.split(/[;&|\n]/);
+  const segments = splitSegments(trimmed);
   for (const seg of segments) {
-    const rawTokens = tokenizeSegment(seg.trim());
-    if (!rawTokens.length) continue;
-    const tokens = rawTokens.map(stripLeadingDelimiters).filter(Boolean);
-    if (!tokens.length) continue;
+    const pairs = tokenizeSegment(seg.trim())
+      .map((raw) => ({ raw, clean: stripLeadingDelimiters(raw) }))
+      .filter((pair) => pair.clean.length > 0);
+    if (!pairs.length) continue;
+    const tokens = pairs.map((pair) => pair.clean);
 
     // Inspect nested shell wrappers (bash -c "...", sh -c '...', eval "...", cmd /c "...", powershell -c "...")
     if (depth < 4) {
       for (let i = 0; i < tokens.length; i++) {
         const cmdName = path.posix.basename(tokens[i].replace(/\\/g, '/')).toLowerCase();
         if (cmdName === 'eval' && i + 1 < tokens.length) {
-          if (isMaliciousShell(rawTokens.slice(i + 1).join(' '), depth + 1)) return true;
+          if (
+            isMaliciousShell(
+              pairs
+                .slice(i + 1)
+                .map((p) => p.raw)
+                .join(' '),
+              depth + 1,
+            )
+          )
+            return true;
         }
         if (
           ['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'sh.exe', 'bash.exe'].includes(cmdName) ||
@@ -124,7 +262,16 @@ export function isMaliciousShell(command: string, depth = 0): boolean {
         ) {
           for (let j = i + 1; j < tokens.length - 1; j++) {
             if (/^(?:-[a-z]*c[a-z]*|\/c|-command)$/i.test(tokens[j])) {
-              if (isMaliciousShell(rawTokens.slice(j + 1).join(' '), depth + 1)) return true;
+              if (
+                isMaliciousShell(
+                  pairs
+                    .slice(j + 1)
+                    .map((p) => p.raw)
+                    .join(' '),
+                  depth + 1,
+                )
+              )
+                return true;
             }
           }
         }
@@ -197,7 +344,10 @@ export function isMaliciousShell(command: string, depth = 0): boolean {
     return true;
   }
 
-  // 4. Remote script piped directly into shell execution
+  // 4. Remote script piped directly into shell execution (including quote-obfuscated commands)
+  if (hasPipeToInterpreter(trimmed)) {
+    return true;
+  }
   if (
     /\b(curl|wget)\b[^|;&\n]+?\|\s*(?:sudo\s+|env\s+)?(?:\/[\w./-]*\/)?(bash|sh|zsh|python|python3|perl|ruby|node|powershell|pwsh)\b/i.test(
       trimmed,
