@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { turnState } from '../core/turn-state.js';
+import { canResumeTurn, turnState } from '../core/turn-state.js';
 import { reduceSessionState } from '../core/session-state.js';
+import { nextAgentAction } from '../core/reducer.js';
 import type { SessionEvent } from '../core/types.js';
 
 const events = (...types: string[]) => types.map((type) => ({ type }));
@@ -149,4 +150,112 @@ test('reduceSessionState projects unified execution and business phases as JSON-
   assert.equal(approvedActive.phase, 'paused');
   assert.equal(approvedActive.canResume, true);
   assert.equal(approvedActive.plan.pendingSteps, 1);
+});
+
+test('reduceSessionState and nextAgentAction handle durable approvals, batch resume, planning pruning, and roles', () => {
+  const make = (entries: Array<[SessionEvent['type'], Record<string, unknown>?]>): SessionEvent[] =>
+    entries.map(([type, payload = {}], index) => ({
+      seq: index + 1,
+      sessionId: 's-reducer',
+      type,
+      at: '2026-11-26T00:00:00.000Z',
+      payload,
+    }));
+
+  const callA = { id: 'c1', name: 'write_file', input: { path: 'a.txt', content: 'hi' } };
+  const callB = { id: 'c2', name: 'write_file', input: { path: 'b.txt', content: 'yo' } };
+
+  const waiting = make([
+    ['user', { text: 'write files' }],
+    ['assistant', { text: '', calls: [callA, callB] }],
+    ['tool_requested', { callId: 'c1', name: 'write_file', input: callA.input }],
+    [
+      'approval_pending',
+      {
+        approvalId: 'appr-1',
+        callId: 'c1',
+        name: 'write_file',
+        input: callA.input,
+        reason: 'write needs approval',
+        workspace: '/repo',
+      },
+    ],
+    ['turn_paused', { reason: 'awaiting_approval', approvalId: 'appr-1', callId: 'c1' }],
+  ]);
+
+  const waitingState = reduceSessionState(waiting);
+  assert.equal(waitingState.phase, 'awaiting_approval');
+  assert.equal(waitingState.canResume, false);
+  assert.equal(canResumeTurn(waiting), false);
+  assert.equal(waitingState.pendingApproval?.id, 'appr-1');
+
+  const awaitingAction = nextAgentAction(waiting, {
+    step: 0,
+    maxSteps: 10,
+    baseToolMode: 'full',
+  });
+  assert.equal(awaitingAction.kind, 'await_approval');
+
+  const approved = make([
+    ...waiting.map((e) => [e.type, e.payload] as [SessionEvent['type'], Record<string, unknown>]),
+    ['tool_approved', { callId: 'c1', name: 'write_file', approvalId: 'appr-1' }],
+  ]);
+  const approvedState = reduceSessionState(approved);
+  assert.equal(approvedState.phase, 'paused');
+  assert.equal(approvedState.canResume, true);
+  assert.equal(approvedState.pendingApproval, null);
+
+  const resumeAction = nextAgentAction(approved, {
+    step: 0,
+    maxSteps: 10,
+    baseToolMode: 'full',
+  });
+  assert.equal(resumeAction.kind, 'resume_tool_batch');
+  if (resumeAction.kind === 'resume_tool_batch') {
+    assert.deepEqual(
+      resumeAction.batch.calls.map((c) => c.id),
+      ['c1', 'c2'],
+    );
+    assert.deepEqual(resumeAction.batch.preApprovedCallIds, ['c1']);
+    assert.deepEqual(resumeAction.batch.requestedCallIds, ['c1']);
+  }
+
+  const planning = make([
+    ['plan_mode', { enabled: true }],
+    ['user', { text: 'plan it' }],
+  ]);
+  assert.deepEqual(nextAgentAction(planning, { step: 0, maxSteps: 10, baseToolMode: 'full' }), {
+    kind: 'call_model',
+    effectiveToolMode: 'planning',
+  });
+
+  const planApproved = make([
+    ['plan_mode', { enabled: true }],
+    ['plan_updated', { steps: ['step 1'] }],
+    ['plan_approved', {}],
+    ['user', { text: 'execute it' }],
+  ]);
+  assert.deepEqual(nextAgentAction(planApproved, { step: 0, maxSteps: 10, baseToolMode: 'full' }), {
+    kind: 'call_model',
+    effectiveToolMode: 'full',
+  });
+
+  assert.deepEqual(
+    nextAgentAction(make([['user', { text: 'verify' }]]), {
+      step: 0,
+      maxSteps: 10,
+      baseToolMode: 'full',
+      role: 'verifier',
+    }),
+    { kind: 'call_model', effectiveToolMode: 'verifier' },
+  );
+
+  assert.deepEqual(
+    nextAgentAction(make([['user', { text: 'done' }]]), {
+      step: 5,
+      maxSteps: 5,
+      baseToolMode: 'full',
+    }),
+    { kind: 'pause_step_limit', maxSteps: 5 },
+  );
 });

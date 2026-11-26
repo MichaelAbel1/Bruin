@@ -50,6 +50,7 @@ import { createSubagentRunner } from './runtime/subagent.js';
 import { turnState } from './core/turn-state.js';
 import { reduceSessionState } from './core/session-state.js';
 import { pendingQuestion, recordQuestionAnswer } from './core/question.js';
+import { pendingApproval, recordApprovalDecision } from './core/approval.js';
 import { sendAttentionWebhook } from './runtime/notify.js';
 import { cronPlan, recoverCronJobs } from './runtime/cron.js';
 import { needsUnknownReview, recordUnknownReview } from './core/unknown-review.js';
@@ -95,7 +96,7 @@ let memoryReview:
   | undefined;
 const approvals = new Map<
   string,
-  { resolve: (approved: boolean) => void; sessionId: string; call: ToolCall }
+  { resolve: (approved: boolean | 'pause') => void; sessionId: string; call: ToolCall }
 >();
 
 // Remove secrets accidentally persisted by older desktop versions from session profiles.
@@ -150,7 +151,7 @@ const runner = new AgentRunner(
         event('runCheckpoint', { sessionId, events: viewSession(getSession(sessionId)).events });
     },
     approve: (call: ToolCall, reason: string, signal: AbortSignal) =>
-      new Promise<boolean | string>((resolve) => {
+      new Promise<boolean | string | 'pause'>((resolve) => {
         const sessionId = active?.sessionId;
         if (!sessionId || signal.aborted) return resolve(false);
         if (
@@ -189,7 +190,7 @@ const runner = new AgentRunner(
             '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。',
           );
         const approvalId = randomUUID();
-        const finish = (approved: boolean) => {
+        const finish = (approved: boolean | 'pause') => {
           signal.removeEventListener('abort', abort);
           approvals.delete(approvalId);
           resolve(approved);
@@ -253,6 +254,23 @@ function notifyAttentionForSession(session: Session, failureMessage?: string): v
           workspace: session.workspace,
           phase: state.phase,
           reason: failureMessage.slice(0, 500),
+        },
+        { extraSecrets },
+      ),
+    );
+    return;
+  }
+  if (state.phase === 'awaiting_approval' && state.pendingApproval) {
+    trackWebhook(
+      sendAttentionWebhook(
+        {
+          event: 'awaiting_approval',
+          sessionId: session.id,
+          workspace: session.workspace,
+          phase: state.phase,
+          approvalId: state.pendingApproval.id,
+          toolName: state.pendingApproval.name,
+          reason: state.pendingApproval.reason || `等待审批工具 ${state.pendingApproval.name}`,
         },
         { extraSecrets },
       ),
@@ -422,6 +440,7 @@ async function startRun(
   try {
     runner.recover(session);
     if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认继续');
+    if (pendingApproval(store.events(session.id))) throw new Error('请先审批当前待处理工具调用');
     if (answer) recordQuestionAnswer(store, session.id, answer.id, answer.text);
     else if (pendingQuestion(store.events(session.id))) throw new Error('请先答复当前待答问题');
     store.append(session.id, 'run_configured', runSettings);
@@ -762,7 +781,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       store.acquireLease(session.id, leaseOwner, 10_000);
       try {
         const events = store.events(session.id);
-        if (turnState(events) !== 'paused' && !pendingQuestion(events))
+        if (turnState(events) !== 'paused' && !pendingQuestion(events) && !pendingApproval(events))
           throw new Error('当前任务未处于暂停状态');
         if (needsReview(session.id)) throw new Error('请先检查执行结果未知的工具调用并确认');
         store.append(session.id, 'turn_completed', { stoppedByUser: true });
@@ -778,39 +797,69 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       approvals.clear();
       return { cancelled: true };
     }
-    case 'answerApproval': {
+    case 'pauseApproval': {
       const id = String(p.approvalId ?? '');
       const pending = approvals.get(id);
       if (!pending) throw new Error('审批请求已失效');
+      approvals.delete(id);
+      pending.resolve('pause');
+      return { paused: true };
+    }
+    case 'answerApproval': {
+      const id = String(p.approvalId ?? '');
       const scope = String(p.scope ?? 'once');
       if (!['once', 'session', 'always'].includes(scope)) throw new Error('无效的授权范围');
-      if (p.approved === true && scope !== 'once') {
-        if (pending.call.name !== 'shell' || typeof pending.call.input.command !== 'string')
+      const saveCommandRule = (
+        targetSessionId: string,
+        name: string,
+        input: Record<string, unknown>,
+      ) => {
+        if (name !== 'shell' || typeof input.command !== 'string')
           throw new Error('仅 Shell 命令支持记住授权');
-        const workspace = getSession(pending.sessionId).workspace;
-        const command = pending.call.input.command;
+        const workspace = getSession(targetSessionId).workspace;
+        const command = input.command;
         if (isMaliciousShell(command)) throw new Error('高危破坏性命令不支持记住授权');
-        const sessionId = scope === 'session' ? pending.sessionId : undefined;
+        const ruleSessionId = scope === 'session' ? targetSessionId : undefined;
         updateConfig((config) => {
           if (
             !config.approvedCommands.some(
               (rule) =>
                 rule.workspace === workspace &&
                 rule.command === command &&
-                rule.sessionId === sessionId,
+                rule.sessionId === ruleSessionId,
             )
           )
             config.approvedCommands.push({
               workspace,
               command,
-              ...(sessionId ? { sessionId } : {}),
+              ...(ruleSessionId ? { sessionId: ruleSessionId } : {}),
             });
           return config;
         });
+      };
+      const pending = approvals.get(id);
+      if (pending) {
+        if (p.approved === true && scope !== 'once')
+          saveCommandRule(pending.sessionId, pending.call.name, pending.call.input);
+        approvals.delete(id);
+        pending.resolve(p.approved === true);
+        return { accepted: true };
       }
-      approvals.delete(id);
-      pending.resolve(p.approved === true);
-      return { accepted: true };
+      if (typeof p.sessionId !== 'string' || !p.sessionId) throw new Error('审批请求已失效');
+      const session = getSession(p.sessionId);
+      const persisted = pendingApproval(store.events(session.id));
+      if (!persisted || persisted.id !== id) throw new Error('审批请求已失效');
+      if (active) throw new Error('已有任务正在运行');
+      if (p.approved === true && scope !== 'once')
+        saveCommandRule(session.id, persisted.name, persisted.input);
+      const lease = services.sessionLeases.retain(session.id, new AbortController());
+      try {
+        recordApprovalDecision(store, session.id, id, p.approved === true, { source: 'desktop' });
+      } finally {
+        lease.release();
+      }
+      const started = await startRun(session, undefined, [], undefined, requestedRunSettings(p));
+      return { accepted: true, ...started, events: viewSession(session).events };
     }
     case 'getApprovalSettings': {
       const sessionId = String(p.sessionId ?? '');
@@ -1424,12 +1473,18 @@ lines.on('line', (line) => {
 async function shutdown() {
   lines.close();
   clearInterval(scheduler);
-  active?.controller.abort();
+  let pauseTimer: ReturnType<typeof setTimeout> | undefined;
+  if (approvals.size > 0) {
+    for (const pending of approvals.values()) pending.resolve('pause');
+    approvals.clear();
+    pauseTimer = setTimeout(() => active?.controller.abort(), 2_000);
+  } else {
+    active?.controller.abort();
+  }
   memoryReviewRun?.controller.abort();
   for (const controller of activeToolControllers) controller.abort();
-  for (const pending of approvals.values()) pending.resolve(false);
-  approvals.clear();
   await activeRun;
+  clearTimeout(pauseTimer);
   await scheduled;
   await memoryReviewRun?.result.catch(() => {});
   await services.close();

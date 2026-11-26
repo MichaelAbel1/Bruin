@@ -14,6 +14,7 @@ import type { ToolMode } from '../core/tools.js';
 import { needsUnknownReview } from '../core/unknown-review.js';
 import { turnState } from '../core/turn-state.js';
 import { pendingQuestion } from '../core/question.js';
+import { pendingApproval } from '../core/approval.js';
 
 const sessionParams = z.object({ sessionId: z.string().min(1) });
 const newParams = z.object({
@@ -120,7 +121,9 @@ export class AcpServer {
       if (['tool_finished', 'tool_denied', 'tool_unknown'].includes(event.type))
         tools.delete(callId);
     }
-    for (const request of tools.values())
+    const approval = pendingApproval(events);
+    for (const request of tools.values()) {
+      if (approval && request.payload.callId === approval.callId) continue;
       this.update(session.id, {
         sessionUpdate: 'tool_call_update',
         toolCallId: `history-tool-${request.seq}`,
@@ -135,6 +138,20 @@ export class AcpServer {
           },
         ],
       });
+    }
+    if (approval) {
+      const lines = [
+        `Pending tool approval (${approval.id}): ${approval.name}`,
+        ...(approval.reason ? [`Reason: ${approval.reason}`] : []),
+        `Approve via Bruin desktop or: bruin chat --resume ${session.id} --approve ${approval.id}`,
+        `Or deny via: bruin chat --resume ${session.id} --deny ${approval.id}`,
+      ];
+      this.update(session.id, {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: `pending-approval-${approval.seq}`,
+        content: { type: 'text', text: lines.join('\n') },
+      });
+    }
     const question = pendingQuestion(events);
     if (question) {
       const lines = [
@@ -393,6 +410,11 @@ export class AcpServer {
         throw new RpcError(
           -32603,
           'Session has uncertain tool results; inspect the local session and workspace before continuing',
+        );
+      if (pendingApproval(events))
+        throw new RpcError(
+          -32603,
+          'Approve or deny the pending tool call in Bruin desktop or CLI before continuing',
         );
       if (pendingQuestion(events))
         throw new RpcError(

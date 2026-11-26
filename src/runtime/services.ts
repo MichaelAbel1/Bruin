@@ -20,6 +20,7 @@ import { buildWorkspacePatch, preflightWorkspacePatches } from '../core/workspac
 import type { SubagentOptions } from './subagent.js';
 import { onSteeringInput, pendingInputs } from '../core/input-queue.js';
 import { originalSubagentTurn } from '../core/subagent-results.js';
+import { isAgentRole, rolePreset } from '../core/roles.js';
 
 const execFileAsync = promisify(execFile);
 type Background = {
@@ -642,7 +643,14 @@ export class RuntimeServices {
           const prompt = String(input.prompt ?? '').trim();
           if (!prompt || prompt.length > 10_000)
             return { output: '子 Agent 任务无效', isError: true };
-          const mode = input.mode === 'worktree' ? 'worktree' : 'read-only';
+          const role = isAgentRole(input.role) ? input.role : undefined;
+          const preset = role ? rolePreset(role) : undefined;
+          const mode =
+            input.mode === 'worktree' || input.mode === 'read-only'
+              ? input.mode
+              : (preset?.defaultSubagentMode ?? 'read-only');
+          if ((role === 'explorer' || role === 'reviewer') && mode === 'worktree')
+            return { output: `只读角色 ${role} 不能使用 worktree 可写模式`, isError: true };
           const config = loadConfig();
           if (
             mode === 'worktree' &&
@@ -717,15 +725,18 @@ export class RuntimeServices {
           const requestedSteps =
             typeof input.maxSteps === 'number' && Number.isInteger(input.maxSteps)
               ? Math.max(1, Math.min(input.maxSteps, parentBudget))
-              : parentBudget;
+              : Math.min(preset?.defaultMaxSteps ?? parentBudget, parentBudget);
           const focusScope =
-            typeof input.scope === 'string' && input.scope.trim() ? input.scope.trim() : undefined;
+            typeof input.scope === 'string' && input.scope.trim()
+              ? input.scope.trim()
+              : preset?.scope;
           const focusDeliverable =
             typeof input.deliverable === 'string' && input.deliverable.trim()
               ? input.deliverable.trim()
-              : undefined;
+              : preset?.deliverable;
           const childOptions: SubagentOptions = {
             mode,
+            ...(role ? { role } : {}),
             commands: config.approvedCommands
               .filter(
                 (rule) =>
@@ -823,6 +834,7 @@ export class RuntimeServices {
               prompt,
               workspace,
               mode,
+              ...(role ? { role } : {}),
               baseCommit,
               permissions: {
                 fileEdits: mode === 'worktree',

@@ -11,6 +11,8 @@ import { ProcessExecutor } from '../executor/client.js';
 import { importAttachments } from '../core/attachments.js';
 import { enqueueInput } from '../core/input-queue.js';
 import { pendingQuestion } from '../core/question.js';
+import { pendingApproval, recordApprovalDecision } from '../core/approval.js';
+import type { ToolMode } from '../core/tools.js';
 import { RuntimeServices } from '../runtime/services.js';
 
 function fixture() {
@@ -1509,6 +1511,211 @@ test('write_file clears stale tracked version after external deletion so retry s
     await runner.run(f.session, 'update a.txt');
     assert.equal(f.store.events(f.session.id).at(-1)?.type, 'turn_completed');
   } finally {
+    await executor.close();
+    f.close();
+  }
+});
+
+test('durable approval_pending survives restart and resumes exact tool batch without re-calling model', async () => {
+  const f = fixture();
+  const executor = new ProcessExecutor();
+  fs.writeFileSync(path.join(f.dir, 'seed.txt'), 'hello');
+  let modelCalls = 0;
+  const gateway: ModelGateway = {
+    async complete() {
+      modelCalls++;
+      if (modelCalls === 1) {
+        return {
+          text: '',
+          calls: [
+            { id: 'r1', name: 'read_file', input: { path: 'seed.txt' } },
+            { id: 'w1', name: 'write_file', input: { path: 'first.txt', content: 'one' } },
+            { id: 'w2', name: 'write_file', input: { path: 'second.txt', content: 'two' } },
+          ],
+        };
+      }
+      return { text: 'All files written after resume', calls: [] };
+    },
+  };
+  try {
+    const runner1 = new AgentRunner(f.store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve() {
+        return 'pause';
+      },
+    });
+    await runner1.run(f.session, 'read and write two files');
+    assert.equal(modelCalls, 1);
+    const pending = pendingApproval(f.store.events(f.session.id));
+    assert.ok(pending);
+    assert.equal(pending.callId, 'w1');
+    assert.equal(fs.existsSync(path.join(f.dir, 'first.txt')), false);
+    assert.equal(fs.existsSync(path.join(f.dir, 'second.txt')), false);
+
+    // Simulate process restart with a brand-new AgentRunner instance.
+    const approvedCalls: string[] = [];
+    const runner2 = new AgentRunner(f.store, gateway, executor, {
+      text() {},
+      notice() {},
+      async approve(call) {
+        approvedCalls.push(call.id);
+        return true;
+      },
+    });
+    assert.equal(runner2.recover(f.session), 0);
+    assert.ok(pendingApproval(f.store.events(f.session.id)));
+    await assert.rejects(runner2.run(f.session), /请先审批当前待处理工具调用/);
+
+    recordApprovalDecision(f.store, f.session.id, pending.id, true, { source: 'cli' });
+    await runner2.run(f.session);
+
+    // w1 was pre-approved and executed directly; only sibling w2 prompted; model called once after batch.
+    assert.deepEqual(approvedCalls, ['w2']);
+    assert.equal(modelCalls, 2);
+    assert.equal(fs.readFileSync(path.join(f.dir, 'first.txt'), 'utf8'), 'one');
+    assert.equal(fs.readFileSync(path.join(f.dir, 'second.txt'), 'utf8'), 'two');
+    assert.equal(f.store.events(f.session.id).at(-1)?.type, 'turn_completed');
+  } finally {
+    await executor.close();
+    f.close();
+  }
+});
+
+test('event-sourced fileVersion prevents blind overwrite across restarted AgentRunner instances', async () => {
+  const f = fixture();
+  const executor = new ProcessExecutor();
+  const target = path.join(f.dir, 'shared.txt');
+  fs.writeFileSync(target, 'v1');
+  try {
+    let step1 = 0;
+    const runner1 = new AgentRunner(
+      f.store,
+      {
+        async complete() {
+          if (++step1 === 1) {
+            return {
+              text: '',
+              calls: [{ id: 'read-1', name: 'read_file', input: { path: 'shared.txt' } }],
+            };
+          }
+          return { text: 'read done', calls: [] };
+        },
+      },
+      executor,
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return true;
+        },
+      },
+    );
+    await runner1.run(f.session, 'read shared.txt');
+
+    // External modification happens while process is restarted.
+    fs.writeFileSync(target, 'v1-externally-edited');
+
+    let step2 = 0;
+    const runner2 = new AgentRunner(
+      f.store,
+      {
+        async complete() {
+          if (++step2 === 1) {
+            return {
+              text: '',
+              calls: [
+                {
+                  id: 'write-stale',
+                  name: 'write_file',
+                  input: { path: 'shared.txt', content: 'blind-overwrite' },
+                },
+              ],
+            };
+          }
+          return { text: 'detected conflict', calls: [] };
+        },
+      },
+      executor,
+      {
+        text() {},
+        notice() {},
+        async approve() {
+          return true;
+        },
+      },
+    );
+    await runner2.run(f.session, 'overwrite shared.txt');
+    const writeEvent = f.store
+      .events(f.session.id)
+      .find((event) => event.type === 'tool_finished' && event.payload.callId === 'write-stale');
+    assert.equal(writeEvent?.payload.isError, true);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'v1-externally-edited');
+  } finally {
+    await executor.close();
+    f.close();
+  }
+});
+
+test('planning mode prunes gateway tool mode before approval and explorer role blocks writes', async () => {
+  const f = fixture();
+  const executor = new ProcessExecutor();
+  const runtime = new RuntimeServices(f.store, executor, async () => {});
+  const seenModes: Array<ToolMode | undefined> = [];
+  let calls = 0;
+  const gateway: ModelGateway = {
+    async complete(_profile, _prompt, _signal, _onText, toolMode) {
+      seenModes.push(toolMode);
+      calls++;
+      if (calls === 1) {
+        return {
+          text: '',
+          calls: [{ id: 'plan-1', name: 'update_plan', input: { steps: ['Inspect', 'Edit'] } }],
+        };
+      }
+      if (calls === 2) {
+        return { text: 'executed after approval', calls: [] };
+      }
+      if (calls === 3) {
+        return {
+          text: '',
+          calls: [
+            { id: 'write-blocked', name: 'write_file', input: { path: 'x.txt', content: 'no' } },
+          ],
+        };
+      }
+      return { text: 'explorer done', calls: [] };
+    },
+  };
+  const runner = new AgentRunner(
+    f.store,
+    gateway,
+    executor,
+    {
+      text() {},
+      notice() {},
+      async approve() {
+        return true;
+      },
+    },
+    runtime,
+  );
+  try {
+    f.store.append(f.session.id, 'plan_mode', { enabled: true });
+    await runner.run(f.session, 'draft a plan');
+    f.store.append(f.session.id, 'plan_approved', {});
+    await runner.run(f.session, 'run approved plan');
+    await runner.run(f.session, 'explore only', undefined, [], undefined, { role: 'explorer' });
+
+    assert.deepEqual(seenModes, ['planning', 'full', 'read-only', 'read-only']);
+    const denied = f.store
+      .events(f.session.id)
+      .find((event) => event.type === 'tool_denied' && event.payload.callId === 'write-blocked');
+    assert.ok(denied);
+    assert.match(String(denied.payload.output), /只读检查工具/);
+    assert.equal(fs.existsSync(path.join(f.dir, 'x.txt')), false);
+  } finally {
+    await runtime.close();
     await executor.close();
     f.close();
   }

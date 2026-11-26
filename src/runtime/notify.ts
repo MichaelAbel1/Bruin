@@ -3,7 +3,8 @@ import type { SessionPhase } from '../core/session-state.js';
 
 export { isAllowedWebhookUrl };
 
-export type AttentionEventKind = 'awaiting_input' | 'paused' | 'awaiting_review' | 'run_failed';
+export type AttentionEventKind =
+  'awaiting_input' | 'awaiting_approval' | 'paused' | 'awaiting_review' | 'run_failed';
 
 export type AttentionPayload = {
   event: AttentionEventKind;
@@ -14,6 +15,8 @@ export type AttentionPayload = {
   questionId?: string;
   question?: string;
   options?: string[];
+  approvalId?: string;
+  toolName?: string;
   at: string;
 };
 
@@ -76,6 +79,8 @@ export async function sendAttentionWebhook(
     ...(payload.options?.length
       ? { options: payload.options.slice(0, 6).map((item) => redact(item, 200)) }
       : {}),
+    ...(payload.approvalId ? { approvalId: payload.approvalId } : {}),
+    ...(payload.toolName ? { toolName: redact(payload.toolName, 120) } : {}),
     at: payload.at ?? new Date().toISOString(),
   };
   try {

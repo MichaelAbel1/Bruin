@@ -2,6 +2,7 @@ import type { EventStore } from '../storage/event-store.js';
 import type { SessionEvent, ToolCall } from './types.js';
 import { toolDefinition } from './tools.js';
 import { originalSubagentTurn } from './subagent-results.js';
+import { pendingApproval, resumableApprovalBatch } from './approval.js';
 
 /** Project only recorded receipts; an absent receipt is not proof of success or failure. */
 export function pendingSubagents(events: readonly SessionEvent[]): SessionEvent[] {
@@ -103,9 +104,35 @@ export function recoverSession(store: EventStore, sessionId: string): number {
       if (queue?.length === 0) pending.delete(String(event.payload.callId));
     }
   }
+  // Preserve unstarted calls belonging to an explicit approval-paused assistant batch.
+  const preservedCallIds = new Set<string>();
+  const activeApproval = pendingApproval(events);
+  if (activeApproval) {
+    let lastAssistantCalls: ToolCall[] = [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].seq < activeApproval.seq && events[i].type === 'assistant') {
+        lastAssistantCalls = Array.isArray(events[i].payload.calls)
+          ? (events[i].payload.calls as ToolCall[])
+          : [];
+        break;
+      }
+    }
+    const idx = lastAssistantCalls.findIndex((c) => c.id === activeApproval.callId);
+    if (idx >= 0) {
+      for (const call of lastAssistantCalls.slice(idx)) preservedCallIds.add(call.id);
+    } else {
+      preservedCallIds.add(activeApproval.callId);
+    }
+  } else {
+    const resumable = resumableApprovalBatch(events);
+    if (resumable) {
+      for (const call of resumable.calls) preservedCallIds.add(call.id);
+    }
+  }
   let unknown = 0;
   for (const queue of pending.values())
     for (const { call, recovery, startedSeq } of queue) {
+      if (recovery === 'not-started' && preservedCallIds.has(call.id)) continue;
       const childId = startedSeq === undefined ? undefined : delegations.get(startedSeq);
       if (childId) {
         store.append(sessionId, 'tool_finished', {

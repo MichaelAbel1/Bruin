@@ -1,3 +1,4 @@
+import { pendingApproval } from './approval.js';
 import { pendingInputs } from './input-queue.js';
 import { pendingQuestion } from './question.js';
 import { pendingSubagents } from './recovery.js';
@@ -10,6 +11,7 @@ import type { SessionEvent } from './types.js';
 export type SessionPhase =
   | 'idle'
   | 'awaiting_review'
+  | 'awaiting_approval'
   | 'awaiting_input'
   | 'awaiting_plan_approval'
   | 'paused'
@@ -23,6 +25,7 @@ export interface SessionState {
   needsReview: boolean;
   unreviewedUnknownCount: number;
   lastUnknownSeq: number | null;
+  pendingApproval: ReturnType<typeof pendingApproval> | null;
   pendingQuestion: ReturnType<typeof pendingQuestion> | null;
   plan: PlanState & { pendingSteps: number };
   pendingInputsCount: number;
@@ -47,6 +50,7 @@ export function reduceSessionState(events: readonly SessionEvent[]): SessionStat
   const state = turnState(events);
   const unreviewed = unreviewedUnknownTools(events);
   const needsReview = unreviewed.length > 0;
+  const approval = pendingApproval(events) ?? null;
   const question = pendingQuestion(events) ?? null;
   const plan = planState([...events]);
   const pendingSteps =
@@ -64,6 +68,7 @@ export function reduceSessionState(events: readonly SessionEvent[]): SessionStat
 
   let phase: SessionPhase;
   if (needsReview) phase = 'awaiting_review';
+  else if (approval) phase = 'awaiting_approval';
   else if (question) phase = 'awaiting_input';
   else if (awaitingPlanApproval && (state === 'completed' || state === 'idle'))
     phase = 'awaiting_plan_approval';
@@ -77,6 +82,7 @@ export function reduceSessionState(events: readonly SessionEvent[]): SessionStat
     needsReview,
     unreviewedUnknownCount: unreviewed.length,
     lastUnknownSeq: unreviewed.at(-1)?.seq ?? null,
+    pendingApproval: approval,
     pendingQuestion: question,
     plan: { ...plan, pendingSteps },
     pendingInputsCount: inputs.length,

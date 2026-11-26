@@ -547,3 +547,68 @@ test('ACP session/load surfaces pending ask_user question with context and optio
     await f.close();
   }
 });
+
+test('ACP session/load surfaces pending persisted approval and blocks prompt until decided', async () => {
+  const f = fixture({
+    async complete() {
+      return { text: 'unused', calls: [] };
+    },
+  });
+  try {
+    const workspace = fs.realpathSync(f.dir);
+    const session = f.store.createSession(workspace, {
+      alias: 'test',
+      provider: 'openai',
+      model: 'mock',
+    });
+    f.store.append(session.id, 'user', { text: 'run deploy' });
+    f.store.append(session.id, 'tool_requested', {
+      callId: 'c-appr',
+      name: 'shell',
+      input: { command: 'echo hi' },
+    });
+    f.store.append(session.id, 'approval_pending', {
+      approvalId: 'appr-acp-1',
+      callId: 'c-appr',
+      name: 'shell',
+      input: { command: 'echo hi' },
+      reason: 'Shell requires approval',
+      workspace,
+    });
+    f.store.append(session.id, 'turn_paused', {
+      reason: 'awaiting_approval',
+      approvalId: 'appr-acp-1',
+      callId: 'c-appr',
+    });
+    await f.request('initialize', { protocolVersion: 1 });
+    const loaded = await f.request('session/load', {
+      sessionId: session.id,
+      cwd: f.dir,
+      mcpServers: [],
+    });
+    assert.equal(loaded.error, undefined);
+    const approvalChunk = f.messages.find(
+      (m) =>
+        m.method === 'session/update' &&
+        m.params?.update?.sessionUpdate === 'agent_message_chunk' &&
+        String(m.params?.update?.content?.text ?? '').includes('appr-acp-1'),
+    );
+    assert.ok(approvalChunk);
+    assert.match(String(approvalChunk.params.update.content.text), /--approve appr-acp-1/);
+    const failedToolUpdate = f.messages.find(
+      (m) =>
+        m.method === 'session/update' &&
+        m.params?.update?.sessionUpdate === 'tool_call_update' &&
+        m.params?.update?.status === 'failed',
+    );
+    assert.equal(failedToolUpdate, undefined);
+
+    const blocked = await f.request('session/prompt', {
+      sessionId: session.id,
+      prompt: [{ type: 'text', text: 'continue anyway' }],
+    });
+    assert.equal(blocked.error?.code, -32603);
+  } finally {
+    await f.close();
+  }
+});

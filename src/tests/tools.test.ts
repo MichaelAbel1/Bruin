@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toolDefinition, toolDefinitions, toolsForMode } from '../core/tools.js';
+import { agentRoles, isAgentRole, rolePreset } from '../core/roles.js';
 import { toolSchemas } from '../providers/gateway.js';
 import { decisionFor } from '../core/permissions.js';
 import { isMaliciousShell } from '../core/approval-policy.js';
@@ -123,4 +124,36 @@ test('isMaliciousShell blocks disk wipes, subshell/wrapper/path bypasses and all
       .decision,
     'allow',
   );
+});
+
+test('planning and verifier tool modes prune schemas and role presets stay bounded', () => {
+  const planningWithoutQ = Object.keys(toolsForMode('planning'));
+  const planningWithQ = Object.keys(toolsForMode('planning', true));
+  assert.equal(planningWithoutQ.includes('ask_user'), false);
+  assert.equal(planningWithQ.includes('ask_user'), true);
+  assert.equal(planningWithQ.includes('update_plan'), true);
+  assert.equal(planningWithQ.includes('write_file'), false);
+  assert.equal(planningWithQ.includes('edit_file'), false);
+  assert.equal(planningWithQ.includes('shell'), false);
+  assert.ok(planningWithQ.length < Object.keys(toolDefinitions).length);
+
+  const verifier = Object.keys(toolsForMode('verifier')).sort();
+  assert.deepEqual(verifier, [
+    'list_files',
+    'list_snapshots',
+    'load_skill',
+    'read_file',
+    'search',
+    'search_repository',
+    'shell',
+  ]);
+
+  assert.equal(isAgentRole('explorer'), true);
+  assert.equal(isAgentRole('reviewer'), true);
+  assert.equal(isAgentRole('implementer'), true);
+  assert.equal(isAgentRole('verifier'), true);
+  assert.equal(isAgentRole('admin'), false);
+  assert.equal(rolePreset('explorer').toolMode, 'read-only');
+  assert.equal(rolePreset('verifier').toolMode, 'verifier');
+  assert.equal(Object.keys(agentRoles).length, 4);
 });

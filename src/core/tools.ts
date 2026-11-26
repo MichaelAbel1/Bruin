@@ -169,10 +169,11 @@ export const toolDefinitions = {
     parallel: false,
     replay: 'manual' as const,
     description:
-      'Start a small, focused subagent. Default read-only researches the current workspace. Mode worktree creates a dedicated worktree at HEAD for edits using inherited permissions; changes are retained for review, never automatically merged. Prefer narrow scope, clear deliverable, and bounded maxSteps.',
+      'Start a small, focused subagent. Optional role preset (explorer, reviewer, implementer, verifier) configures tool scope and default budget. Default read-only researches the current workspace. Mode worktree creates a dedicated worktree at HEAD for edits using inherited permissions; changes are retained for review, never automatically merged. Prefer narrow scope, clear deliverable, and bounded maxSteps.',
     inputSchema: z.object({
       prompt: z.string(),
       worktree: z.string().optional(),
+      role: z.enum(['explorer', 'reviewer', 'implementer', 'verifier']).optional(),
       mode: z.enum(['read-only', 'worktree']).optional(),
       scope: z.string().trim().min(1).max(500).optional(),
       deliverable: z.string().trim().min(1).max(1000).optional(),
@@ -399,7 +400,7 @@ export const toolDefinitions = {
   },
 };
 
-export type ToolMode = 'basic' | 'full' | 'read-only' | 'worktree';
+export type ToolMode = 'basic' | 'full' | 'read-only' | 'worktree' | 'planning' | 'verifier';
 export const toolSchemas = Object.fromEntries(
   Object.entries(toolDefinitions).map(([name, { description, inputSchema }]) => [
     name,
@@ -415,15 +416,19 @@ export const toolSchemas = Object.fromEntries(
 export function toolsForMode(mode: ToolMode, allowQuestions = false) {
   return Object.fromEntries(
     Object.entries(toolSchemas).filter(([name]) => {
-      if (name === 'ask_user') return mode === 'full' && allowQuestions;
+      if (name === 'ask_user') return (mode === 'full' || mode === 'planning') && allowQuestions;
       const definition = toolDefinitions[name as keyof typeof toolDefinitions];
       return (
         mode === 'full' ||
-        (mode === 'worktree'
-          ? definition.readOnly || ['write_file', 'edit_file', 'shell'].includes(name)
-          : mode === 'read-only'
-            ? definition.readOnly
-            : definition.basic)
+        (mode === 'planning'
+          ? definition.planning
+          : mode === 'worktree'
+            ? definition.readOnly || ['write_file', 'edit_file', 'shell'].includes(name)
+            : mode === 'verifier'
+              ? definition.readOnly || name === 'shell'
+              : mode === 'read-only'
+                ? definition.readOnly
+                : definition.basic)
       );
     }),
   );

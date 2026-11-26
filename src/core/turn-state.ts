@@ -1,3 +1,4 @@
+import { pendingApproval } from './approval.js';
 import { pendingInputs } from './input-queue.js';
 import { pendingQuestion } from './question.js';
 
@@ -25,7 +26,7 @@ export function turnState(events: ReadonlyArray<{ type: string }>): TurnState {
 export function canResumeTurn(
   events: ReadonlyArray<{ seq: number; type: string; payload: Record<string, unknown> }>,
 ) {
-  if (pendingQuestion(events)) return false;
+  if (pendingQuestion(events) || pendingApproval(events)) return false;
   const state = turnState(events);
   return state === 'unfinished' || state === 'paused' || pendingInputs(events).length > 0;
 }

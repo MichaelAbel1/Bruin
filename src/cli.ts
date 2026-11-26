@@ -40,6 +40,8 @@ import { createSubagentRunner } from './runtime/subagent.js';
 import { canResumeTurn, turnState } from './core/turn-state.js';
 import { reduceSessionState, type SessionState } from './core/session-state.js';
 import { pendingQuestion, recordQuestionAnswer, type PendingQuestion } from './core/question.js';
+import { pendingApproval, recordApprovalDecision, type PendingApproval } from './core/approval.js';
+import { agentRoles, isAgentRole, rolePreset, type AgentRole } from './core/roles.js';
 import { runService } from './runtime/service.js';
 import { sendAttentionWebhook } from './runtime/notify.js';
 import { toolsForMode, toolDefinitions } from './core/tools.js';
@@ -50,7 +52,7 @@ const help = `Bruin — local coding agent
 
 bruin model add ALIAS PROVIDER MODEL [BASE_URL] [API_KEY_ENV] [--context-tokens N]
 bruin model list | default ALIAS
-bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--answer QUESTION_ID] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [--json] [PROMPT]
+bruin chat [--model ALIAS] [--workspace DIR] [--resume SESSION_ID] [--answer QUESTION_ID] [--approve APPROVAL_ID [--scope once|session|always] | --deny APPROVAL_ID] [--pause-on-approval] [--role explorer|reviewer|implementer|verifier] [--max-model-calls 24|96|240|480] [--allow-workspace-edits] [--unattended] [--json] [PROMPT]
 bruin sessions list | show SESSION_ID | status SESSION_ID
 bruin service run [--timezone IANA_ZONE]
 bruin acp [--model ALIAS]
@@ -123,18 +125,47 @@ async function chatOptions(args: string[]) {
   const workspaceArg = takeFlag(args, '--workspace');
   const resume = takeFlag(args, '--resume');
   const answerTo = takeFlag(args, '--answer');
+  const approveId = takeFlag(args, '--approve');
+  const denyId = takeFlag(args, '--deny');
+  const scopeArg = takeFlag(args, '--scope');
+  const roleArg = takeFlag(args, '--role');
   const maxCallsArg = takeFlag(args, '--max-model-calls');
-  const maxModelCalls = maxCallsArg === undefined ? 24 : Number(maxCallsArg);
   const allowWorkspaceEdits = args.includes('--allow-workspace-edits');
   if (allowWorkspaceEdits) args.splice(args.indexOf('--allow-workspace-edits'), 1);
   const unattended = args.includes('--unattended');
   if (unattended) args.splice(args.indexOf('--unattended'), 1);
   const jsonOutput = args.includes('--json');
   if (jsonOutput) args.splice(args.indexOf('--json'), 1);
-  if (![24, 96, 240, 480].includes(maxModelCalls)) throw new Error('无效的长任务调用预算');
-  if (allowWorkspaceEdits && maxModelCalls === 24)
+  const pauseOnApproval = args.includes('--pause-on-approval');
+  if (pauseOnApproval) args.splice(args.indexOf('--pause-on-approval'), 1);
+  if (approveId !== undefined && denyId !== undefined)
+    throw new Error('--approve 和 --deny 不能同时使用');
+  const approvalScope = scopeArg ?? 'once';
+  if (!['once', 'session', 'always'].includes(approvalScope))
+    throw new Error('--scope 必须是 once、session 或 always');
+  if (scopeArg !== undefined && approveId === undefined)
+    throw new Error('--scope 仅可与 --approve 配合使用');
+  if ((approveId !== undefined || denyId !== undefined) && !resume)
+    throw new Error('--approve 和 --deny 需要 --resume');
+  if ((approveId !== undefined || denyId !== undefined) && answerTo !== undefined)
+    throw new Error('--approve/--deny 不能与 --answer 同时使用');
+  let role: AgentRole | undefined;
+  if (roleArg !== undefined) {
+    if (!isAgentRole(roleArg))
+      throw new Error('无效的 --role，可选值：explorer、reviewer、implementer、verifier');
+    role = roleArg;
+  }
+  const maxModelCalls =
+    maxCallsArg === undefined
+      ? role
+        ? rolePreset(role).defaultMaxSteps
+        : 24
+      : Number(maxCallsArg);
+  if (maxCallsArg !== undefined && ![24, 96, 240, 480].includes(maxModelCalls))
+    throw new Error('无效的长任务调用预算');
+  if (allowWorkspaceEdits && maxModelCalls <= 24)
     throw new Error('--allow-workspace-edits 需要长任务调用预算');
-  if (unattended && maxModelCalls === 24) throw new Error('--unattended 需要长任务调用预算');
+  if (unattended && maxModelCalls <= 24) throw new Error('--unattended 需要长任务调用预算');
   if (maxModelCalls === 480 && !unattended) throw new Error('480 次模型调用需要 --unattended');
   const effectiveUnattended = unattended || jsonOutput || !stdin.isTTY;
   const prompt = await readChatPrompt(args.join(' '));
@@ -147,6 +178,11 @@ async function chatOptions(args: string[]) {
     workspaceArg,
     resume,
     answerTo,
+    approveId,
+    denyId,
+    approvalScope: approvalScope as 'once' | 'session' | 'always',
+    pauseOnApproval,
+    role,
     maxModelCalls,
     allowWorkspaceEdits,
     effectiveUnattended,
@@ -230,9 +266,12 @@ async function main(): Promise<void> {
             desktop: Object.keys(toolsForMode('full', true)),
             acp: Object.keys(toolsForMode('full')),
             service: Object.keys(toolsForMode('full', true)),
+            planning: Object.keys(toolsForMode('planning', true)),
             subagent: Object.keys(toolsForMode('read-only')),
             worktreeSubagent: Object.keys(toolsForMode('worktree')),
+            verifier: Object.keys(toolsForMode('verifier')),
           },
+          roles: agentRoles,
           tools: Object.fromEntries(
             Object.entries(toolDefinitions).map(([name, definition]) => [
               name,
@@ -468,6 +507,11 @@ async function main(): Promise<void> {
       workspaceArg,
       resume,
       answerTo,
+      approveId,
+      denyId,
+      approvalScope,
+      pauseOnApproval,
+      role,
       maxModelCalls,
       allowWorkspaceEdits,
       effectiveUnattended,
@@ -531,18 +575,27 @@ async function main(): Promise<void> {
           )
             return true;
         }
+        if (pauseOnApproval) return 'pause' as const;
         if (effectiveUnattended)
           return '无人值守模式：此操作没有预先授权，已拒绝。请不要重复请求；改用已授权工具或说明需要用户批准。';
         const answer = await askLine(
           rl,
-          `\n批准 ${call.name} ${JSON.stringify(call.input)}? ${reason} [y/N] `,
+          `\n批准 ${call.name} ${JSON.stringify(call.input)}? ${reason} [y/N/p(稍后审批)] `,
           signal,
         );
+        if (answer !== null && /^p(ause)?$/i.test(answer.trim())) return 'pause' as const;
         return answer !== null && /^y(es)?$/i.test(answer.trim());
       },
     };
     const services = new RuntimeServices(store, executor, createSubagentRunner(store, executor));
-    const runner = new AgentRunner(store, new AiSdkGateway('full', true), executor, io, services);
+    const gatewayMode = role ? rolePreset(role).toolMode : 'full';
+    const runner = new AgentRunner(
+      store,
+      new AiSdkGateway(gatewayMode, true),
+      executor,
+      io,
+      services,
+    );
     const runOptions =
       maxModelCalls > 24
         ? {
@@ -552,8 +605,15 @@ async function main(): Promise<void> {
             allowQuestions: true,
             unattended: effectiveUnattended,
             allowWorkspaceEdits,
+            ...(role ? { role } : {}),
           }
-        : { unattended: effectiveUnattended, allowWorkspaceEdits, allowQuestions: true };
+        : {
+            ...(maxModelCalls !== 24 ? { maxModelCalls } : {}),
+            unattended: effectiveUnattended,
+            allowWorkspaceEdits,
+            allowQuestions: true,
+            ...(role ? { role } : {}),
+          };
     const controller = new AbortController();
     const leaseSessionId = session.id;
     let lease: ReturnType<RuntimeServices['sessionLeases']['retain']> | undefined;
@@ -585,7 +645,20 @@ async function main(): Promise<void> {
         );
         return;
       }
-      if (state.phase === 'awaiting_input' && state.pendingQuestion) {
+      if (state.phase === 'awaiting_approval' && state.pendingApproval) {
+        await sendAttentionWebhook(
+          {
+            event: 'awaiting_approval',
+            sessionId: leaseSessionId,
+            workspace: session.workspace,
+            phase: state.phase,
+            approvalId: state.pendingApproval.id,
+            toolName: state.pendingApproval.name,
+            reason: state.pendingApproval.reason || `等待审批工具 ${state.pendingApproval.name}`,
+          },
+          { extraSecrets },
+        );
+      } else if (state.phase === 'awaiting_input' && state.pendingQuestion) {
         await sendAttentionWebhook(
           {
             event: 'awaiting_input',
@@ -655,6 +728,7 @@ async function main(): Promise<void> {
               turnState: state.turnState,
               canResume: state.canResume,
               needsReview: state.needsReview,
+              pendingApproval: state.pendingApproval,
               pendingQuestion: state.pendingQuestion,
               usage: state.usage,
               answer,
@@ -699,6 +773,54 @@ async function main(): Promise<void> {
           `会话 ${session.id} | 工作区 ${session.workspace} | 模型 ${session.profile.alias}`,
         );
       }
+      const printApproval = (approval: PendingApproval) => {
+        console.log(
+          `\n待审批工具 ${approval.id}: ${approval.name} ${JSON.stringify(approval.input)}`,
+        );
+        if (approval.reason) console.log(`原因：${approval.reason}`);
+      };
+      const reportApprovalUnattended = async () => {
+        const state = reduceSessionState(store.events(leaseSessionId));
+        const approval = state.pendingApproval;
+        if (!approval) return false;
+        await notifyAttention(state);
+        if (jsonOutput) {
+          emitJsonSummary(2);
+        } else {
+          printApproval(approval);
+          console.log(
+            `使用 bruin chat --resume ${leaseSessionId} --approve ${approval.id} 或 --deny ${approval.id} 继续任务`,
+          );
+          process.exitCode = 2;
+        }
+        return true;
+      };
+      const resolvePendingApprovalsInteractively = async (): Promise<boolean> => {
+        while (!controller.signal.aborted) {
+          const approval = pendingApproval(store.events(leaseSessionId));
+          if (!approval) return true;
+          printApproval(approval);
+          const line = await askLine(rl, '\n是否批准该工具调用? [y/N/exit] ', controller.signal);
+          if (controller.signal.aborted) throw new Error('已取消');
+          if (line === null || /^(?:\/?exit)$/i.test(line.trim())) {
+            console.log(
+              `使用 bruin chat --resume ${leaseSessionId} --approve ${approval.id} 或 --deny ${approval.id} 继续任务`,
+            );
+            process.exitCode = 2;
+            return false;
+          }
+          const approved = /^y(es)?$/i.test(line.trim());
+          recordApprovalDecision(store, leaseSessionId, approval.id, approved, { source: 'cli' });
+          store.append(session.id, 'run_configured', {
+            maxModelCalls,
+            allowWorkspaceEdits,
+            unattended: effectiveUnattended,
+          });
+          await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
+          stdout.write('\n');
+        }
+        return false;
+      };
       const reportQuestionUnattended = async () => {
         const state = reduceSessionState(store.events(leaseSessionId));
         const question = state.pendingQuestion;
@@ -752,13 +874,57 @@ async function main(): Promise<void> {
         }
         return false;
       };
-      if (answerTo !== undefined) recordQuestionAnswer(store, session.id, answerTo, prompt);
-      else if (effectiveUnattended) {
+      const handledApproval = approveId !== undefined || denyId !== undefined;
+      if (handledApproval) {
+        const targetApprovalId = (approveId ?? denyId)!;
+        if (approveId !== undefined && approvalScope !== 'once') {
+          const pending = pendingApproval(store.events(session.id));
+          if (pending && pending.id === approveId) {
+            if (pending.name !== 'shell' || typeof pending.input.command !== 'string')
+              throw new Error('仅 Shell 命令支持记住授权');
+            const command = pending.input.command;
+            if (isMaliciousShell(command)) throw new Error('高危破坏性命令不支持记住授权');
+            const ruleSessionId = approvalScope === 'session' ? session.id : undefined;
+            updateConfig((config) => {
+              if (
+                !config.approvedCommands.some(
+                  (rule) =>
+                    rule.workspace === session.workspace &&
+                    rule.command === command &&
+                    rule.sessionId === ruleSessionId,
+                )
+              )
+                config.approvedCommands.push({
+                  workspace: session.workspace,
+                  command,
+                  ...(ruleSessionId ? { sessionId: ruleSessionId } : {}),
+                });
+              return config;
+            });
+          }
+        }
+        recordApprovalDecision(store, session.id, targetApprovalId, approveId !== undefined, {
+          source: 'cli',
+          ...(denyId !== undefined && prompt.trim() ? { reason: prompt.trim() } : {}),
+        });
+      } else if (answerTo !== undefined) {
+        recordQuestionAnswer(store, session.id, answerTo, prompt);
+      } else if (effectiveUnattended) {
+        if (await reportApprovalUnattended()) return;
         if (await reportQuestionUnattended()) return;
-      } else if (!(await resolvePendingQuestionsInteractively())) {
-        return;
+      } else {
+        if (!(await resolvePendingApprovalsInteractively())) return;
+        if (!(await resolvePendingQuestionsInteractively())) return;
       }
-      if (prompt) {
+      if (handledApproval) {
+        store.append(session.id, 'run_configured', {
+          maxModelCalls,
+          allowWorkspaceEdits,
+          unattended: effectiveUnattended,
+        });
+        await runner.run(session, undefined, controller.signal, [], undefined, runOptions);
+        if (!jsonOutput) stdout.write('\n');
+      } else if (prompt) {
         store.append(session.id, 'run_configured', {
           maxModelCalls,
           allowWorkspaceEdits,
@@ -783,6 +949,7 @@ async function main(): Promise<void> {
         if (!jsonOutput) stdout.write('\n');
       }
       if (effectiveUnattended) {
+        if (await reportApprovalUnattended()) return;
         if (await reportQuestionUnattended()) return;
         const state = reduceSessionState(store.events(session.id));
         if (state.phase === 'awaiting_review') {
@@ -801,6 +968,7 @@ async function main(): Promise<void> {
         return;
       }
       while (!controller.signal.aborted) {
+        if (!(await resolvePendingApprovalsInteractively())) break;
         if (!(await resolvePendingQuestionsInteractively())) break;
         const line = await askLine(rl, '\n你> ', controller.signal);
         if (controller.signal.aborted) throw new Error('已取消');
@@ -817,7 +985,12 @@ async function main(): Promise<void> {
           continue;
         }
         if (line.trim() === '/stop') {
-          if (turnState(store.events(session.id)) === 'paused') {
+          const currentEvents = store.events(session.id);
+          if (
+            turnState(currentEvents) === 'paused' ||
+            pendingApproval(currentEvents) ||
+            pendingQuestion(currentEvents)
+          ) {
             store.append(session.id, 'turn_completed', { stoppedByUser: true });
             console.log('已结束暂停的任务');
           } else console.log('当前没有暂停的任务');

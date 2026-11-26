@@ -45,6 +45,7 @@ import { connectorTemplates } from './connectors.js';
 import type { AttachmentRef } from '../../../src/core/attachments.js';
 import type { PatchPreflight } from '../../../src/core/workspace-patch.js';
 import { pendingQuestion } from '../../../src/core/question.js';
+import { pendingApproval } from '../../../src/core/approval.js';
 import {
   memoryReviewTurns,
   type MemoryReviewPreview,
@@ -831,6 +832,7 @@ function App() {
     if (
       !view ||
       isOtherBusy ||
+      pendingApproval(view.events) ||
       pendingQuestion(view.events) ||
       (!composer.trim() && !attachments.length && !quote) ||
       sending ||
@@ -922,20 +924,52 @@ function App() {
         fail(err);
       }
   }
+  const persistedApproval = view ? pendingApproval(view.events) : undefined;
+  const activeApproval: (Approval & { persisted?: boolean }) | null =
+    approval ??
+    (persistedApproval && view
+      ? {
+          sessionId: view.session.id,
+          workspace: persistedApproval.workspace,
+          approvalId: persistedApproval.id,
+          call: { name: persistedApproval.name, input: persistedApproval.input },
+          reason: persistedApproval.reason,
+          persisted: true,
+        }
+      : null);
   async function decide(approved: boolean) {
-    if (!approval || deciding) return;
-    const currentApproval = approval;
+    if (!activeApproval || deciding) return;
+    const currentApproval = activeApproval;
     const scope = approvalScope;
     setDeciding(true);
     try {
-      await api('answerApproval', {
-        approvalId: currentApproval.approvalId,
-        approved,
-        scope,
-      });
+      const result = await api<{ accepted?: boolean; started?: boolean; events?: SessionEvent[] }>(
+        'answerApproval',
+        {
+          sessionId: currentApproval.sessionId,
+          approvalId: currentApproval.approvalId,
+          approved,
+          scope,
+          ...(currentApproval.persisted
+            ? {
+                maxModelCalls,
+                allowWorkspaceEdits: maxModelCalls > 24 && allowWorkspaceEdits,
+                unattended: maxModelCalls > 24 && unattended,
+              }
+            : {}),
+        },
+      );
       setApproval((current) =>
         current?.approvalId === currentApproval.approvalId ? null : current,
       );
+      if (result.started) setBusySessionId(currentApproval.sessionId);
+      if (result.events) {
+        setView((previous) =>
+          acceptsEventSnapshot(previous, currentApproval.sessionId, result.events!)
+            ? { ...previous!, events: result.events! }
+            : previous,
+        );
+      }
       if (approved && scope !== 'once') {
         const settings = await api<{ config: Config; sessionCommands: [string, string][] }>(
           'getApprovalSettings',
@@ -946,6 +980,21 @@ function App() {
           setSessionApprovedCommands(settings.sessionCommands);
         }
       }
+    } catch (err) {
+      fail(err);
+    } finally {
+      setDeciding(false);
+    }
+  }
+  async function deferApproval() {
+    if (!approval || deciding) return;
+    const currentApproval = approval;
+    setDeciding(true);
+    try {
+      await api('pauseApproval', { approvalId: currentApproval.approvalId });
+      setApproval((current) =>
+        current?.approvalId === currentApproval.approvalId ? null : current,
+      );
     } catch (err) {
       fail(err);
     } finally {
@@ -1884,7 +1933,7 @@ function App() {
             </div>
           </>
         )}
-        {approval && (
+        {activeApproval && (
           <div className="approval-dock" role="region" aria-label="工具操作审批">
             <div className="approval-panel">
               <div className="approval-head">
@@ -1892,20 +1941,23 @@ function App() {
                   <ShieldCheck size={22} />
                 </div>
                 <div>
-                  <span className="eyebrow">TOOL APPROVAL</span>
+                  <span className="eyebrow">
+                    {activeApproval.persisted ? 'SAVED TOOL APPROVAL' : 'TOOL APPROVAL'}
+                  </span>
                   <h2>允许 Bruin 执行此操作？</h2>
                 </div>
               </div>
-              <p title={approval.workspace}>
-                {approval.workspace ?? '工作区路径未提供'} · 会话 {approval.sessionId.slice(0, 8)}
+              <p title={activeApproval.workspace}>
+                {activeApproval.workspace ?? '工作区路径未提供'} · 会话{' '}
+                {activeApproval.sessionId.slice(0, 8)}
               </p>
-              <p>{approval.reason}</p>
+              <p>{activeApproval.reason}</p>
               <div className="approval-name">
                 <Terminal size={15} />
-                {approval.call.name}
+                {activeApproval.call.name}
               </div>
-              <pre>{JSON.stringify(approval.call.input, null, 2)}</pre>
-              {approval.call.name === 'shell' && (
+              <pre>{JSON.stringify(activeApproval.call.input, null, 2)}</pre>
+              {activeApproval.call.name === 'shell' && (
                 <div className="approval-scope">
                   <label htmlFor="approval-scope">授权范围（仅对相同工作区中的完整命令生效）</label>
                   <select
@@ -1928,11 +1980,20 @@ function App() {
                 >
                   拒绝
                 </button>
+                {!activeApproval.persisted && (
+                  <button
+                    className="secondary"
+                    disabled={deciding}
+                    onClick={() => void deferApproval()}
+                  >
+                    稍后审批
+                  </button>
+                )}
                 <button className="primary" disabled={deciding} onClick={() => void decide(true)}>
                   <Check size={16} /> 允许
-                  {approvalScope === 'session' && approval.call.name === 'shell'
+                  {approvalScope === 'session' && activeApproval.call.name === 'shell'
                     ? '本会话'
-                    : approvalScope === 'always' && approval.call.name === 'shell'
+                    : approvalScope === 'always' && activeApproval.call.name === 'shell'
                       ? '并记住'
                       : '本次操作'}
                 </button>

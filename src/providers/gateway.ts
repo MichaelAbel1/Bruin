@@ -16,7 +16,7 @@ export interface ModelReply {
   providerMessages?: ModelMessage[];
 }
 export interface ModelGateway {
-  inputOverheadTokens?(): number;
+  inputOverheadTokens?(toolMode?: ToolMode): number;
   summarize?(
     profile: ModelProfile,
     source: string,
@@ -28,6 +28,7 @@ export interface ModelGateway {
     prompt: ModelMessage[],
     signal: AbortSignal,
     onText: (text: string) => void,
+    toolMode?: ToolMode,
   ): Promise<ModelReply>;
 }
 export { toolSchemas } from '../core/tools.js';
@@ -116,19 +117,25 @@ export async function proposeMemory(profile: ModelProfile, source: string, signa
 }
 
 export class AiSdkGateway implements ModelGateway {
-  private cachedOverheadTokens?: number;
+  private cachedOverheadTokens = new Map<string, number>();
   constructor(
     private mode: ToolMode = 'basic',
     private allowQuestions = false,
   ) {}
-  inputOverheadTokens(): number {
+  inputOverheadTokens(toolMode?: ToolMode): number {
     // Include tool definitions and a protocol margin, even before usage is available.
-    return (this.cachedOverheadTokens ??=
+    const effectiveMode = toolMode ?? this.mode;
+    const key = `${effectiveMode}:${this.allowQuestions}`;
+    const cached = this.cachedOverheadTokens.get(key);
+    if (cached !== undefined) return cached;
+    const tokens =
       estimateTokens(
-        JSON.stringify(toolsForMode(this.mode, this.allowQuestions), (_key, value) =>
+        JSON.stringify(toolsForMode(effectiveMode, this.allowQuestions), (_key, value) =>
           value instanceof z.ZodType ? z.toJSONSchema(value) : value,
         ),
-      ) + 256);
+      ) + 256;
+    this.cachedOverheadTokens.set(key, tokens);
+    return tokens;
   }
   async summarize(
     profile: ModelProfile,
@@ -153,6 +160,7 @@ export class AiSdkGateway implements ModelGateway {
     prompt: ModelMessage[],
     signal: AbortSignal,
     onText: (text: string) => void,
+    toolMode?: ToolMode,
   ): Promise<ModelReply> {
     // Some Claude models reject assistant prefills. An SDK tool result already
     // becomes a user message, so a continuation is only needed after an assistant message.
@@ -163,10 +171,11 @@ export class AiSdkGateway implements ModelGateway {
             { role: 'user', content: 'Continue the current task from the recorded results.' },
           ]
         : prompt;
+    const effectiveMode = toolMode ?? this.mode;
     const result = streamText({
       model: providerModel(profile),
       messages,
-      tools: toolsForMode(this.mode, this.allowQuestions),
+      tools: toolsForMode(effectiveMode, this.allowQuestions),
       abortSignal: signal,
       // AgentRunner owns retries, notices and cancellation. Avoid multiplying attempts.
       maxRetries: 0,

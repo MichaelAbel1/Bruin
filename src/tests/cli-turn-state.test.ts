@@ -333,3 +333,74 @@ test('CLI sessions status and chat --json emit structured machine-readable outpu
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('CLI supports --pause-on-approval, cross-restart --approve, --role, and capabilities roles', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bruin-cli-approval-'));
+  try {
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home);
+    const model = { alias: 'test', provider: 'openai-compatible', model: 'mock' };
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ profiles: [model] }));
+    const preloader = path.join(dir, 'mock-model.mjs');
+    const gateway = new URL('../providers/gateway.js', import.meta.url).href;
+    fs.writeFileSync(
+      preloader,
+      `
+      import { AiSdkGateway } from ${JSON.stringify(gateway)};
+      AiSdkGateway.prototype.complete = async (_profile, prompt) => {
+        const serialized = JSON.stringify(prompt);
+        if (serialized.includes('tool_result') || serialized.includes('write-cli-1') || serialized.includes('approved.txt')) {
+          return { text: 'approved and completed', calls: [] };
+        }
+        return {
+          text: '',
+          calls: [{
+            id: 'write-cli-1',
+            name: 'write_file',
+            input: { path: 'approved.txt', content: 'resumed-ok' },
+          }],
+        };
+      };
+    `,
+    );
+    const cli = fileURLToPath(new URL('../cli.js', import.meta.url));
+    const run = (args: string[]) =>
+      spawnSync(process.execPath, ['--import', pathToFileURL(preloader).href, cli, ...args], {
+        cwd: dir,
+        env: { ...process.env, BRUIN_HOME: home },
+        input: '',
+        encoding: 'utf8',
+        timeout: 8000,
+      });
+
+    const caps = run(['capabilities']);
+    assert.equal(caps.status, 0, caps.stderr);
+    const capsJson = JSON.parse(caps.stdout);
+    assert.ok(Array.isArray(capsJson.modes.planning));
+    assert.ok(Array.isArray(capsJson.modes.verifier));
+    assert.ok(capsJson.roles.explorer && capsJson.roles.verifier);
+
+    const paused = run(['chat', '--model', 'test', '--pause-on-approval', '--json', 'create file']);
+    assert.equal(paused.status, 2, paused.stderr);
+    const pausedJson = JSON.parse(paused.stdout);
+    assert.equal(pausedJson.phase, 'awaiting_approval');
+    assert.equal(pausedJson.pendingApproval?.name, 'write_file');
+    assert.equal(fs.existsSync(path.join(dir, 'approved.txt')), false);
+
+    const resumed = run([
+      'chat',
+      '--resume',
+      pausedJson.sessionId,
+      '--approve',
+      pausedJson.pendingApproval.id,
+      '--json',
+    ]);
+    assert.equal(resumed.status, 0, resumed.stderr);
+    const resumedJson = JSON.parse(resumed.stdout);
+    assert.equal(resumedJson.phase, 'completed');
+    assert.equal(resumedJson.answer, 'approved and completed');
+    assert.equal(fs.readFileSync(path.join(dir, 'approved.txt'), 'utf8'), 'resumed-ok');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

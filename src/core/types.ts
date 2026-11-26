@@ -18,6 +18,7 @@ export type EventType =
   | 'input_queued'
   | 'assistant'
   | 'tool_requested'
+  | 'approval_pending'
   | 'tool_approved'
   | 'tool_denied'
   | 'tool_started'
