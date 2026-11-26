@@ -88,8 +88,12 @@ function setBuiltinEnabled(name: string, enabled: boolean): void {
     const settings = { ...builtinSettings(), [name]: enabled };
     fs.mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
     const temp = `${builtinSettingsPath()}.${process.pid}.${randomUUID()}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(settings, null, 2), { mode: 0o600 });
-    fs.renameSync(temp, builtinSettingsPath());
+    try {
+      fs.writeFileSync(temp, JSON.stringify(settings, null, 2), { mode: 0o600 });
+      fs.renameSync(temp, builtinSettingsPath());
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
   });
 }
 function builtinSkills(): SkillInfo[] {
@@ -382,8 +386,12 @@ export function setSkillEnabled(name: string, enabled: boolean): void {
     const data = JSON.parse(readSkillText(file, 64_000));
     data.enabled = enabled;
     const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 });
-    fs.renameSync(temp, file);
+    try {
+      fs.writeFileSync(temp, JSON.stringify(data, null, 2), { mode: 0o600 });
+      fs.renameSync(temp, file);
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
   });
 }
 export function uninstallSkill(name: string): void {

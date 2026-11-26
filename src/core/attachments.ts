@@ -66,11 +66,19 @@ function xmlText(value: string): string {
   return value
     .replace(/<\/w:p>|<\/row>/g, '\n')
     .replace(/<[^>]+>/g, '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => {
+      const cp = Number.parseInt(hex, 16);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+    })
+    .replace(/&#(\d+);/g, (_, dec: string) => {
+      const cp = Number.parseInt(dec, 10);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+    })
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
 }
 function extractedText(text: string, note?: string): { text: string; note?: string } {
   if (text.length <= 60_000) return { text, ...(note ? { note } : {}) };

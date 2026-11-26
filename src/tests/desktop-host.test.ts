@@ -108,7 +108,7 @@ test('desktop host manages models, sessions, recovery and skills over JSON lines
       provider: 'openai-compatible',
       model: 'test',
       baseUrl: `http://127.0.0.1:${address.port}/v1`,
-      apiKey: key,
+      apiKey: `  ${key}\n`,
       contextWindowTokens: 65_536,
     });
     assert.equal(config.profiles[0].contextWindowTokens, 65_536);

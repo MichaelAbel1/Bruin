@@ -263,6 +263,7 @@ function loadAppearance() {
 }
 function applyIcon() {
   const icon = iconPath(iconBackground);
+  if (!fs.existsSync(icon)) return;
   if (process.platform === 'darwin' && app.dock) app.dock.setIcon(icon);
   if (window && !window.isDestroyed() && process.platform !== 'darwin') window.setIcon(icon);
 }
@@ -353,10 +354,16 @@ function startHost() {
         try {
           const url = new URL(message.url);
           if (
-            url.protocol === 'https:' ||
-            (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
-          )
+            !url.username &&
+            !url.password &&
+            (url.protocol === 'https:' ||
+              (url.protocol === 'http:' &&
+                ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)))
+          ) {
             void shell.openExternal(url.href).catch(() => {});
+          } else {
+            sendToWindow({ type: 'notice', message: '无效或不安全的 OAuth 授权地址' });
+          }
         } catch {
           sendToWindow({ type: 'notice', message: '无效的 OAuth 授权地址' });
         }

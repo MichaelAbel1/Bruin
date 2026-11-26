@@ -824,9 +824,13 @@ async function main(): Promise<void> {
           continue;
         }
         if (line.startsWith('/model ')) {
-          store.setProfile(session.id, findProfile(line.slice(7).trim()), lease.owner);
-          session = store.getSession(session.id)!;
-          console.log(`模型已切换为 ${session.profile.alias}`);
+          try {
+            store.setProfile(session.id, findProfile(line.slice(7).trim()), lease.owner);
+            session = store.getSession(session.id)!;
+            console.log(`模型已切换为 ${session.profile.alias}`);
+          } catch (err) {
+            console.error(err instanceof Error ? err.message : String(err));
+          }
           continue;
         }
         store.append(session.id, 'run_configured', {

@@ -91,6 +91,12 @@ export function buildPrompt(
         if (e.type === 'tool_unknown') {
           return `tool ${String(e.payload.name ?? '')} (interrupted)`;
         }
+        if (e.type === 'plan_updated') {
+          const steps = Array.isArray(e.payload.steps)
+            ? e.payload.steps.map(String).join('; ').slice(0, 300)
+            : '';
+          return steps ? `plan updated: ${steps}` : '';
+        }
         return '';
       })
       .filter(Boolean)

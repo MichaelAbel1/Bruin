@@ -895,6 +895,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
       return viewSession(session);
     }
     case 'setPlanProgress': {
+      if (active) throw new Error('运行中不能修改规划进度');
       const session = getSession(p.sessionId);
       setPlanProgress(
         store,
@@ -1053,6 +1054,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         input: parsed.data as Record<string, unknown>,
       };
       const controller = new AbortController();
+      activeToolControllers.add(controller);
       const lease =
         name === 'spawn_subagent' || candidate
           ? services.sessionLeases.retain(session.id, controller)
@@ -1103,6 +1105,7 @@ async function dispatch(method: string, p: Record<string, unknown>) {
           throw error;
         }
       } finally {
+        activeToolControllers.delete(controller);
         lease?.release();
       }
     }
@@ -1166,9 +1169,10 @@ async function dispatch(method: string, p: Record<string, unknown>) {
         current.defaultProfile ??= alias;
         return current;
       });
-      if (p.clearApiKey === true || (previous && previous.provider !== provider && !p.apiKey))
+      const apiKey = typeof p.apiKey === 'string' ? p.apiKey.trim() : '';
+      if (p.clearApiKey === true || (previous && previous.provider !== provider && !apiKey))
         setRuntimeApiKey(alias, undefined);
-      else if (typeof p.apiKey === 'string' && p.apiKey) setRuntimeApiKey(alias, p.apiKey);
+      else if (apiKey) setRuntimeApiKey(alias, apiKey);
       for (const session of store.listSessions()) {
         if (session.profile.alias !== alias) continue;
         const nextProfile = {
@@ -1384,6 +1388,8 @@ const scheduler = setInterval(() => {
 }, 15_000);
 scheduler.unref();
 
+const inFlightRequests = new Set<Promise<unknown>>();
+const activeToolControllers = new Set<AbortController>();
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on('line', (line) => {
   let request: Request;
@@ -1405,24 +1411,30 @@ lines.on('line', (line) => {
     request.params && typeof request.params === 'object' && !Array.isArray(request.params)
       ? request.params
       : {};
-  void dispatch(request.method, params)
+  const task = dispatch(request.method, params)
     .then((result) => send({ id: request.id, result }))
     .catch((error) =>
       send({ id: request.id, error: error instanceof Error ? error.message : String(error) }),
-    );
+    )
+    .finally(() => {
+      inFlightRequests.delete(task);
+    });
+  inFlightRequests.add(task);
 });
 async function shutdown() {
   lines.close();
   clearInterval(scheduler);
   active?.controller.abort();
   memoryReviewRun?.controller.abort();
+  for (const controller of activeToolControllers) controller.abort();
   for (const pending of approvals.values()) pending.resolve(false);
   approvals.clear();
   await activeRun;
   await scheduled;
   await memoryReviewRun?.result.catch(() => {});
-  await Promise.allSettled([...inFlightWebhooks]);
   await services.close();
+  await Promise.allSettled([...inFlightRequests]);
+  await Promise.allSettled([...inFlightWebhooks]);
   await executor.close();
   store.close();
 }

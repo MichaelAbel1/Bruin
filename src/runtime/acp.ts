@@ -58,6 +58,7 @@ export class AcpServer {
   private initialized = false;
   private entries = new Map<string, Entry>();
   private permissions = new Map<string, Permission>();
+  private inFlight = new Set<Promise<void>>();
   private nextId = 0;
   private closing = false;
   constructor(
@@ -186,7 +187,14 @@ export class AcpServer {
       });
     });
   }
-  async handle(value: unknown): Promise<void> {
+  handle(value: unknown): Promise<void> {
+    const task = this.handleInner(value).finally(() => {
+      this.inFlight.delete(task);
+    });
+    this.inFlight.add(task);
+    return task;
+  }
+  private async handleInner(value: unknown): Promise<void> {
     const envelope = z
       .object({
         jsonrpc: z.literal('2.0'),
@@ -255,8 +263,13 @@ export class AcpServer {
       const p = newParams
         .extend({ sessionId: sessionParams.shape.sessionId.optional() })
         .parse(params);
-      const root = fs.realpathSync(p.cwd);
-      if (!fs.statSync(root).isDirectory()) throw new RpcError(-32602, 'cwd must be a directory');
+      let root: string;
+      try {
+        root = fs.realpathSync(p.cwd);
+        if (!fs.statSync(root).isDirectory()) throw new Error('not a directory');
+      } catch {
+        throw new RpcError(-32602, 'cwd must be an existing directory');
+      }
       if (method === 'session/load') {
         if (!p.sessionId) throw new RpcError(-32602, 'sessionId is required');
         const session = this.store.getSession(p.sessionId);
@@ -407,6 +420,7 @@ export class AcpServer {
     this.closing = true;
     for (const entry of this.entries.values()) entry.controller?.abort();
     for (const permission of [...this.permissions.values()]) permission.resolve(false);
+    await Promise.allSettled([...this.inFlight]);
     await Promise.allSettled([...this.entries.values()].map((entry) => entry.run));
     await Promise.allSettled([...this.entries.values()].map((entry) => entry.services.close()));
     this.entries.clear();

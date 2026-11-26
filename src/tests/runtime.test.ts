@@ -1201,6 +1201,14 @@ test('remote MCP configuration requires HTTPS when leaving the local machine', (
       .success,
     true,
   );
+  assert.equal(
+    mcpServerSchema.safeParse({
+      name: 'creds',
+      transport: 'http',
+      url: 'https://user:pass@example.com/mcp',
+    }).success,
+    false,
+  );
 });
 
 test('services.execute returns isError for pre-execution validation and throws on runtime failure', async () => {

@@ -219,6 +219,7 @@ export function FileEditorViewer({
           {isDirty && (
             <button
               className="file-action-btn revert"
+              disabled={saving}
               onClick={onRevert}
               title="放弃修改，还原到磁盘文件"
             >

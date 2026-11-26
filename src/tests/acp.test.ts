@@ -312,6 +312,15 @@ test('ACP negotiates v1, validates capabilities, preserves streams and records n
     assert.equal((await f.request('session/new', {})).error.code, -32600);
     assert.equal((await f.request('initialize', { protocolVersion: 2 })).result.protocolVersion, 1);
     assert.equal((await f.request('session/new', { cwd: '.', mcpServers: [] })).error.code, -32602);
+    assert.equal(
+      (
+        await f.request('session/new', {
+          cwd: path.join(f.dir, 'does-not-exist-subdir'),
+          mcpServers: [],
+        })
+      ).error.code,
+      -32602,
+    );
     const created = await f.request('session/new', { cwd: f.dir, mcpServers: [] });
     const sessionId = created.result.sessionId;
     assert.equal((await f.request('session/load', {})).error.code, -32602);

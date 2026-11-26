@@ -2634,6 +2634,9 @@ pre {
   padding: 1px 7px;
   border-radius: 4px;
 }
+.modal:focus {
+  outline: none;
+}
 .plan-badge.pending {
   background: rgba(224, 160, 48, 0.16);
   color: #f0b443;
@@ -2643,6 +2646,11 @@ pre {
   background: rgba(93, 138, 67, 0.2);
   color: #9cd775;
   border: 1px solid rgba(93, 138, 67, 0.4);
+}
+.plan-badge.inactive {
+  background: rgba(142, 150, 156, 0.16);
+  color: #9ba5ac;
+  border: 1px solid rgba(142, 150, 156, 0.32);
 }
 .plan-close-btn {
   font-size: 11px;
@@ -2969,6 +2977,11 @@ pre {
   background: #ebf6e5;
   color: #266b0a;
   border: 1px solid #99ce7f;
+}
+:root[data-theme='light'] .plan-badge.inactive {
+  background: #f0f2f4;
+  color: #5c656c;
+  border: 1px solid #d5dbe0;
 }
 :root[data-theme='light'] .composer-hint {
   color: #8c959f;

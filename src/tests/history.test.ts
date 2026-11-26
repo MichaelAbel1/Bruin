@@ -463,3 +463,28 @@ test('compactToolError strips ANSI codes, collapses repeated lines, and caps err
   assert.match(capped, /unique error line 399/);
   assert.match(capped, /中间内容已压缩/);
 });
+
+test('history-limit fallback summary preserves plan_updated steps', () => {
+  const event = (
+    seq: number,
+    type: SessionEvent['type'],
+    payload: Record<string, unknown>,
+  ): SessionEvent => ({ sessionId: 'plan-fallback', seq, type, at: '', payload });
+  const messages = buildPrompt(
+    [
+      event(1, 'user', { text: 'Initial request ' + 'a'.repeat(500) }),
+      event(2, 'plan_updated', { steps: ['Audit endpoints', 'Add regression tests'] }),
+      event(3, 'assistant', { text: 'Done ' + 'b'.repeat(500), calls: [] }),
+      event(4, 'user', { text: 'Latest question' }),
+    ],
+    'rules',
+    undefined,
+    undefined,
+    200,
+  );
+  const summary = messages.find(
+    (m) => m.role === 'user' && String(m.content).includes('Earlier conversation summary'),
+  );
+  assert.ok(summary);
+  assert.match(String(summary.content), /plan updated: Audit endpoints; Add regression tests/);
+});

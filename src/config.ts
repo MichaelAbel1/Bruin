@@ -62,11 +62,12 @@ export const mcpServerSchema = z
         .url()
         .refine((value) => {
           const url = new URL(value);
+          if (url.username || url.password) return false;
           return (
             url.protocol === 'https:' ||
             (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
           );
-        }, '远程 MCP 服务器必须使用 HTTPS'),
+        }, '远程 MCP 服务器必须使用 HTTPS 且不能包含内嵌凭据'),
       tokenEnv: z.string().regex(envNamePattern).optional(),
       oauth: z
         .object({
