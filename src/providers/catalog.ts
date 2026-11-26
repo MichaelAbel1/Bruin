@@ -28,6 +28,7 @@ export async function discoverModels(profile: ModelProfile, refresh = false): Pr
     (profile.provider === 'openai-compatible' ? '' : defaultBaseUrls[profile.provider]);
   if (!base) throw new Error('请先配置 Base URL');
   const endpoint = new URL(base);
+  if (endpoint.username || endpoint.password) throw new Error('模型目录地址不允许包含内嵌凭据');
   endpoint.hash = '';
   endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, '')}/models`;
   if (!['http:', 'https:'].includes(endpoint.protocol))

@@ -32,6 +32,8 @@ export class ProcessExecutor implements ToolExecutor {
       env: {
         PATH: process.env.PATH,
         TMPDIR: process.env.TMPDIR,
+        TEMP: process.env.TEMP,
+        TMP: process.env.TMP,
         LANG: process.env.LANG,
         BRUIN_HOME: dataDir(),
         BRUIN_ALLOW_UNSANDBOXED_SHELL: process.env.BRUIN_ALLOW_UNSANDBOXED_SHELL,
@@ -109,14 +111,19 @@ export class ProcessExecutor implements ToolExecutor {
         },
       };
       worker.pending.set(request.requestId, pending);
-      worker.child.send(request, (err) => {
-        if (err) {
-          if (worker.pending.get(request.requestId) === pending)
-            worker.pending.delete(request.requestId);
-          signal?.removeEventListener('abort', abort);
-          reject(err);
-        }
-      });
+      const failSend = (err: Error) => {
+        if (worker.pending.get(request.requestId) === pending)
+          worker.pending.delete(request.requestId);
+        signal?.removeEventListener('abort', abort);
+        reject(err);
+      };
+      try {
+        worker.child.send(request, (err) => {
+          if (err) failSend(err);
+        });
+      } catch (err) {
+        failSend(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 

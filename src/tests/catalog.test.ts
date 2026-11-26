@@ -153,3 +153,15 @@ test('model discovery never forwards credentials through redirects', async () =>
     target.close();
   }
 });
+
+test('model discovery rejects base URLs with embedded credentials', async () => {
+  await assert.rejects(
+    discoverModels({
+      alias: 'creds-test',
+      provider: 'openai-compatible',
+      model: 'mock',
+      baseUrl: 'https://user:pass@example.com/v1',
+    }),
+    /内嵌凭据/,
+  );
+});

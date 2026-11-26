@@ -9,8 +9,17 @@ export function recordedUsage(
     inputReports: 0,
     outputReports: 0,
   };
-  for (const event of events) {
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
     if (event.type !== 'assistant') continue;
+    const next = events[index + 1];
+    if (
+      event.payload.synthetic === 'pause_report' ||
+      (typeof event.payload.text === 'string' &&
+        next?.type === 'turn_paused' &&
+        next.payload.report === event.payload.text)
+    )
+      continue;
     totals.responses++;
     const usage = event.payload.usage;
     if (!usage || typeof usage !== 'object' || Array.isArray(usage)) continue;

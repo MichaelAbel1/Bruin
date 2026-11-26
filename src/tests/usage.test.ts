@@ -73,3 +73,24 @@ test('accumulated token totals remain exact above the safe integer range', () =>
     '≥ 9,007,199,254,740,993',
   );
 });
+
+test('recorded usage excludes synthetic pause reports from response counts', () => {
+  const usage = recordedUsage([
+    {
+      type: 'assistant',
+      payload: { text: 'working', usage: { inputTokens: 120, outputTokens: 30 } },
+    },
+    { type: 'assistant', payload: { text: 'Paused report', calls: [], synthetic: 'pause_report' } },
+    { type: 'turn_paused', payload: { reason: 'step_limit', report: 'Paused report' } },
+    { type: 'assistant', payload: { text: 'Legacy paused report', calls: [] } },
+    { type: 'turn_paused', payload: { reason: 'time_limit', report: 'Legacy paused report' } },
+  ]);
+  assert.deepEqual(usage, {
+    responses: 1,
+    inputTokens: 120n,
+    outputTokens: 30n,
+    inputReports: 1,
+    outputReports: 1,
+  });
+  assert.equal(recordedTokenLabel(usage.inputTokens, usage.inputReports, usage.responses), '120');
+});

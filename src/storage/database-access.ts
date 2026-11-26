@@ -28,9 +28,24 @@ function alive(pid: unknown): boolean {
 function clean(directory: string) {
   for (const name of fs.readdirSync(directory).filter((name) => name.endsWith('.json'))) {
     const file = path.join(directory, name);
-    if (!fs.lstatSync(file).isFile()) throw new Error('数据库访问锁文件无效');
-    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!alive(value.pid)) fs.unlinkSync(file);
+    let stat: fs.Stats;
+    let raw: string;
+    try {
+      stat = fs.lstatSync(file);
+      if (!stat.isFile()) throw new Error('数据库访问锁文件无效');
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const value = JSON.parse(raw);
+    if (!alive(value.pid)) {
+      try {
+        fs.unlinkSync(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
   }
 }
 function claim(filename: string, maintenance: boolean): () => void {

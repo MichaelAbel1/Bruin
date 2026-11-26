@@ -19,8 +19,11 @@ export type AttentionPayload = {
 
 export function redactWebhookText(text: string, extraSecrets: readonly string[] = []): string {
   let out = text;
-  for (const secret of extraSecrets) {
-    if (secret && secret.length >= 8) out = out.replaceAll(secret, '[REDACTED]');
+  const sortedSecrets = [...new Set(extraSecrets.filter((secret) => secret.length >= 8))].sort(
+    (a, b) => b.length - a.length,
+  );
+  for (const secret of sortedSecrets) {
+    out = out.replaceAll(secret, '[REDACTED]');
   }
   return out
     .replace(

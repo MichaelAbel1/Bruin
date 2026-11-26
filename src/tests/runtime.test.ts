@@ -19,7 +19,7 @@ import {
 } from '../runtime/plan.js';
 import { loadConfig, mcpServerSchema, saveConfig } from '../config.js';
 import { McpManager } from '../runtime/mcp.js';
-import { isAllowedWebhookUrl, sendAttentionWebhook } from '../runtime/notify.js';
+import { isAllowedWebhookUrl, redactWebhookText, sendAttentionWebhook } from '../runtime/notify.js';
 import { doctor } from '../runtime/doctor.js';
 import { recoverCronJobs } from '../runtime/cron.js';
 import type { ModelGateway } from '../providers/gateway.js';
@@ -1894,4 +1894,12 @@ test('McpManager rejects insecure remote HTTP URLs and embedded credentials at r
   } finally {
     await manager.close();
   }
+});
+
+test('redactWebhookText replaces overlapping extraSecrets longest-first without leaking suffix', () => {
+  const redacted = redactWebhookText('error with secret_prefix_full_suffix_1234', [
+    'secret_prefix',
+    'secret_prefix_full_suffix_1234',
+  ]);
+  assert.equal(redacted, 'error with [REDACTED]');
 });

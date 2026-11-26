@@ -41,6 +41,7 @@ export class McpOAuthSession implements OAuthClientProvider {
   private redirect?: (url: URL) => Promise<void>;
   private cancelPending?: () => void;
   private cancelled = false;
+  private loggingIn = false;
   cancelLogin() {
     this.cancelled = true;
     this.cancelPending?.();
@@ -138,6 +139,8 @@ export class McpOAuthSession implements OAuthClientProvider {
     port = 0,
     timeoutMs = 120_000,
   ) {
+    if (this.loggingIn) throw new Error('OAuth 登录正在进行中');
+    this.loggingIn = true;
     this.cancelled = false;
     this.nonce = randomBytes(32).toString('hex');
     let resolve!: (params: URLSearchParams) => void;
@@ -186,19 +189,26 @@ export class McpOAuthSession implements OAuthClientProvider {
       res.end('已收到授权，正在完成登录。可关闭此页面并返回 Bruin。');
       resolve(url.searchParams);
     });
-    await new Promise<void>((ok, fail) => {
-      const onError = (err: Error) => {
-        server.off('listening', onListening);
-        fail(err);
-      };
-      const onListening = () => {
-        server.off('error', onError);
-        ok();
-      };
-      server.once('error', onError);
-      server.once('listening', onListening);
-      server.listen(port, '127.0.0.1');
-    });
+    let listening = false;
+    try {
+      await new Promise<void>((ok, fail) => {
+        const onError = (err: Error) => {
+          server.off('listening', onListening);
+          fail(err);
+        };
+        const onListening = () => {
+          server.off('error', onError);
+          listening = true;
+          ok();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(port, '127.0.0.1');
+      });
+    } catch (error) {
+      this.loggingIn = false;
+      throw error;
+    }
     const onRuntimeError = (err: Error) => {
       reject(err);
     };
@@ -260,8 +270,11 @@ export class McpOAuthSession implements OAuthClientProvider {
       this.cancelPending = undefined;
       this.redirect = undefined;
       this.verifier = '';
-      server.closeAllConnections();
-      await new Promise<void>((ok) => server.close(() => ok()));
+      if (listening) {
+        server.closeAllConnections();
+        await new Promise<void>((ok) => server.close(() => ok()));
+      }
+      this.loggingIn = false;
     }
   }
 }
